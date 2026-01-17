@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="RepoDLL/RepoDLL.vcxproj" Id="8b39552c-d57c-42de-b911-818894bad5cb" />
+</Solution>
