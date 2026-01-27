@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 namespace config {
 constexpr const char* kAssemblyName = "Assembly-CSharp";
