@@ -21,6 +21,11 @@ void LogMessage(const char* tag) {
     << ms.count() << "] " << (tag ? tag : "") << "\n";
 }
 
+LONG WINAPI RepoUnhandledExceptionFilter(EXCEPTION_POINTERS* info) {
+  LogCrash("UnhandledException", info ? info->ExceptionRecord->ExceptionCode : 0, info);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
 DWORD WINAPI MainThread(LPVOID module) {
   LogMessage("MainThread: begin");
   if (!HookDx11()) {
@@ -37,6 +42,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
   switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH: {
       DisableThreadLibraryCalls(hModule);
+      SetUnhandledExceptionFilter(RepoUnhandledExceptionFilter);
       HANDLE thread = CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr);
       if (thread) {
         CloseHandle(thread);

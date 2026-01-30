@@ -14,11 +14,15 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <vector>
 
 #include "mono_bridge.h"
 #include "ui.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// ESP 开关（供 mono_bridge 等引用）
+bool g_esp_enabled = true;
 
 namespace {
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
@@ -34,6 +38,36 @@ bool g_imgui_initialized = false;
 bool g_menu_open = true;
 bool g_overlay_disabled = false;
 bool g_unhooked = false;
+
+struct Vec3 { float x, y, z; };
+
+// 将世界坐标投影到屏幕
+static bool WorldToScreen(const Vec3& p, const Matrix4x4& view, const Matrix4x4& proj,
+  float screen_w, float screen_h, ImVec2& out) {
+  // Unity Matrix4x4 顺序为行主序 m00 m01 m02 m03 ...，但为避免转置歧义，这里显式写出乘法。
+  auto mul_col_major = [](const Matrix4x4& m, const float v[4], float outv[4]) {
+    // 视为列主序：先列后行 (匹配常见 Unity → HLSL 乘法)
+    outv[0] = m.m[0] * v[0] + m.m[4] * v[1] + m.m[8] * v[2] + m.m[12] * v[3];
+    outv[1] = m.m[1] * v[0] + m.m[5] * v[1] + m.m[9] * v[2] + m.m[13] * v[3];
+    outv[2] = m.m[2] * v[0] + m.m[6] * v[1] + m.m[10] * v[2] + m.m[14] * v[3];
+    outv[3] = m.m[3] * v[0] + m.m[7] * v[1] + m.m[11] * v[2] + m.m[15] * v[3];
+  };
+
+  float v[4] = { p.x, p.y, p.z, 1.0f };
+  float view_v[4];
+  mul_col_major(view, v, view_v);
+  float clip[4];
+  mul_col_major(proj, view_v, clip);
+
+  if (clip[3] <= 0.001f || clip[2] < 0.0f) return false;  // 背面/在相机后方
+  float ndc_x = clip[0] / clip[3];
+  float ndc_y = clip[1] / clip[3];
+  if (ndc_x < -1.f || ndc_x > 1.f || ndc_y < -1.f || ndc_y > 1.f) return false;
+
+  out.x = (ndc_x * 0.5f + 0.5f) * screen_w;
+  out.y = (1.0f - (ndc_y * 0.5f + 0.5f)) * screen_h;
+  return true;
+}
 
 void LogMessage(const std::string& msg) {
   std::ofstream f("D:\\Project\\REPO_LOG.txt", std::ios::app);
@@ -70,6 +104,54 @@ void CleanupRenderTarget() {
   if (g_rtv) {
     g_rtv->Release();
     g_rtv = nullptr;
+  }
+}
+
+// 轻量 ESP 绘制：使用相机矩阵把物品/敌人投影到屏幕
+void DrawEsp() {
+  if (!g_esp_enabled || MonoIsShuttingDown()) return;
+  try {
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!dl) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float sw = io.DisplaySize.x;
+    const float sh = io.DisplaySize.y;
+
+    Matrix4x4 view{}, proj{};
+    if (!UiGetCachedMatrices(view, proj)) return;
+
+    const auto& items = UiGetCachedItems();
+    if (!items.empty()) {
+      const size_t cap = items.size() > 1024 ? 1024 : items.size();
+      for (size_t i = 0; i < cap; ++i) {
+        const auto& st = items[i];
+        if (!st.has_position) continue;
+        ImVec2 sp;
+        if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
+        ImU32 col = IM_COL32(230, 201, 60, 255);  // 黄色
+        dl->AddRect(ImVec2(sp.x - 6, sp.y - 6), ImVec2(sp.x + 6, sp.y + 6), col, 0.0f, 0, 1.5f);
+        if (st.has_name) {
+          dl->AddText(ImVec2(sp.x + 8, sp.y - 6), col, st.name.c_str());
+        }
+      }
+    }
+
+    const auto& enemies = UiGetCachedEnemies();
+    if (!enemies.empty()) {
+      const size_t cap = enemies.size() > 512 ? 512 : enemies.size();
+      for (size_t i = 0; i < cap; ++i) {
+        const auto& st = enemies[i];
+        if (!st.has_position) continue;
+        ImVec2 sp;
+        if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
+        ImU32 col = IM_COL32(220, 64, 64, 255);
+        dl->AddRect(ImVec2(sp.x - 8, sp.y - 8), ImVec2(sp.x + 8, sp.y + 8), col, 0.0f, 0, 1.8f);
+        dl->AddText(ImVec2(sp.x + 10, sp.y - 8), col, st.has_name ? st.name.c_str() : "Enemy");
+      }
+    }
+  }
+  catch (...) {
+    LogCrash("DrawEsp", 0, nullptr);
   }
 }
 
@@ -123,86 +205,77 @@ LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
 }
 
 HRESULT __stdcall HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
-  if (!g_original_present) {
-    LogMessage("HookPresent: original_present null, skipping");
-    return DXGI_ERROR_INVALID_CALL;
-  }
-  static bool logged_present_once = false;
-  if (!logged_present_once) {
-    LogMessage("HookPresent: entered");
-    logged_present_once = true;
-  }
-  if (MonoIsShuttingDown()) {
-    return g_original_present(swap_chain, sync_interval, flags);
-  }
-  if (!g_imgui_initialized) {
-    if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device),
-                                        reinterpret_cast<void**>(&g_device))) &&
-        g_device) {
-      g_device->GetImmediateContext(&g_context);
-      DXGI_SWAP_CHAIN_DESC desc = {};
-      swap_chain->GetDesc(&desc);
-      g_hwnd = desc.OutputWindow;
-      g_original_wndproc = reinterpret_cast<WNDPROC>(
-          SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProcHook)));
-
-      CreateRenderTarget(swap_chain);
-
-      ImGui::CreateContext();
-      ImGuiIO& io = ImGui::GetIO();
-      SetupFonts(io);
-      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-      ImGui::StyleColorsDark();
-      ImGui_ImplWin32_Init(g_hwnd);
-      ImGui_ImplDX11_Init(g_device, g_context);
-
-      g_imgui_initialized = true;
+  try {
+    if (!g_original_present) {
+      LogMessage("HookPresent: original_present null, skipping");
+      return DXGI_ERROR_INVALID_CALL;
     }
-  }
-
-  if (g_imgui_initialized) {
-    if (g_overlay_disabled) {
+    static bool logged_present_once = false;
+    if (!logged_present_once) {
+      LogMessage("HookPresent: entered");
+      logged_present_once = true;
+    }
+    if (MonoIsShuttingDown()) {
       return g_original_present(swap_chain, sync_interval, flags);
     }
+    if (!g_imgui_initialized) {
+      if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device),
+        reinterpret_cast<void**>(&g_device))) &&
+        g_device) {
+        g_device->GetImmediateContext(&g_context);
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        swap_chain->GetDesc(&desc);
+        g_hwnd = desc.OutputWindow;
+        g_original_wndproc = reinterpret_cast<WNDPROC>(
+          SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProcHook)));
 
-    ImGui_ImplDX11_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
+        CreateRenderTarget(swap_chain);
 
-    // 用于异常追踪的阶段标记
-    const char* stage = "begin";
-    try {
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        SetupFonts(io);
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::StyleColorsDark();
+        ImGui_ImplWin32_Init(g_hwnd);
+        ImGui_ImplDX11_Init(g_device, g_context);
+
+        g_imgui_initialized = true;
+      }
+    }
+
+    if (g_imgui_initialized) {
+      if (g_overlay_disabled) {
+        return g_original_present(swap_chain, sync_interval, flags);
+      }
+
+      ImGui_ImplDX11_NewFrame();
+      ImGui_ImplWin32_NewFrame();
+      ImGui::NewFrame();
+
+      // 用于异常追踪的阶段标记
+      const char* stage = "begin";
       stage = "RenderOverlay";
       RenderOverlay(&g_menu_open);
 
       stage = "ImGui::Render";
       ImGui::Render();
-    } catch (...) {
-      ImGuiContext* ctx = ImGui::GetCurrentContext();
-      if (ctx && ctx->WithinFrameScope) {
-        ImGui::EndFrame();
+      // fallthrough
+
+      if (!g_rtv) {
+        CreateRenderTarget(swap_chain);
       }
-      g_overlay_disabled = true;
-      ImGui_ImplDX11_Shutdown();
-      ImGui_ImplWin32_Shutdown();
-      ImGui::DestroyContext();
-      g_imgui_initialized = false;
-      CleanupRenderTarget();
-      std::string err = std::string("HookPresent: exception at stage ") + stage;
-      LogMessage(err);
-      return g_original_present(swap_chain, sync_interval, flags);
+      if (g_rtv) {
+        g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+      }
+      ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     }
 
-    if (!g_rtv) {
-      CreateRenderTarget(swap_chain);
-    }
-    if (g_rtv) {
-      g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
-    }
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    return g_original_present(swap_chain, sync_interval, flags);
   }
-
-  return g_original_present(swap_chain, sync_interval, flags);
+  catch (...) {
+    LogCrash("HookPresent", 0, nullptr);
+    return g_original_present(swap_chain, sync_interval, flags);
+  }
 }
 
 bool CreateDx11Hook() {

@@ -86,6 +86,9 @@ constexpr const char* kItemManagerNamespace = "";
 constexpr const char* kItemManagerClass = "ItemManager";
 constexpr const char* kItemManagerInstanceField = "instance";
 constexpr const char* kItemManagerGetAllItemsMethod = "GetAllItemVolumesInScene";
+constexpr const char* kPhysGrabObjectNamespace = "";
+constexpr const char* kPhysGrabObjectClass = "PhysGrabObject";
+constexpr bool kFindObjectsInactive = true;
 
 constexpr const char* kValuableObjectNamespace = "";
 constexpr const char* kValuableObjectClass = "ValuableObject";

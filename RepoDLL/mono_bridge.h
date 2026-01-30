@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 
 struct LocalPlayerInfo {
   void* object = nullptr;
@@ -21,6 +22,20 @@ struct PlayerState {
   bool has_position = false;
   bool has_health = false;
   bool has_energy = false;
+  int layer = -1;
+  bool has_layer = false;
+  std::string name;
+  bool has_name = false;
+  int value = 0;
+  bool has_value = false;
+  enum Category : int {
+    kUnknown = 0,
+    kValuable = 1,
+    kPhysGrab = 2,
+    kVolume = 3,
+    kCollider = 4,
+    kEnemy = 5,
+  } category = kUnknown;
 };
 
 struct Matrix4x4 {
@@ -38,6 +53,14 @@ bool MonoSetLocalPlayerPosition(float x, float y, float z);
 bool MonoSetLocalPlayerHealth(int health, int max_health);
 bool MonoSetLocalPlayerEnergy(float energy, float max_energy);
 bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection);
+
+// Native in-game highlight (ValuableDiscover)
+bool MonoValueFieldsResolved();
+bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count);
+bool MonoApplyValuableDiscoverPersistence(bool enable, float wait_seconds, int& out_count);
+// SEH 包装，防止崩溃
+bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count);
+bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, int& out_count);
 
 bool MonoSetRunCurrency(int amount);
 bool MonoGetRunCurrency(int& out_amount);
@@ -59,3 +82,9 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local);
 
 // Enumerate items/valuables; fills out_items with positions (health/energy unused).
 bool MonoListItems(std::vector<PlayerState>& out_items);
+
+// Enumerate enemies (any hostile entity with transform).
+bool MonoListEnemies(std::vector<PlayerState>& out_enemies);
+
+// ESP开关（在 hook_dx11.cpp 定义）
+extern bool g_esp_enabled;
