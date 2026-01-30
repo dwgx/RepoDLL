@@ -23,6 +23,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 // ESP 开关（供 mono_bridge 等引用）
 bool g_esp_enabled = true;
+// Overlay 状态（供 mono_bridge 等引用）
+bool g_overlay_disabled = false;
 
 namespace {
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
@@ -36,7 +38,6 @@ ID3D11RenderTargetView* g_rtv = nullptr;
 void* g_present_fn = nullptr;
 bool g_imgui_initialized = false;
 bool g_menu_open = true;
-bool g_overlay_disabled = false;
 bool g_unhooked = false;
 
 struct Vec3 { float x, y, z; };
@@ -204,78 +205,81 @@ LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
   return CallWindowProc(g_original_wndproc, hwnd, msg, wparam, lparam);
 }
 
-HRESULT __stdcall HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
-  try {
-    if (!g_original_present) {
-      LogMessage("HookPresent: original_present null, skipping");
-      return DXGI_ERROR_INVALID_CALL;
+// Helper with C++ logic; called from HookPresent inside SEH wrapper.
+static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+  if (!g_original_present) {
+    LogMessage("HookPresent: original_present null, skipping");
+    return DXGI_ERROR_INVALID_CALL;
+  }
+  static bool logged_present_once = false;
+  if (!logged_present_once) {
+    LogMessage("HookPresent: entered");
+    logged_present_once = true;
+  }
+  if (MonoIsShuttingDown()) {
+    return g_original_present(swap_chain, sync_interval, flags);
+  }
+  if (!g_imgui_initialized) {
+    if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device),
+      reinterpret_cast<void**>(&g_device))) &&
+      g_device) {
+      g_device->GetImmediateContext(&g_context);
+      DXGI_SWAP_CHAIN_DESC desc = {};
+      swap_chain->GetDesc(&desc);
+      g_hwnd = desc.OutputWindow;
+      g_original_wndproc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProcHook)));
+
+      CreateRenderTarget(swap_chain);
+
+      ImGui::CreateContext();
+      ImGuiIO& io = ImGui::GetIO();
+      SetupFonts(io);
+      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+      ImGui::StyleColorsDark();
+      ImGui_ImplWin32_Init(g_hwnd);
+      ImGui_ImplDX11_Init(g_device, g_context);
+
+      g_imgui_initialized = true;
     }
-    static bool logged_present_once = false;
-    if (!logged_present_once) {
-      LogMessage("HookPresent: entered");
-      logged_present_once = true;
-    }
-    if (MonoIsShuttingDown()) {
+  }
+
+  if (g_imgui_initialized) {
+    if (g_overlay_disabled) {
       return g_original_present(swap_chain, sync_interval, flags);
     }
-    if (!g_imgui_initialized) {
-      if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device),
-        reinterpret_cast<void**>(&g_device))) &&
-        g_device) {
-        g_device->GetImmediateContext(&g_context);
-        DXGI_SWAP_CHAIN_DESC desc = {};
-        swap_chain->GetDesc(&desc);
-        g_hwnd = desc.OutputWindow;
-        g_original_wndproc = reinterpret_cast<WNDPROC>(
-          SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProcHook)));
 
-        CreateRenderTarget(swap_chain);
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
 
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        SetupFonts(io);
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        ImGui::StyleColorsDark();
-        ImGui_ImplWin32_Init(g_hwnd);
-        ImGui_ImplDX11_Init(g_device, g_context);
+    // Render without SEH to avoid mixed exception models (C2712). Upstream catch is in HookPresent.
+    RenderOverlay(&g_menu_open);
+    ImGui::Render();
 
-        g_imgui_initialized = true;
-      }
+    if (!g_rtv) {
+      CreateRenderTarget(swap_chain);
     }
-
-    if (g_imgui_initialized) {
-      if (g_overlay_disabled) {
-        return g_original_present(swap_chain, sync_interval, flags);
-      }
-
-      ImGui_ImplDX11_NewFrame();
-      ImGui_ImplWin32_NewFrame();
-      ImGui::NewFrame();
-
-      // 用于异常追踪的阶段标记
-      const char* stage = "begin";
-      stage = "RenderOverlay";
-      RenderOverlay(&g_menu_open);
-
-      stage = "ImGui::Render";
-      ImGui::Render();
-      // fallthrough
-
-      if (!g_rtv) {
-        CreateRenderTarget(swap_chain);
-      }
-      if (g_rtv) {
-        g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
-      }
-      ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (g_rtv) {
+      g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     }
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+  }
 
-    return g_original_present(swap_chain, sync_interval, flags);
+  return g_original_present(swap_chain, sync_interval, flags);
+}
+
+HRESULT __stdcall HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+#ifdef _MSC_VER
+  __try {
+    return PresentFrame(swap_chain, sync_interval, flags);
   }
-  catch (...) {
-    LogCrash("HookPresent", 0, nullptr);
-    return g_original_present(swap_chain, sync_interval, flags);
+  __except (LogCrash("HookPresent", GetExceptionCode(), GetExceptionInformation())) {
+    return g_original_present ? g_original_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
   }
+#else
+  return PresentFrame(swap_chain, sync_interval, flags);
+#endif
 }
 
 bool CreateDx11Hook() {

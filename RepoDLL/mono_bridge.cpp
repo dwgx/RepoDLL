@@ -17,6 +17,7 @@
 #include "config.h"
 
 extern bool g_esp_enabled;
+extern bool g_overlay_disabled;
 
 namespace {
   using MonoDomain = void;
@@ -233,6 +234,7 @@ namespace {
   int g_pending_cart_value = 0;
   bool g_pending_cart_active = false;
   bool g_cart_apply_in_progress = false;
+  bool g_native_highlight_failed = false;
 
   // Shutdown guard
   bool g_shutting_down = false;
@@ -2008,6 +2010,27 @@ bool MonoBeginShutdown() {
 
 bool MonoIsShuttingDown() {
   return g_shutting_down;
+}
+
+// Safe invoke helper to guard mono_runtime_invoke with SEH.
+static MonoObject* SafeInvoke(MonoMethod* method, MonoObject* obj, void** args, const char* tag) {
+  if (!method || !g_mono.mono_runtime_invoke) return nullptr;
+#ifdef _MSC_VER
+  __try {
+    MonoObject* exc = nullptr;
+    MonoObject* ret = g_mono.mono_runtime_invoke(method, obj, args, &exc);
+    if (exc) return nullptr;
+    return ret;
+  }
+  __except (LogCrash(tag ? tag : "SafeInvoke", GetExceptionCode(), GetExceptionInformation())) {
+    return nullptr;
+  }
+#else
+  MonoObject* exc = nullptr;
+  MonoObject* ret = g_mono.mono_runtime_invoke(method, obj, args, &exc);
+  if (exc) return nullptr;
+  return ret;
+#endif
 }
 
 bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
@@ -4437,10 +4460,9 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     for (int i = 0; i < limit; ++i) {
       MonoObject* obj = static_cast<MonoObject*>(arr->vector[i]);
       if (!obj) continue;
-      MonoObject* exc_new = nullptr;
       void* new_args[2] = { obj, &state };
-      g_mono.mono_runtime_invoke(g_valuable_discover_new_method, discover_instance, new_args, &exc_new);
-      if (!exc_new) ++hit;
+      MonoObject* ret = SafeInvoke(g_valuable_discover_new_method, discover_instance, new_args, "ValuableDiscover.New");
+      if (ret) ++hit;
     }
     return hit;
   };
@@ -4450,12 +4472,9 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
   if (g_object_find_objects_of_type_include_inactive && pgo_type_obj) {
     bool include_inactive = true;
     void* args2[2] = { pgo_type_obj, &include_inactive };  // bool includeInactive=true
-    MonoObject* exc = nullptr;
     MonoObject* arr_obj =
-      g_mono.mono_runtime_invoke(g_object_find_objects_of_type_include_inactive, nullptr, args2, &exc);
-    if (!exc && arr_obj) {
-      total_hit += call_new_on_array(reinterpret_cast<MonoArray*>(arr_obj));
-    }
+      SafeInvoke(g_object_find_objects_of_type_include_inactive, nullptr, args2, "FindObjectsOfType(PhysGrabObject, true)");
+    total_hit += call_new_on_array(reinterpret_cast<MonoArray*>(arr_obj));
   }
 
   // 2) 退化：OverlapSphere 物理探测
@@ -4476,9 +4495,9 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     void* args3[3] = { center, &radius, &layer_mask };
     void* args2b[2] = { center, &radius };
     switch (g_physics_overlap_sphere_argc) {
-    case 4: arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args4, &exc); break;
-    case 3: arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args3, &exc); break;
-    case 2: arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args2b, &exc); break;
+    case 4: arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args4, "Physics.OverlapSphere"); break;
+    case 3: arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args3, "Physics.OverlapSphere3"); break;
+    case 2: arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args2b, "Physics.OverlapSphere2"); break;
     default: break;
     }
     if (!exc && arr_obj && pgo_type_obj) {
@@ -4488,21 +4507,18 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
       for (int i = 0; i < limit; ++i) {
         MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
         if (!collider) continue;
-        MonoObject* exc_go = nullptr;
         MonoObject* game_obj =
           g_component_get_game_object
-          ? g_mono.mono_runtime_invoke(g_component_get_game_object, collider, nullptr, &exc_go)
+          ? SafeInvoke(g_component_get_game_object, collider, nullptr, "Collider.get_gameObject")
           : nullptr;
-        if (exc_go || !game_obj) continue;
+        if (!game_obj) continue;
         void* comp_args[1] = { pgo_type_obj };
-        MonoObject* exc_comp = nullptr;
         MonoObject* phys_grab =
-          g_mono.mono_runtime_invoke(g_game_object_get_component, game_obj, comp_args, &exc_comp);
-        if (exc_comp || !phys_grab) continue;
+          SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(PhysGrabObject)");
+        if (!phys_grab) continue;
         void* new_args[2] = { phys_grab, &state };
-        MonoObject* exc_new = nullptr;
-        g_mono.mono_runtime_invoke(g_valuable_discover_new_method, discover_instance, new_args, &exc_new);
-        if (!exc_new) ++total_hit;
+        MonoObject* ret = SafeInvoke(g_valuable_discover_new_method, discover_instance, new_args, "ValuableDiscover.New");
+        if (ret) ++total_hit;
       }
     }
   }
@@ -4543,6 +4559,8 @@ bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count) {
     return MonoTriggerValuableDiscover(state, max_items, out_count);
   }
   __except (LogCrash("MonoTriggerValuableDiscoverSafe", GetExceptionCode(), GetExceptionInformation())) {
+    g_native_highlight_failed = true;
+    g_overlay_disabled = true;
     return false;
   }
 #else
@@ -4562,5 +4580,9 @@ bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, i
 #else
   return MonoApplyValuableDiscoverPersistence(enable, wait_seconds, out_count);
 #endif
+}
+
+bool MonoNativeHighlightAvailable() {
+  return !g_native_highlight_failed;
 }
 

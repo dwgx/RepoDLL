@@ -61,6 +61,7 @@ bool MonoApplyValuableDiscoverPersistence(bool enable, float wait_seconds, int& 
 // SEH 包装，防止崩溃
 bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count);
 bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, int& out_count);
+bool MonoNativeHighlightAvailable();
 
 bool MonoSetRunCurrency(int amount);
 bool MonoGetRunCurrency(int& out_amount);
@@ -88,3 +89,5 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies);
 
 // ESP开关（在 hook_dx11.cpp 定义）
 extern bool g_esp_enabled;
+// Overlay 状态（在 hook_dx11.cpp 定义）
+extern bool g_overlay_disabled;

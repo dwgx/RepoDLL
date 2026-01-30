@@ -102,7 +102,7 @@ void RenderOverlay(bool* menu_open) {
   static bool auto_refresh = true;  // 默认开启自动刷新
   static bool auto_refresh_items = true;
   static bool auto_refresh_enemies = true;
-  static bool native_highlight_enabled = true;
+  static bool native_highlight_enabled = false;
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
   static int native_highlight_limit = 160;
   static uint64_t last_highlight_tick = 0;
@@ -179,7 +179,8 @@ void RenderOverlay(bool* menu_open) {
   }
 
   // Native in-game highlight (ValuableDiscover)
-  if (mono_ready && g_esp_enabled && native_highlight_enabled && MonoValueFieldsResolved()) {
+  if (mono_ready && g_esp_enabled && native_highlight_enabled &&
+      MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
     if (now - last_highlight_tick > 900) {
       int count = 0;
       if (MonoTriggerValuableDiscoverSafe(native_highlight_state, native_highlight_limit, count)) {
