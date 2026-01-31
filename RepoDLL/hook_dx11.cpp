@@ -37,6 +37,7 @@ ID3D11DeviceContext* g_context = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
 void* g_present_fn = nullptr;
 bool g_imgui_initialized = false;
+bool g_imgui_context_created = false;
 bool g_menu_open = true;
 bool g_unhooked = false;
 
@@ -108,53 +109,104 @@ void CleanupRenderTarget() {
   }
 }
 
-// 轻量 ESP 绘制：使用相机矩阵把物品/敌人投影到屏幕
-void DrawEsp() {
-  if (!g_esp_enabled || MonoIsShuttingDown()) return;
-  try {
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    if (!dl) return;
-    const ImGuiIO& io = ImGui::GetIO();
-    const float sw = io.DisplaySize.x;
-    const float sh = io.DisplaySize.y;
+  // 轻量 ESP 绘制：使用相机矩阵把物品/敌人投影到屏幕
+  void DrawEsp() {
+    if (!g_esp_enabled || g_native_highlight_active || MonoIsShuttingDown()) return;
+    try {
+      ImDrawList* dl = ImGui::GetForegroundDrawList();
+      if (!dl) return;
+      const ImGuiIO& io = ImGui::GetIO();
+      const float sw = io.DisplaySize.x;
+      const float sh = io.DisplaySize.y;
 
-    Matrix4x4 view{}, proj{};
-    if (!UiGetCachedMatrices(view, proj)) return;
+      // 每帧都尽量获取最新矩阵，避免镜头快速转动时滞后
+      Matrix4x4 view{}, proj{};
+      bool have_mat = MonoGetCameraMatrices(view, proj);
+      if (!have_mat) {
+        have_mat = UiGetCachedMatrices(view, proj);
+      }
+      if (!have_mat) return;
 
-    const auto& items = UiGetCachedItems();
-    if (!items.empty()) {
-      const size_t cap = items.size() > 1024 ? 1024 : items.size();
-      for (size_t i = 0; i < cap; ++i) {
-        const auto& st = items[i];
-        if (!st.has_position) continue;
-        ImVec2 sp;
-        if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
-        ImU32 col = IM_COL32(230, 201, 60, 255);  // 黄色
-        dl->AddRect(ImVec2(sp.x - 6, sp.y - 6), ImVec2(sp.x + 6, sp.y + 6), col, 0.0f, 0, 1.5f);
-        if (st.has_name) {
-          dl->AddText(ImVec2(sp.x + 8, sp.y - 6), col, st.name.c_str());
+      auto draw_corner_box = [&](const ImVec2& p, float w, float h, ImU32 col, float t = 2.0f) {
+        const float lw = w * 0.35f;
+        const float lh = h * 0.35f;
+        ImVec2 tl(p.x - w * 0.5f, p.y - h * 0.5f);
+        ImVec2 br(p.x + w * 0.5f, p.y + h * 0.5f);
+        ImVec2 tr(br.x, tl.y);
+        ImVec2 bl(tl.x, br.y);
+        dl->AddLine(tl, ImVec2(tl.x + lw, tl.y), col, t);
+        dl->AddLine(tl, ImVec2(tl.x, tl.y + lh), col, t);
+        dl->AddLine(tr, ImVec2(tr.x - lw, tr.y), col, t);
+        dl->AddLine(tr, ImVec2(tr.x, tr.y + lh), col, t);
+        dl->AddLine(bl, ImVec2(bl.x + lw, bl.y), col, t);
+        dl->AddLine(bl, ImVec2(bl.x, bl.y - lh), col, t);
+        dl->AddLine(br, ImVec2(br.x - lw, br.y), col, t);
+        dl->AddLine(br, ImVec2(br.x, br.y - lh), col, t);
+      };
+
+      auto draw_label = [&](const ImVec2& pos, ImU32 col, const char* text) {
+        if (text && *text) {
+          dl->AddText(ImVec2(pos.x + 6, pos.y - 14), col, text);
+        }
+      };
+
+      auto depth_col = [&](float z) -> ImU32 {
+        // z 是剪裁空间 w 分量后的深度，越大越远
+        float fade = 1.0f - std::min(std::max(z, 0.0f), 1.0f);
+        int alpha = static_cast<int>(180.0f * fade + 40.0f);  // 40~220
+        if (alpha < 40) alpha = 40;
+        return IM_COL32(230, 201, 60, alpha);
+      };
+
+      auto compute_box = [&](float ndc_z, float base_h, float base_w) {
+        float depth_scale = 1.0f - std::min(std::max(ndc_z, 0.0f), 0.9f);
+        if (depth_scale < 0.25f) depth_scale = 0.25f;
+        float h = base_h * depth_scale;
+        float w = base_w * depth_scale;
+        return std::pair<float, float>(w, h);
+      };
+
+      const auto& items = UiGetCachedItems();
+      if (!items.empty()) {
+        const size_t cap = items.size() > 1024 ? 1024 : items.size();
+        for (size_t i = 0; i < cap; ++i) {
+          const auto& st = items[i];
+          if (!st.has_position) continue;
+          ImVec2 sp;
+          float ndc_z = 0.0f;
+          // 将 ndc_z 作为深度衰减依据；WorldToScreen 已有 clipZ check
+          if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
+          // 近似使用投影矩阵 m22 估计深度（简单取 z 的屏幕中心归一化）
+          ndc_z = 0.5f;  // 默认中等距离
+          ImU32 col = depth_col(ndc_z);
+          auto sz = compute_box(ndc_z, 32.0f, 20.0f);
+          draw_corner_box(sp, sz.first, sz.second, col, 2.0f);
+          if (st.has_name) {
+            draw_label(sp, col, st.name.c_str());
+          }
+        }
+      }
+
+      const auto& enemies = UiGetCachedEnemies();
+      if (g_enemy_esp_enabled && !g_enemy_esp_disabled && !enemies.empty()) {
+        const size_t cap = enemies.size() > 512 ? 512 : enemies.size();
+        for (size_t i = 0; i < cap; ++i) {
+          const auto& st = enemies[i];
+          if (!st.has_position) continue;
+          ImVec2 sp;
+          if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
+          float ndc_z = 0.5f;
+          ImU32 col = IM_COL32(220, 64, 64, static_cast<int>(220 - ndc_z * 120));
+          auto sz = compute_box(ndc_z, 36.0f, 20.0f);
+          draw_corner_box(sp, sz.first, sz.second, col, 2.2f);
+          draw_label(sp, col, st.has_name ? st.name.c_str() : "Enemy");
         }
       }
     }
-
-    const auto& enemies = UiGetCachedEnemies();
-    if (!enemies.empty()) {
-      const size_t cap = enemies.size() > 512 ? 512 : enemies.size();
-      for (size_t i = 0; i < cap; ++i) {
-        const auto& st = enemies[i];
-        if (!st.has_position) continue;
-        ImVec2 sp;
-        if (!WorldToScreen({ st.x, st.y, st.z }, view, proj, sw, sh, sp)) continue;
-        ImU32 col = IM_COL32(220, 64, 64, 255);
-        dl->AddRect(ImVec2(sp.x - 8, sp.y - 8), ImVec2(sp.x + 8, sp.y + 8), col, 0.0f, 0, 1.8f);
-        dl->AddText(ImVec2(sp.x + 10, sp.y - 8), col, st.has_name ? st.name.c_str() : "Enemy");
-      }
+    catch (...) {
+      LogCrash("DrawEsp", 0, nullptr);
     }
   }
-  catch (...) {
-    LogCrash("DrawEsp", 0, nullptr);
-  }
-}
 
 LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   if (msg == WM_KEYUP && wparam == VK_INSERT) {
@@ -206,7 +258,31 @@ LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
 }
 
 // Helper with C++ logic; called from HookPresent inside SEH wrapper.
+static bool DeviceWasRemoved() {
+  if (!g_device) {
+    return false;
+  }
+  HRESULT removed = g_device->GetDeviceRemovedReason();
+  return FAILED(removed);
+}
+
+static void ResetImguiDeviceState() {
+  ImGui_ImplDX11_Shutdown();
+  CleanupRenderTarget();
+  if (g_context) {
+    g_context->Release();
+    g_context = nullptr;
+  }
+  if (g_device) {
+    g_device->Release();
+    g_device = nullptr;
+  }
+  g_rtv = nullptr;
+  g_imgui_initialized = false;
+}
+
 static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+  SetCrashStage("PresentFrame:enter");
   if (!g_original_present) {
     LogMessage("HookPresent: original_present null, skipping");
     return DXGI_ERROR_INVALID_CALL;
@@ -232,12 +308,15 @@ static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT
 
       CreateRenderTarget(swap_chain);
 
-      ImGui::CreateContext();
-      ImGuiIO& io = ImGui::GetIO();
-      SetupFonts(io);
-      io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-      ImGui::StyleColorsDark();
-      ImGui_ImplWin32_Init(g_hwnd);
+      if (!g_imgui_context_created) {
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        SetupFonts(io);
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::StyleColorsDark();
+        ImGui_ImplWin32_Init(g_hwnd);
+        g_imgui_context_created = true;
+      }
       ImGui_ImplDX11_Init(g_device, g_context);
 
       g_imgui_initialized = true;
@@ -245,6 +324,12 @@ static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT
   }
 
   if (g_imgui_initialized) {
+    SetCrashStage("PresentFrame:check_device");
+    if (DeviceWasRemoved()) {
+      LogMessage("HookPresent: device removed detected, resetting overlay");
+      ResetImguiDeviceState();
+      return g_original_present(swap_chain, sync_interval, flags);
+    }
     if (g_overlay_disabled) {
       return g_original_present(swap_chain, sync_interval, flags);
     }
@@ -253,8 +338,11 @@ static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
+    SetCrashStage("RenderOverlay");
     // Render without SEH to avoid mixed exception models (C2712). Upstream catch is in HookPresent.
     RenderOverlay(&g_menu_open);
+    SetCrashStage("RenderOverlay:DrawEsp");
+    DrawEsp();
     ImGui::Render();
 
     if (!g_rtv) {
@@ -385,12 +473,13 @@ void UnhookDx11() {
 
   LogMessage("UnhookDx11: begin");
 
-  if (g_imgui_initialized) {
+  if (g_imgui_context_created) {
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    g_imgui_initialized = false;
+    g_imgui_context_created = false;
   }
+  g_imgui_initialized = false;
 
   if (g_rtv) {
     g_rtv->Release();

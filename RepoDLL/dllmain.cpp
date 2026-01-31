@@ -3,6 +3,7 @@
 
 #include "hook_dx11.h"
 #include "mono_bridge.h"
+#include "ui.h"
 #include <chrono>
 #include <fstream>
 #include <iomanip>

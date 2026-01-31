@@ -8,6 +8,10 @@
 #include <cmath>
 #include <algorithm>
 #include <cfloat>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 
 #pragma execution_character_set("utf-8")
 
@@ -71,13 +75,9 @@ void SectionLabel(const char* label) {
 }
 }  // namespace
 
-const std::vector<PlayerState>& UiGetCachedItems() {
-  return g_cached_items;
-}
+const std::vector<PlayerState>& UiGetCachedItems() { return g_cached_items; }
 
-const std::vector<PlayerState>& UiGetCachedEnemies() {
-  return g_cached_enemies;
-}
+const std::vector<PlayerState>& UiGetCachedEnemies() { return g_cached_enemies; }
 
 bool UiGetCachedMatrices(Matrix4x4& view, Matrix4x4& proj) {
   if (!g_cached_mats_valid) return false;
@@ -89,6 +89,7 @@ bool UiGetCachedMatrices(Matrix4x4& view, Matrix4x4& proj) {
 void RenderOverlay(bool* menu_open) {
   const bool menu_visible = menu_open && *menu_open;
   static bool last_menu_open = false;
+  SetCrashStage("RenderOverlay:enter");
 
   static LocalPlayerInfo last_info;
   static bool last_ok = false;
@@ -99,10 +100,9 @@ void RenderOverlay(bool* menu_open) {
   static bool lock_health = false;
   static bool lock_stamina = false;
   static bool inputs_synced = false;
-  static bool auto_refresh = true;  // 默认开启自动刷新
+  static bool auto_refresh = true;  // 默认开启自动刷新（玩家状态）
   static bool auto_refresh_items = true;
   static bool auto_refresh_enemies = true;
-  static bool native_highlight_enabled = false;
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
   static int native_highlight_limit = 160;
   static uint64_t last_highlight_tick = 0;
@@ -121,7 +121,6 @@ void RenderOverlay(bool* menu_open) {
   static int current_currency = 0;
   static bool has_currency = false;
   static uint64_t last_user_edit = 0;
-
   static uint64_t last_items_update = 0;
   static uint64_t last_enemies_update = 0;
 
@@ -137,6 +136,7 @@ void RenderOverlay(bool* menu_open) {
     return;
   }
   if (mono_ready && auto_refresh && safe_to_refresh && now - last_update > 500) {
+    SetCrashStage("RenderOverlay:MonoGetLocalPlayer");
     last_ok = MonoGetLocalPlayer(last_info);
     if (last_ok) {
       MonoGetLocalPlayerState(last_state);
@@ -147,19 +147,25 @@ void RenderOverlay(bool* menu_open) {
     last_update = now;
   }
 
-  // 刷新物品 / 敌人列表（轻量定时）
   auto refresh_items = [&]() {
     if (!mono_ready) return;
+    SetCrashStage("RenderOverlay:MonoListItems");
     MonoListItems(g_cached_items);
     last_items_update = now;
   };
   auto refresh_enemies = [&]() {
     if (!mono_ready) return;
-    MonoListEnemies(g_cached_enemies);
+    if (!g_enemy_esp_enabled || g_enemy_esp_disabled) {
+      g_cached_enemies.clear();
+      return;
+    }
+    SetCrashStage("RenderOverlay:MonoListEnemies");
+    MonoListEnemiesSafe(g_cached_enemies);
     last_enemies_update = now;
   };
   auto refresh_matrices = [&]() {
     if (!mono_ready) return;
+    SetCrashStage("RenderOverlay:MonoGetCameraMatrices");
     Matrix4x4 v{}, p{};
     if (MonoGetCameraMatrices(v, p)) {
       g_cached_view = v;
@@ -168,31 +174,45 @@ void RenderOverlay(bool* menu_open) {
       g_last_matrix_update = now;
     }
   };
-  if (mono_ready && auto_refresh_items && now - last_items_update > 800) {
+  // 高频刷新：降低到约 60ms，保证快速转镜时缓存不滞后
+  if (mono_ready && auto_refresh_items && now - last_items_update > 60) {
     refresh_items();
   }
-  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 1000) {
+  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 60) {
     refresh_enemies();
   }
-  if (mono_ready && now - g_last_matrix_update > 200) {
+  if (mono_ready && now - g_last_matrix_update > 33) {
     refresh_matrices();
   }
 
   // Native in-game highlight (ValuableDiscover)
-  if (mono_ready && g_esp_enabled && native_highlight_enabled &&
+  if (mono_ready && g_esp_enabled && g_native_highlight_active &&
       MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
-    if (now - last_highlight_tick > 900) {
-      int count = 0;
-      if (MonoTriggerValuableDiscoverSafe(native_highlight_state, native_highlight_limit, count)) {
-        last_highlight_count = count;
+#ifdef _MSC_VER
+    __try {
+#endif
+      SetCrashStage("RenderOverlay:NativeHighlight");
+      if (now - last_highlight_tick > 900) {
+        int count = 0;
+        SetCrashStage("RenderOverlay:MonoTriggerValuableDiscover");
+        if (MonoTriggerValuableDiscoverSafe(native_highlight_state, native_highlight_limit, count)) {
+          last_highlight_count = count;
+        }
+        last_highlight_tick = now;
       }
-      last_highlight_tick = now;
+      if (now - last_persist_tick > 200) {
+        SetCrashStage("RenderOverlay:MonoApplyValuableDiscoverPersistence");
+        int count = 0;
+        MonoApplyValuableDiscoverPersistenceSafe(true, 0.0f, count);
+        last_persist_tick = now;
+      }
+#ifdef _MSC_VER
     }
-    if (now - last_persist_tick > 200) {
-      int count = 0;
-      MonoApplyValuableDiscoverPersistenceSafe(true, 0.0f, count);
-      last_persist_tick = now;
+    __except (LogCrash("RenderOverlay:NativeHighlight", GetExceptionCode(), GetExceptionInformation())) {
+      g_native_highlight_active = false;
+      g_native_highlight_failed = true;
     }
+#endif
   }
 
   // Sync inputs once after we get a fresh state, but don't stomp user edits every frame.
@@ -443,7 +463,7 @@ void RenderOverlay(bool* menu_open) {
         if (ImGui::BeginTabItem("物品/ESP")) {
           ImGui::Checkbox("启用ESP常亮", &g_esp_enabled);
           ImGui::SameLine();
-          ImGui::Checkbox("原生高亮", &native_highlight_enabled);
+          ImGui::Checkbox("原生高亮", &g_native_highlight_active);
           ImGui::SameLine();
           ImGui::Checkbox("自动刷新", &auto_refresh_items);
           ImGui::SameLine();
@@ -530,11 +550,17 @@ void RenderOverlay(bool* menu_open) {
 
         // 敌人页
         if (ImGui::BeginTabItem("敌人")) {
+          ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled);
+          ImGui::SameLine();
           ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
           ImGui::SameLine();
           if (ImGui::Button("刷新敌人")) refresh_enemies();
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
+          if (g_enemy_esp_disabled) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "敌人扫描已自动关闭(崩溃保护)");
+          }
 
           ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
             ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;

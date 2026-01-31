@@ -13,11 +13,19 @@
 #include <psapi.h>
 #include <vector>
 #include <functional>
+#include <mutex>
+#include <deque>
+#include <atomic>
 
 #include "config.h"
 
 extern bool g_esp_enabled;
 extern bool g_overlay_disabled;
+
+bool g_native_highlight_failed = false;
+bool g_native_highlight_active = false;
+bool g_enemy_esp_disabled = false;
+bool g_enemy_esp_enabled = false;
 
 namespace {
   using MonoDomain = void;
@@ -113,6 +121,7 @@ namespace {
 
   MonoClass* g_game_object_class = nullptr;
   MonoMethod* g_game_object_get_component = nullptr;
+  MonoMethod* g_game_object_get_component_in_parent = nullptr;
   MonoMethod* g_game_object_get_layer = nullptr;
 
   MonoClass* g_unity_object_class = nullptr;
@@ -234,10 +243,33 @@ namespace {
   int g_pending_cart_value = 0;
   bool g_pending_cart_active = false;
   bool g_cart_apply_in_progress = false;
-  bool g_native_highlight_failed = false;
 
   // Shutdown guard
   bool g_shutting_down = false;
+
+  // ------------------------------------------------------------
+  // Structured logging (thread-safe, low-noise, ring-buffered)
+  // ------------------------------------------------------------
+  enum class LogLevel : int { kError = 0, kWarn = 1, kInfo = 2, kDebug = 3, kTrace = 4 };
+
+  struct LogEntry {
+    std::string ts;
+    std::string stage;
+    std::string msg;
+    LogLevel level{ LogLevel::kInfo };
+    uint32_t tid{ 0 };
+  };
+
+  constexpr size_t kLogRingCap = 256;
+  constexpr const char* kLogPath = "D:\\Project\\REPO_LOG.txt";
+  constexpr const char* kCrashPath = "D:\\Project\\REPO_CRASH.txt";
+
+  std::mutex g_log_mutex;
+  std::deque<LogEntry> g_log_ring;
+  std::unordered_set<std::string> g_log_once;
+  std::atomic<int> g_log_level(static_cast<int>(LogLevel::kWarn));
+  std::atomic<bool> g_env_logged{false};
+  std::atomic<const char*> g_crash_stage{"init"};
 
   std::string NowString() {
     auto now = std::chrono::system_clock::now();
@@ -256,22 +288,109 @@ namespace {
     return oss.str();
   }
 
-  void AppendLog(const std::string& message) {
-    static const char* kLogPath = "D:\\REPO_LOG.txt";
+  void WriteLogLineUnlocked(const LogEntry& e) {
     std::ofstream file(kLogPath, std::ios::app);
-    if (!file) {
-      return;
+    if (!file) return;
+    file << "[" << e.ts << "] "
+         << "L" << static_cast<int>(e.level) << " "
+         << "T" << e.tid << " "
+         << "[" << e.stage << "] "
+         << e.msg << "\n";
+  }
+
+  void AppendLogInternal(LogLevel lvl, const char* stage, const std::string& message) {
+    if (static_cast<int>(lvl) > g_log_level.load(std::memory_order_relaxed)) return;
+    LogEntry e{};
+    e.ts = NowString();
+    e.stage = stage ? stage : "general";
+    e.msg = message;
+    e.level = lvl;
+#if defined(_WIN32)
+    e.tid = GetCurrentThreadId();
+#else
+    e.tid = static_cast<uint32_t>(::getpid());
+#endif
+    {
+      std::lock_guard<std::mutex> lock(g_log_mutex);
+      g_log_ring.push_back(e);
+      if (g_log_ring.size() > kLogRingCap) g_log_ring.pop_front();
+      WriteLogLineUnlocked(e);
     }
-    file << "[" << NowString() << "] " << message << "\n";
+  }
+
+  void AppendLog(const std::string& message) {
+    AppendLogInternal(LogLevel::kInfo, "legacy", message);
   }
 
   bool AppendLogOnce(const std::string& key, const std::string& message) {
-    static std::unordered_set<std::string> logged;
-    if (logged.insert(key).second) {
-      AppendLog(message);
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    if (g_log_once.insert(key).second) {
+      LogEntry e{NowString(), "legacy", message, LogLevel::kInfo,
+#if defined(_WIN32)
+        GetCurrentThreadId()
+#else
+        static_cast<uint32_t>(::getpid())
+#endif
+      };
+      g_log_ring.push_back(e);
+      if (g_log_ring.size() > kLogRingCap) g_log_ring.pop_front();
+      WriteLogLineUnlocked(e);
       return true;
     }
     return false;
+  }
+
+  void SetLogLevel(LogLevel lvl) {
+    g_log_level.store(static_cast<int>(lvl), std::memory_order_relaxed);
+  }
+
+  // Crash report dumps last N log lines for diagnosis.
+  void WriteCrashReport(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::ofstream f(kCrashPath, std::ios::app);
+    if (!f) return;
+    f << "=== Crash ===\n";
+    f << "when: " << (where ? where : "<unknown>") << "\n";
+    f << "code: 0x" << std::hex << code << std::dec << "\n";
+    f << "addr: 0x"
+      << (info && info->ExceptionRecord
+            ? reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress)
+            : 0)
+      << "\n";
+    f << "thread: ";
+#if defined(_WIN32)
+    f << GetCurrentThreadId();
+#else
+    f << ::getpid();
+#endif
+    f << "\n";
+    f << "stage: " << g_crash_stage.load(std::memory_order_relaxed) << "\n";
+    f << "last_logs:\n";
+    for (const auto& e : g_log_ring) {
+      f << " [" << e.ts << "] L" << static_cast<int>(e.level) << " T" << e.tid
+        << " [" << e.stage << "] " << e.msg << "\n";
+    }
+    f << "=== End Crash ===\n\n";
+  }
+
+  void LogEnvironmentOnce() {
+    bool expected = false;
+    if (!g_env_logged.compare_exchange_strong(expected, true)) return;
+#if defined(_WIN32)
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    std::ostringstream oss;
+    oss << "Env: CPU=" << si.dwNumberOfProcessors
+        << " PageSize=" << si.dwPageSize
+        << " RAM=" << (ms.ullTotalPhys / (1024 * 1024)) << "MB"
+        << " LogLevel=" << g_log_level.load();
+    AppendLogInternal(LogLevel::kInfo, "env", oss.str());
+#else
+    AppendLogInternal(LogLevel::kInfo, "env", "Environment logging not implemented on this platform");
+#endif
   }
 
   bool IsSubclassOf(MonoClass* klass, MonoClass* parent) {
@@ -1038,6 +1157,18 @@ namespace {
       }
       else {
         AppendLogOnce("GameObject_get_component_fail", "Failed to resolve GameObject::GetComponent(Type)");
+      }
+    }
+    if (g_game_object_class && !g_game_object_get_component_in_parent) {
+      g_game_object_get_component_in_parent =
+        g_mono.mono_class_get_method_from_name(g_game_object_class, "GetComponentInParent", 1);
+      if (g_game_object_get_component_in_parent) {
+        AppendLogOnce("GameObject_get_component_parent_ok",
+          "Successfully resolved GameObject::GetComponentInParent(Type)");
+      }
+      else {
+        AppendLogOnce("GameObject_get_component_parent_fail",
+          "Failed to resolve GameObject::GetComponentInParent(Type)");
       }
     }
     if (g_game_object_class && !g_game_object_get_layer) {
@@ -1985,6 +2116,10 @@ namespace {
   }
 }  // namespace
 
+void SetCrashStage(const char* stage) {
+  g_crash_stage.store(stage ? stage : "null", std::memory_order_relaxed);
+}
+
 long LogCrash(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
   std::ostringstream oss;
   oss << "CRASH in " << (where ? where : "<unknown>")
@@ -1992,12 +2127,14 @@ long LogCrash(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
     << " addr=0x"
     << std::hex
     << (info && info->ExceptionRecord ? reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress) : 0);
-  AppendLog(oss.str());
+  AppendLogInternal(LogLevel::kError, "crash", oss.str());
+  WriteCrashReport(where, code, info);
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
 bool MonoInitialize() {
   if (g_shutting_down) return false;
+  LogEnvironmentOnce();
   return EnsureThreadAttached();
 }
 
@@ -4198,6 +4335,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
   try {
     if (g_shutting_down) return false;
     out_enemies.clear();
+    if (!g_enemy_esp_enabled) return true;  // feature off
     if (!CacheManagedRefs()) {
       AppendLog("MonoListEnemies: CacheManagedRefs failed");
       return false;
@@ -4206,56 +4344,82 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLogOnce("MonoListEnemies_no_class", "MonoListEnemies: EnemyRigidbody class unresolved");
       return false;
     }
-    if (!g_component_get_transform) {
-      AppendLogOnce("MonoListEnemies_no_transform", "MonoListEnemies: Component::get_transform unresolved");
+    if (!g_component_get_transform || !g_component_get_game_object || !g_game_object_get_component) {
+      AppendLogOnce("MonoListEnemies_no_method", "MonoListEnemies: transform/gameObject/GetComponent unresolved");
+      return false;
+    }
+    if (!g_physics_overlap_sphere) {
+      AppendLogOnce("MonoListEnemies_no_overlap", "MonoListEnemies: Physics.OverlapSphere unresolved");
       return false;
     }
 
-    MonoArray* arr = nullptr;
-    int count = 0;
-
-    auto fetch_array_by_type = [&](MonoMethod* method, int argc, bool include_inactive) -> MonoArray* {
-      if (!method || !g_mono.mono_class_get_type || !g_mono.mono_type_get_object) return nullptr;
-      MonoType* enemy_type = g_mono.mono_class_get_type(g_enemy_rigidbody_class);
-      if (!enemy_type) return nullptr;
-      MonoObject* type_obj =
-        g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), enemy_type);
-      if (!type_obj) return nullptr;
-      void* args[2] = { type_obj, &include_inactive };
-      MonoObject* exc = nullptr;
-      MonoObject* arr_obj = g_mono.mono_runtime_invoke(method, nullptr, argc == 1 ? args : args, &exc);
-      if (exc || !arr_obj) return nullptr;
-      return reinterpret_cast<MonoArray*>(arr_obj);
-      };
-
-    // Strategy 1: Object.FindObjectsOfType(Type)
-    if (g_find_objects_of_type_itemvolume) {
-      arr = fetch_array_by_type(g_find_objects_of_type_itemvolume, 1, false);
-    }
-    // Strategy 2: Object.FindObjectsOfType(Type, bool includeInactive)
-    if (!arr && g_find_objects_of_type_itemvolume_include_inactive) {
-      arr = fetch_array_by_type(g_find_objects_of_type_itemvolume_include_inactive, 2, true);
-    }
-    // Strategy 3: Resources.FindObjectsOfTypeAll(Type)
-    if (!arr && g_resources_find_objects_of_type_all) {
-      arr = fetch_array_by_type(g_resources_find_objects_of_type_all, 1, false);
+    // Build Type object for EnemyRigidbody (required for GetComponent)
+    MonoType* enemy_type = g_mono.mono_class_get_type ? g_mono.mono_class_get_type(g_enemy_rigidbody_class) : nullptr;
+    MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
+    MonoObject* enemy_type_obj =
+      (enemy_type && g_mono.mono_type_get_object) ? g_mono.mono_type_get_object(dom, enemy_type) : nullptr;
+    if (!enemy_type_obj) {
+      AppendLogOnce("MonoListEnemies_type_null", "MonoListEnemies: EnemyRigidbody type object null");
+      return false;
     }
 
-    // Guard: nothing found, or invalid array => just return gracefully
-    if (!arr || arr->max_length <= 0) {
-      AppendLogOnce("MonoListEnemies_empty", "MonoListEnemies: no enemies found by authoritative search");
+    // Center on local player if available
+    float center[3] = { 0.0f, 0.0f, 0.0f };
+    PlayerState local_state{};
+    if (MonoGetLocalPlayerState(local_state) && local_state.has_position) {
+      center[0] = local_state.x;
+      center[1] = local_state.y;
+      center[2] = local_state.z;
+    }
+    float radius = 300.0f;
+    int layer_mask = -1;
+    int query = 2;  // QueryTriggerInteraction.Collide
+    void* args4[4] = { center, &radius, &layer_mask, &query };
+    void* args3[3] = { center, &radius, &layer_mask };
+    void* args2[2] = { center, &radius };
+    MonoObject* arr_obj = nullptr;
+    switch (g_physics_overlap_sphere_argc) {
+    case 4:
+      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args4, "Physics.OverlapSphere");
+      break;
+    case 3:
+      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args3, "Physics.OverlapSphere3");
+      break;
+    case 2:
+      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args2, "Physics.OverlapSphere2");
+      break;
+    default:
+      AppendLogOnce("MonoListEnemies_overlap_args", "MonoListEnemies: unsupported OverlapSphere signature");
+      return false;
+    }
+
+    MonoArray* colliders = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
+    if (!colliders || colliders->max_length <= 0 || !colliders->vector) {
+      AppendLogOnce("MonoListEnemies_empty", "MonoListEnemies: no enemies found via OverlapSphere");
       return true;
     }
 
-    count = static_cast<int>(arr->max_length);
+    int limit = static_cast<int>(colliders->max_length);
+    if (limit > 2048) limit = 2048;
     int valid = 0;
-    for (int i = 0; i < count && i < 1024; ++i) {
-      MonoObject* enemy = static_cast<MonoObject*>(arr->vector[i]);
+    for (int i = 0; i < limit; ++i) {
+      MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
+      if (!collider) continue;
+      MonoObject* game_obj = SafeInvoke(g_component_get_game_object, collider, nullptr, "Collider.get_gameObject");
+      if (!game_obj) continue;
+      void* comp_args[1] = { enemy_type_obj };
+      if (!comp_args[0]) continue;
+      MonoObject* enemy =
+        SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(Enemy)");
+      if (!enemy && g_game_object_get_component_in_parent) {
+        enemy = SafeInvoke(g_game_object_get_component_in_parent, game_obj, comp_args,
+          "GameObject.GetComponentInParent(Enemy)");
+        AppendLogOnce("MonoListEnemies_parent_fallback",
+          "Collider game object fell back to GameObject::GetComponentInParent(Enemy)");
+      }
       if (!enemy) continue;
-      MonoObject* exc = nullptr;
-      MonoObject* tr = g_mono.mono_runtime_invoke(g_component_get_transform, enemy, nullptr, &exc);
-      if (exc || !tr) continue;
-      // 额外防御：transform 解析失败直接跳过
+      MonoObject* tr = SafeInvoke(g_component_get_transform, enemy, nullptr, "Enemy.get_transform");
+      if (!tr) continue;
       PlayerState st{};
       st.category = PlayerState::Category::kEnemy;
       if (TryGetPositionFromTransform(tr, st, false) && st.has_position) {
@@ -4264,22 +4428,33 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
         out_enemies.push_back(st);
         ++valid;
       }
+      if (valid >= 256) break;
     }
 
-    static bool logged_once = false;
-    if (!logged_once) {
-      std::ostringstream oss;
-      oss << "MonoListEnemies: total=" << count << " valid=" << valid;
-      AppendLog(oss.str());
-      logged_once = true;
+    if (valid == 0) {
+      AppendLogOnce("MonoListEnemies_zero", "MonoListEnemies: found zero enemies after scanning colliders");
     }
-
     return true;
   }
   catch (...) {
     AppendLog("MonoListEnemies: exception caught");
+    g_enemy_esp_disabled = true;
     return false;
   }
+}
+
+bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies) {
+#ifdef _MSC_VER
+  __try {
+    return MonoListEnemies(out_enemies);
+  }
+  __except (LogCrash("MonoListEnemiesSafe", GetExceptionCode(), GetExceptionInformation())) {
+    g_enemy_esp_disabled = true;
+    return false;
+  }
+#else
+  return MonoListEnemies(out_enemies);
+#endif
 }
 
 bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
@@ -4451,13 +4626,23 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
   MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
   MonoObject* pgo_type_obj = (pgo_type && g_mono.mono_type_get_object) ? g_mono.mono_type_get_object(dom, pgo_type) : nullptr;
 
+  // Prevent runaway loops on large maps: cap objects and time budget
+  const int kObjCap = max_items > 0 ? std::min(max_items, 512) : 512;
+  const uint64_t start_ms = GetTickCount64();
+  const uint64_t kBudgetMs = 30;  // keep under ~30ms to avoid hitching Present thread
+
   auto call_new_on_array = [&](MonoArray* arr) {
     if (!arr || arr->max_length <= 0) return 0;
     int limit = static_cast<int>(arr->max_length);
     if (max_items > 0 && limit > max_items) limit = max_items;
-    if (limit > 2048) limit = 2048;
+    if (limit > kObjCap) limit = kObjCap;
     int hit = 0;
     for (int i = 0; i < limit; ++i) {
+      if (GetTickCount64() - start_ms > kBudgetMs) {
+        AppendLogInternal(LogLevel::kWarn, "valuable",
+          "ValuableDiscover.New exceeded time budget, early-exit");
+        break;
+      }
       MonoObject* obj = static_cast<MonoObject*>(arr->vector[i]);
       if (!obj) continue;
       void* new_args[2] = { obj, &state };
@@ -4505,6 +4690,11 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
       int limit = colliders ? static_cast<int>(colliders->max_length) : 0;
       if (limit > 4096) limit = 4096;
       for (int i = 0; i < limit; ++i) {
+        if (GetTickCount64() - start_ms > kBudgetMs) {
+          AppendLogInternal(LogLevel::kWarn, "valuable",
+            "ValuableDiscover overlap-sphere exceeded time budget, early-exit");
+          break;
+        }
         MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
         if (!collider) continue;
         MonoObject* game_obj =

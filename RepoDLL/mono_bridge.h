@@ -63,6 +63,12 @@ bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count);
 bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, int& out_count);
 bool MonoNativeHighlightAvailable();
 
+extern bool g_native_highlight_failed;
+extern bool g_native_highlight_active;
+
+// 目前在 HookPresent / RenderOverlay 中设置，用于在崩溃日志里记录阶段
+void SetCrashStage(const char* stage);
+
 bool MonoSetRunCurrency(int amount);
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
@@ -86,6 +92,11 @@ bool MonoListItems(std::vector<PlayerState>& out_items);
 
 // Enumerate enemies (any hostile entity with transform).
 bool MonoListEnemies(std::vector<PlayerState>& out_enemies);
+// SEH-safe wrapper for overlay thread
+bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies);
+
+extern bool g_enemy_esp_disabled;
+extern bool g_enemy_esp_enabled;
 
 // ESP开关（在 hook_dx11.cpp 定义）
 extern bool g_esp_enabled;
