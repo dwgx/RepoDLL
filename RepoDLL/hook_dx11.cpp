@@ -28,14 +28,17 @@ bool g_overlay_disabled = false;
 
 namespace {
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
 PresentFn g_original_present = nullptr;
+ResizeBuffersFn g_original_resizebuffers = nullptr;
 HWND g_hwnd = nullptr;
 WNDPROC g_original_wndproc = nullptr;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
 void* g_present_fn = nullptr;
+void* g_resize_fn = nullptr;
 bool g_imgui_initialized = false;
 bool g_imgui_context_created = false;
 bool g_menu_open = true;
@@ -109,6 +112,19 @@ void CleanupRenderTarget() {
   }
 }
 
+HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count, UINT width,
+                                    UINT height, DXGI_FORMAT format, UINT flags) {
+  // Release RTV bound to the old backbuffer before the swap chain recreates buffers.
+  CleanupRenderTarget();
+  HRESULT hr = g_original_resizebuffers
+                 ? g_original_resizebuffers(swap_chain, buffer_count, width, height, format, flags)
+                 : DXGI_ERROR_INVALID_CALL;
+  if (SUCCEEDED(hr)) {
+    CreateRenderTarget(swap_chain);
+  }
+  return hr;
+}
+
   // 轻量 ESP 绘制：使用相机矩阵把物品/敌人投影到屏幕
   void DrawEsp() {
     if (!g_esp_enabled || g_native_highlight_active || MonoIsShuttingDown()) return;
@@ -167,8 +183,11 @@ void CleanupRenderTarget() {
       };
 
       const auto& items = UiGetCachedItems();
-      if (!items.empty()) {
-        const size_t cap = items.size() > 1024 ? 1024 : items.size();
+      if (g_item_esp_enabled && !items.empty()) {
+        size_t cap = items.size();
+        if (g_item_esp_cap >= 0 && static_cast<size_t>(g_item_esp_cap) < cap) cap = static_cast<size_t>(g_item_esp_cap);
+        const size_t max_cap = 1024;
+        if (cap > max_cap) cap = max_cap;
         for (size_t i = 0; i < cap; ++i) {
           const auto& st = items[i];
           if (!st.has_position) continue;
@@ -189,7 +208,10 @@ void CleanupRenderTarget() {
 
       const auto& enemies = UiGetCachedEnemies();
       if (g_enemy_esp_enabled && !g_enemy_esp_disabled && !enemies.empty()) {
-        const size_t cap = enemies.size() > 512 ? 512 : enemies.size();
+        size_t cap = enemies.size();
+        if (g_enemy_esp_cap >= 0 && static_cast<size_t>(g_enemy_esp_cap) < cap) cap = static_cast<size_t>(g_enemy_esp_cap);
+        const size_t max_cap = 512;
+        if (cap > max_cap) cap = max_cap;
         for (size_t i = 0; i < cap; ++i) {
           const auto& st = enemies[i];
           if (!st.has_position) continue;
@@ -422,10 +444,15 @@ bool CreateDx11Hook() {
 
   void** vtable = *reinterpret_cast<void***>(swap_chain);
   void* present = vtable[8];
+  void* resizebuffers = vtable[13];
   if (!present) {
     LogMessage("CreateDx11Hook: present vtable null");
   }
+  if (!resizebuffers) {
+    LogMessage("CreateDx11Hook: resizebuffers vtable null");
+  }
   g_present_fn = present;
+  g_resize_fn = resizebuffers;
 
   swap_chain->Release();
   context->Release();
@@ -444,10 +471,26 @@ bool CreateDx11Hook() {
     MH_Uninitialize();
     return false;
   }
+  if (resizebuffers &&
+      MH_CreateHook(resizebuffers, HookResizeBuffers,
+                    reinterpret_cast<void**>(&g_original_resizebuffers)) != MH_OK) {
+    LogMessage("CreateDx11Hook: MH_CreateHook ResizeBuffers failed");
+    MH_RemoveHook(present);
+    MH_Uninitialize();
+    return false;
+  }
 
   if (MH_EnableHook(present) != MH_OK) {
     LogMessage("CreateDx11Hook: MH_EnableHook failed");
     MH_RemoveHook(present);
+    if (resizebuffers) MH_RemoveHook(resizebuffers);
+    MH_Uninitialize();
+    return false;
+  }
+  if (resizebuffers && MH_EnableHook(resizebuffers) != MH_OK) {
+    LogMessage("CreateDx11Hook: MH_EnableHook ResizeBuffers failed");
+    MH_RemoveHook(present);
+    MH_RemoveHook(resizebuffers);
     MH_Uninitialize();
     return false;
   }
@@ -504,6 +547,11 @@ void UnhookDx11() {
     MH_DisableHook(g_present_fn);
     MH_RemoveHook(g_present_fn);
     g_present_fn = nullptr;
+  }
+  if (g_resize_fn && g_original_resizebuffers) {
+    MH_DisableHook(g_resize_fn);
+    MH_RemoveHook(g_resize_fn);
+    g_resize_fn = nullptr;
   }
   MH_Uninitialize();
 

@@ -101,8 +101,9 @@ void RenderOverlay(bool* menu_open) {
   static bool lock_stamina = false;
   static bool inputs_synced = false;
   static bool auto_refresh = true;  // 默认开启自动刷新（玩家状态）
-  static bool auto_refresh_items = true;
-  static bool auto_refresh_enemies = true;
+  // 为避免主菜单/加载场景扫描导致崩溃，默认关闭自动刷新，进局后再手动开启。
+  static bool auto_refresh_items = false;
+  static bool auto_refresh_enemies = false;
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
   static int native_highlight_limit = 160;
   static uint64_t last_highlight_tick = 0;
@@ -149,16 +150,20 @@ void RenderOverlay(bool* menu_open) {
 
   auto refresh_items = [&]() {
     if (!mono_ready) return;
+    if (g_items_disabled) return;
+    // 仅在有可靠本地玩家坐标时刷新，避免主菜单/加载场景扫物品导致崩溃
+    if (!last_ok || !last_state.has_position) return;
+    // 若还没有获取过相机矩阵，也跳过（常见于主菜单）
+    if (!g_cached_mats_valid) return;
     SetCrashStage("RenderOverlay:MonoListItems");
-    MonoListItems(g_cached_items);
+    MonoListItemsSafe(g_cached_items);
     last_items_update = now;
   };
   auto refresh_enemies = [&]() {
     if (!mono_ready) return;
-    if (!g_enemy_esp_enabled || g_enemy_esp_disabled) {
-      g_cached_enemies.clear();
-      return;
-    }
+    if (g_enemy_esp_disabled) return;
+    if (!last_ok || !last_state.has_position) return;
+    if (!g_cached_mats_valid) return;
     SetCrashStage("RenderOverlay:MonoListEnemies");
     MonoListEnemiesSafe(g_cached_enemies);
     last_enemies_update = now;
@@ -461,7 +466,7 @@ void RenderOverlay(bool* menu_open) {
 
         // 物品 / ESP 页
         if (ImGui::BeginTabItem("物品/ESP")) {
-          ImGui::Checkbox("启用ESP常亮", &g_esp_enabled);
+          ImGui::Checkbox("物品ESP", &g_item_esp_enabled);
           ImGui::SameLine();
           ImGui::Checkbox("原生高亮", &g_native_highlight_active);
           ImGui::SameLine();
@@ -470,12 +475,17 @@ void RenderOverlay(bool* menu_open) {
           if (ImGui::Button("刷新物品")) refresh_items();
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_items.size()));
+          ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
+          ImGui::SliderInt("敌人ESP上限", &g_enemy_esp_cap, 0, 512);
 
           ImGui::Spacing();
           ImGui::BeginGroup();
+          int total_items = static_cast<int>(g_cached_items.size());
           ImGui::TextDisabled("原生高亮状态");
           ImGui::SliderInt("模式##native_state", &native_highlight_state, 0, 2);
           ImGui::SliderInt("最大数量##native_limit", &native_highlight_limit, 20, 512);
+          ImGui::SameLine();
+          ImGui::TextDisabled("当前检测: %d", total_items);
           ImGui::SameLine();
           ImGui::TextDisabled("最近触发: %d", last_highlight_count);
           ImGui::EndGroup();
@@ -518,7 +528,9 @@ void RenderOverlay(bool* menu_open) {
               ImGui::TextColored(col, "%s", cat_name(st.category));
 
               ImGui::TableSetColumnIndex(2);
-              if (st.has_value) ImGui::Text("%d", st.value); else ImGui::TextDisabled("-");
+              if (st.has_value) ImGui::Text("%d", st.value);
+              else if (st.has_item_type) ImGui::TextDisabled("type %d", st.item_type);
+              else ImGui::TextDisabled("-");
 
               ImGui::TableSetColumnIndex(3);
               if (last_state.has_position && st.has_position) {

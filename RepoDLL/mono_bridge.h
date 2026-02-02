@@ -28,6 +28,8 @@ struct PlayerState {
   bool has_name = false;
   int value = 0;
   bool has_value = false;
+  int item_type = -1;
+  bool has_item_type = false;
   enum Category : int {
     kUnknown = 0,
     kValuable = 1,
@@ -89,6 +91,8 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local);
 
 // Enumerate items/valuables; fills out_items with positions (health/energy unused).
 bool MonoListItems(std::vector<PlayerState>& out_items);
+// SEH-safe wrapper for overlay thread
+bool MonoListItemsSafe(std::vector<PlayerState>& out_items);
 
 // Enumerate enemies (any hostile entity with transform).
 bool MonoListEnemies(std::vector<PlayerState>& out_enemies);
@@ -97,6 +101,11 @@ bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies);
 
 extern bool g_enemy_esp_disabled;
 extern bool g_enemy_esp_enabled;
+extern bool g_items_disabled;
+extern bool g_enemy_cache_disabled;
+extern bool g_item_esp_enabled;
+extern int g_item_esp_cap;
+extern int g_enemy_esp_cap;
 
 // ESP开关（在 hook_dx11.cpp 定义）
 extern bool g_esp_enabled;
