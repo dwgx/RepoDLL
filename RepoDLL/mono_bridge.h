@@ -110,6 +110,15 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies);
 // SEH-safe wrapper for overlay thread
 bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies);
 
+// Diagnostics / manual controls
+bool MonoItemsDisabled();
+void MonoResetItemsDisabled();
+bool MonoManualRefreshItems(std::vector<PlayerState>& out_items);
+void MonoResetEnemiesDisabled();
+bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results);
+bool MonoReviveAllPlayers(bool include_local);
+bool MonoGetLogs(int max_lines, std::vector<std::string>& out_logs);
+
 extern bool g_enemy_esp_disabled;
 extern bool g_enemy_esp_enabled;
 extern bool g_items_disabled;

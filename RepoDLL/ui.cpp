@@ -103,6 +103,8 @@ void RenderOverlay(bool* menu_open) {
   static bool auto_refresh = true;  // 默认开启自动刷新（玩家状态）
   static bool auto_refresh_items = true;
   static bool auto_refresh_enemies = true;
+  static std::vector<PlayerState> squad_states;
+  static uint64_t last_squad_update = 0;
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
   static int native_highlight_limit = 160;
   static uint64_t last_highlight_tick = 0;
@@ -113,11 +115,11 @@ void RenderOverlay(bool* menu_open) {
   static int round_goal_edit = 0;
   static bool round_lock_enabled = false;
   static uint64_t round_lock_last_tick = 0;
-  static float speed_mult = 3.0f;
-  static int extra_jump_count = 9999;  // 固定大值用于无限跳跃
-  static float jump_cooldown = 0.0f;
+  static float speed_mult = 1.0f;      // 默认与游戏一致，不主动改动
+  static int extra_jump_count = 0;     // 默认不加跳数，避免注入即改变
+  static float jump_cooldown = 0.0f;   // 仅在用户修改后生效
   static int grab_strength = 1000;
-  static bool infinite_jump_enabled = true;
+  static bool infinite_jump_enabled = false;  // 默认关闭，需手动开启
   static bool god_mode_enabled = false;
   static float jump_force = 20.0f;
   static float grab_range_field = 5.0f;
@@ -127,9 +129,14 @@ void RenderOverlay(bool* menu_open) {
   static uint64_t last_user_edit = 0;
   static uint64_t last_items_update = 0;
   static uint64_t last_enemies_update = 0;
+  static bool no_fall_enabled = false;
+  static bool include_local_squad = true;
   static RoundState cached_round_state{};
   static bool has_round_state = false;
   static uint64_t last_round_update = 0;
+  static std::vector<std::string> debug_logs;
+  static uint64_t last_log_update = 0;
+  static int log_lines = 200;
 
   const uint64_t now = GetTickCount64();
   const bool mono_ready = MonoInitialize();
@@ -189,6 +196,15 @@ void RenderOverlay(bool* menu_open) {
     MonoListEnemiesSafe(g_cached_enemies);
     last_enemies_update = now;
   };
+  auto refresh_squad = [&]() {
+    if (!mono_ready) return;
+    MonoListPlayers(squad_states, include_local_squad);
+    last_squad_update = now;
+  };
+  auto refresh_logs = [&]() {
+    MonoGetLogs(log_lines, debug_logs);
+    last_log_update = now;
+  };
   auto refresh_matrices = [&]() {
     if (!mono_ready) return;
     SetCrashStage("RenderOverlay:MonoGetCameraMatrices");
@@ -207,6 +223,9 @@ void RenderOverlay(bool* menu_open) {
   if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 60) {
     refresh_enemies();
   }
+  if (mono_ready && safe_to_refresh && now - last_squad_update > 500) {
+    refresh_squad();
+  }
   if (mono_ready && now - g_last_matrix_update > 33) {
     refresh_matrices();
   }
@@ -222,34 +241,29 @@ void RenderOverlay(bool* menu_open) {
     }
   }
 
-  // Native in-game highlight (ValuableDiscover)
+  auto native_highlight = [&](uint64_t ts) -> bool {
+    SetCrashStage("RenderOverlay:NativeHighlight");
+    if (ts - last_highlight_tick > 900) {
+      int count = 0;
+      SetCrashStage("RenderOverlay:MonoTriggerValuableDiscover");
+      if (MonoTriggerValuableDiscoverSafe(native_highlight_state, native_highlight_limit, count)) {
+        last_highlight_count = count;
+      }
+      last_highlight_tick = ts;
+    }
+    if (ts - last_persist_tick > 200) {
+      SetCrashStage("RenderOverlay:MonoApplyValuableDiscoverPersistence");
+      int count = 0;
+      MonoApplyValuableDiscoverPersistenceSafe(true, 0.0f, count);
+      last_persist_tick = ts;
+    }
+    return true;
+  };
+
+  // Native in-game highlight (ValuableDiscover) with SEH guard
   if (mono_ready && g_esp_enabled && g_native_highlight_active &&
-      MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
-#ifdef _MSC_VER
-    __try {
-#endif
-      SetCrashStage("RenderOverlay:NativeHighlight");
-      if (now - last_highlight_tick > 900) {
-        int count = 0;
-        SetCrashStage("RenderOverlay:MonoTriggerValuableDiscover");
-        if (MonoTriggerValuableDiscoverSafe(native_highlight_state, native_highlight_limit, count)) {
-          last_highlight_count = count;
-        }
-        last_highlight_tick = now;
-      }
-      if (now - last_persist_tick > 200) {
-        SetCrashStage("RenderOverlay:MonoApplyValuableDiscoverPersistence");
-        int count = 0;
-        MonoApplyValuableDiscoverPersistenceSafe(true, 0.0f, count);
-        last_persist_tick = now;
-      }
-#ifdef _MSC_VER
-    }
-    __except (LogCrash("RenderOverlay:NativeHighlight", GetExceptionCode(), GetExceptionInformation())) {
-      g_native_highlight_active = false;
-      g_native_highlight_failed = true;
-    }
-#endif
+    MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
+    native_highlight(now);
   }
 
   // Sync inputs once after we get a fresh state, but don't stomp user edits every frame.
@@ -440,16 +454,22 @@ void RenderOverlay(bool* menu_open) {
                 round_apply = false;  // only apply when user clicks
               }
               ImGui::SameLine();
-              if (ImGui::Button("当前=目标##copy_goal")) {
-                round_current_edit = round_goal_edit;
-                round_apply = true;
-              }
-              if (round_apply) {
-                MonoSetRoundState(round_current_edit, round_goal_edit, round_current_edit);
-              }
-              ImGui::Checkbox("锁定伪房主(每0.2s覆盖)", &round_lock_enabled);
-              ImGui::SameLine();
-              ImGui::TextDisabled("仅本地，绕过房主同步");
+            if (ImGui::Button("当前=目标##copy_goal")) {
+              round_current_edit = round_goal_edit;
+              round_apply = true;
+            }
+            if (round_apply) {
+              MonoSetRoundState(round_current_edit, round_goal_edit, round_current_edit);
+            }
+            ImGui::Checkbox("伪房主", &round_lock_enabled);
+            ImGui::SameLine();
+            ImGui::TextDisabled("ZW[ZIWEI]");
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("防摔倒/击倒");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Checkbox("防摔倒", &no_fall_enabled);
             }
             else {
               ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "未找到 RoundDirector (请在局内)");
@@ -552,6 +572,18 @@ void RenderOverlay(bool* menu_open) {
           if (ImGui::Button("刷新物品")) refresh_items();
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_items.size()));
+          if (MonoItemsDisabled()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "物品扫描已自动关闭(崩溃保护)");
+          }
+          if (ImGui::Button("安全刷新一次")) {
+            MonoManualRefreshItems(g_cached_items);
+            last_items_update = now;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("重置禁用标志")) {
+            MonoResetItemsDisabled();
+          }
           ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
           ImGui::SliderInt("敌人ESP上限", &g_enemy_esp_cap, 0, 512);
 
@@ -637,6 +669,110 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndTabItem();
         }
 
+        // 队友/复活
+        if (ImGui::BeginTabItem("队友")) {
+          ImGui::Checkbox("包含自己", &include_local_squad);
+          ImGui::SameLine();
+          if (ImGui::Button("刷新队友")) refresh_squad();
+          ImGui::SameLine();
+          if (ImGui::Button("复活队友")) {
+            MonoReviveAllPlayers(false);
+            refresh_squad();
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("全体满血(含自己)")) {
+            MonoReviveAllPlayers(true);
+            refresh_squad();
+          }
+          ImGui::SameLine();
+          ImGui::TextDisabled("队友数: %d", static_cast<int>(squad_states.size()));
+
+          ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;
+          ImVec2 table_size = ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y - 8.0f);
+          if (ImGui::BeginTable("squad_table_view", 5, flags, table_size)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("生命", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("状态", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("距离", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("坐标", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableHeadersRow();
+
+            for (const auto& st : squad_states) {
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::TextUnformatted(st.has_name ? st.name.c_str() : "<player>");
+
+              ImGui::TableSetColumnIndex(1);
+              if (st.has_health) ImGui::Text("%d / %d", st.health, st.max_health);
+              else ImGui::TextDisabled("-");
+
+              ImGui::TableSetColumnIndex(2);
+              bool downed = st.has_health && st.health <= 0;
+              ImVec4 col = downed ? ImVec4(0.9f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.85f, 0.45f, 1.0f);
+              ImGui::TextColored(col, "%s", downed ? "倒地" : "存活");
+
+              ImGui::TableSetColumnIndex(3);
+              if (last_state.has_position && st.has_position) {
+                float dx = st.x - last_state.x;
+                float dy = st.y - last_state.y;
+                float dz = st.z - last_state.z;
+                ImGui::Text("%.1fm", std::sqrt(dx * dx + dy * dy + dz * dz));
+              } else {
+                ImGui::TextDisabled("-");
+              }
+
+              ImGui::TableSetColumnIndex(4);
+              if (st.has_position) {
+                ImGui::Text("%.2f, %.2f, %.2f", st.x, st.y, st.z);
+              } else {
+                ImGui::TextDisabled("无坐标");
+              }
+            }
+            ImGui::EndTable();
+          }
+          ImGui::EndTabItem();
+        }
+
+        // 调试
+        if (ImGui::BeginTabItem("调试")) {
+          SectionLabel("刷新/开关");
+          ImGui::TextDisabled("物品禁用: %s", MonoItemsDisabled() ? "是" : "否");
+          ImGui::SameLine();
+          if (ImGui::Button("重置物品禁用")) {
+            MonoResetItemsDisabled();
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("手动刷新物品")) {
+            MonoManualRefreshItems(g_cached_items);
+            last_items_update = now;
+          }
+          ImGui::SameLine();
+          ImGui::TextDisabled("敌人禁用: %s", g_enemy_esp_disabled ? "是" : "否");
+          ImGui::SameLine();
+          if (ImGui::Button("重置敌人禁用")) {
+            MonoResetEnemiesDisabled();
+          }
+
+          SectionLabel("日志");
+          ImGui::SliderInt("行数", &log_lines, 50, 400);
+          ImGui::SameLine();
+          if (ImGui::Button("刷新日志")) {
+            refresh_logs();
+          }
+          if (debug_logs.empty() && (now - last_log_update > 2000)) {
+            refresh_logs();
+          }
+          ImGui::BeginChild("log_view", ImVec2(0, ImGui::GetContentRegionAvail().y - 8.0f), true);
+          for (const auto& line : debug_logs) {
+            ImGui::TextUnformatted(line.c_str());
+          }
+          ImGui::EndChild();
+
+          ImGui::EndTabItem();
+        }
+
         // 敌人页
         if (ImGui::BeginTabItem("敌人")) {
           ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled);
@@ -704,6 +840,10 @@ void RenderOverlay(bool* menu_open) {
 
   // Auto-maintenance toggles
   if (last_ok) {
+    if (no_fall_enabled) {
+      // 防摔倒：仅尝试去掉击倒/摔落的体力消耗与硬直，而不附加无敌
+      MonoOverrideJumpCooldown(0.0f);
+    }
     if (infinite_jump_enabled && extra_jump_count > 0) {
       MonoSetJumpExtraDirect(extra_jump_count);
     }
