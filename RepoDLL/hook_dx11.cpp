@@ -23,7 +23,7 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // ESP 开关（供 mono_bridge 等引用）
-bool g_esp_enabled = true;
+bool g_esp_enabled = false;
 // Overlay 状态（供 mono_bridge 等引用）
 bool g_overlay_disabled = false;
 
@@ -79,7 +79,8 @@ static bool WorldToScreen(const Vec3& p, const Matrix4x4& view, const Matrix4x4&
 }
 
 void LogMessage(const std::string& msg) {
-  std::ofstream f("D:\\Project\\REPO_LOG.txt", std::ios::app);
+  std::string path = MonoGetLogPath();
+  std::ofstream f(path, std::ios::app);
   if (!f) return;
   auto now = std::chrono::system_clock::now();
   auto t = std::chrono::system_clock::to_time_t(now);
@@ -142,7 +143,7 @@ HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_coun
 
   // 轻量 ESP 绘制：使用相机矩阵把物品/敌人投影到屏幕
   void DrawEsp() {
-    if (!g_esp_enabled || g_native_highlight_active || MonoIsShuttingDown()) return;
+    if (g_overlay_disabled || MonoIsShuttingDown()) return;
     try {
       ImDrawList* dl = ImGui::GetForegroundDrawList();
       if (!dl) return;

@@ -118,6 +118,8 @@ void MonoResetEnemiesDisabled();
 bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results);
 bool MonoReviveAllPlayers(bool include_local);
 bool MonoGetLogs(int max_lines, std::vector<std::string>& out_logs);
+const std::string& MonoGetLogPath();
+void MonoSetLogPath(const std::string& path_utf8);
 
 extern bool g_enemy_esp_disabled;
 extern bool g_enemy_esp_enabled;

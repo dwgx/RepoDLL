@@ -11,7 +11,8 @@
 
 namespace {
 void LogMessage(const char* tag) {
-  std::ofstream f("D:\\Project\\REPO_LOG.txt", std::ios::app);
+  std::string path = MonoGetLogPath();
+  std::ofstream f(path, std::ios::app);
   if (!f) return;
   auto now = std::chrono::system_clock::now();
   auto t = std::chrono::system_clock::to_time_t(now);

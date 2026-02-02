@@ -12,6 +12,8 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 
 #pragma execution_character_set("utf-8")
 
@@ -37,6 +39,87 @@ Matrix4x4 g_cached_view{};
 Matrix4x4 g_cached_proj{};
 bool g_cached_mats_valid = false;
 uint64_t g_last_matrix_update = 0;
+
+struct SavedSettings {
+  bool auto_refresh = false;
+  bool auto_refresh_items = false;
+  bool auto_refresh_enemies = false;
+  bool item_esp = false;
+  bool enemy_esp = false;
+  bool native_highlight = false;
+  bool no_fall = false;
+  bool load_on_start = true;
+  bool reset_each_round = true;
+  float speed_mult = 1.0f;
+  std::string log_path;
+};
+
+std::string SettingsPath() {
+  std::filesystem::path p(MonoGetLogPath());
+  return (p.parent_path() / "repodll_settings.ini").string();
+}
+
+void ResetUiDefaults(bool &auto_refresh, bool &auto_refresh_items, bool &auto_refresh_enemies,
+  bool &item_esp, bool &enemy_esp, bool &native_highlight, bool &no_fall,
+  float &speed_mult, int &extra_jump_count, bool &infinite_jump_enabled,
+  bool &god_mode_enabled) {
+  auto_refresh = false;
+  auto_refresh_items = false;
+  auto_refresh_enemies = false;
+  item_esp = false;
+  enemy_esp = false;
+  native_highlight = false;
+  no_fall = false;
+  speed_mult = 1.0f;
+  extra_jump_count = 0;
+  infinite_jump_enabled = false;
+  god_mode_enabled = false;
+}
+
+void SaveSettings(const SavedSettings& s) {
+  std::ofstream f(SettingsPath(), std::ios::trunc);
+  if (!f) return;
+  f << "auto_refresh=" << s.auto_refresh << "\n";
+  f << "auto_refresh_items=" << s.auto_refresh_items << "\n";
+  f << "auto_refresh_enemies=" << s.auto_refresh_enemies << "\n";
+  f << "item_esp=" << s.item_esp << "\n";
+  f << "enemy_esp=" << s.enemy_esp << "\n";
+  f << "native_highlight=" << s.native_highlight << "\n";
+  f << "no_fall=" << s.no_fall << "\n";
+  f << "speed_mult=" << s.speed_mult << "\n";
+  f << "load_on_start=" << s.load_on_start << "\n";
+  f << "reset_each_round=" << s.reset_each_round << "\n";
+  f << "log_path=" << s.log_path << "\n";
+}
+
+bool LoadSettings(SavedSettings& out) {
+  std::ifstream f(SettingsPath());
+  if (!f) return false;
+  std::string line;
+  while (std::getline(f, line)) {
+    auto pos = line.find('=');
+    if (pos == std::string::npos) continue;
+    std::string k = line.substr(0, pos);
+    std::string v = line.substr(pos + 1);
+    auto to_bool = [](const std::string& s) { return s == "1" || s == "true" || s == "True"; };
+    try {
+      if (k == "auto_refresh") out.auto_refresh = to_bool(v);
+      else if (k == "auto_refresh_items") out.auto_refresh_items = to_bool(v);
+      else if (k == "auto_refresh_enemies") out.auto_refresh_enemies = to_bool(v);
+      else if (k == "item_esp") out.item_esp = to_bool(v);
+      else if (k == "enemy_esp") out.enemy_esp = to_bool(v);
+      else if (k == "native_highlight") out.native_highlight = to_bool(v);
+      else if (k == "no_fall") out.no_fall = to_bool(v);
+      else if (k == "speed_mult") out.speed_mult = std::stof(v);
+      else if (k == "load_on_start") out.load_on_start = to_bool(v);
+      else if (k == "reset_each_round") out.reset_each_round = to_bool(v);
+      else if (k == "log_path") out.log_path = v;
+    } catch (...) {
+      continue;
+    }
+  }
+  return true;
+}
 
 void ApplyOverlayStyleOnce() {
   static bool styled = false;
@@ -70,7 +153,18 @@ void ApplyOverlayStyleOnce() {
 
 void SectionLabel(const char* label) {
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.48f, 1.0f), "%s", label);
+  ImVec4 col = ImVec4(0.22f, 0.74f, 0.48f, 1.0f);
+  ImGui::TextColored(col, "%s", label);
+  // Animated underline for a bit of motion
+  ImVec2 start = ImGui::GetItemRectMin();
+  ImVec2 end = ImGui::GetItemRectMax();
+  float t = ImGui::GetTime();
+  float pulse = 0.5f + 0.5f * sinf(t * 3.0f);
+  ImVec4 line_col = ImVec4(col.x, col.y, col.z, 0.35f + 0.35f * pulse);
+  ImGui::GetWindowDrawList()->AddRectFilled(
+    ImVec2(start.x, end.y + 2.0f),
+    ImVec2(end.x, end.y + 6.0f),
+    ImColor(line_col));
   ImGui::Separator();
 }
 }  // namespace
@@ -100,9 +194,9 @@ void RenderOverlay(bool* menu_open) {
   static bool lock_health = false;
   static bool lock_stamina = false;
   static bool inputs_synced = false;
-  static bool auto_refresh = true;  // 默认开启自动刷新（玩家状态）
-  static bool auto_refresh_items = true;
-  static bool auto_refresh_enemies = true;
+  static bool auto_refresh = false;  // 默认关闭，需用户开启
+  static bool auto_refresh_items = false;
+  static bool auto_refresh_enemies = false;
   static std::vector<PlayerState> squad_states;
   static uint64_t last_squad_update = 0;
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
@@ -137,12 +231,37 @@ void RenderOverlay(bool* menu_open) {
   static std::vector<std::string> debug_logs;
   static uint64_t last_log_update = 0;
   static int log_lines = 200;
+  static SavedSettings saved{};
+  static bool settings_loaded = false;
+  static bool reset_each_round = true;
+  static int last_stage_seen = -999;
+  static char log_path_buf[260] = {};
 
   const uint64_t now = GetTickCount64();
   const bool mono_ready = MonoInitialize();
   const bool user_editing = ImGui::IsAnyItemActive();
   if (user_editing) {
     last_user_edit = now;
+  }
+  if (!settings_loaded) {
+    saved.log_path = MonoGetLogPath();
+    LoadSettings(saved);
+    if (!saved.log_path.empty()) {
+      strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
+      MonoSetLogPath(saved.log_path);
+    }
+    if (saved.load_on_start) {
+      auto_refresh = saved.auto_refresh;
+      auto_refresh_items = saved.auto_refresh_items;
+      auto_refresh_enemies = saved.auto_refresh_enemies;
+      g_item_esp_enabled = saved.item_esp;
+      g_enemy_esp_enabled = saved.enemy_esp;
+      g_native_highlight_active = saved.native_highlight;
+      no_fall_enabled = saved.no_fall;
+      speed_mult = saved.speed_mult;
+      reset_each_round = saved.reset_each_round;
+    }
+    settings_loaded = true;
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -167,6 +286,12 @@ void RenderOverlay(bool* menu_open) {
     if (MonoGetRoundState(rs) && rs.ok) {
       has_round_state = true;
       cached_round_state = rs;
+      if (reset_each_round && last_stage_seen != -999 && rs.stage != last_stage_seen) {
+        ResetUiDefaults(auto_refresh, auto_refresh_items, auto_refresh_enemies,
+          g_item_esp_enabled, g_enemy_esp_enabled, g_native_highlight_active, no_fall_enabled,
+          speed_mult, extra_jump_count, infinite_jump_enabled, god_mode_enabled);
+      }
+      last_stage_seen = rs.stage;
       // 同步输入框（如果当前没有正在编辑）
       if (!user_editing) {
         if (rs.current >= 0) round_current_edit = rs.current;
@@ -563,9 +688,13 @@ void RenderOverlay(bool* menu_open) {
 
         // 物品 / ESP 页
         if (ImGui::BeginTabItem("物品/ESP")) {
-          ImGui::Checkbox("物品ESP", &g_item_esp_enabled);
+          if (ImGui::Checkbox("物品ESP", &g_item_esp_enabled)) {
+            g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+          }
           ImGui::SameLine();
-          ImGui::Checkbox("原生高亮", &g_native_highlight_active);
+          if (ImGui::Checkbox("原生高亮", &g_native_highlight_active)) {
+            g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+          }
           ImGui::SameLine();
           ImGui::Checkbox("自动刷新", &auto_refresh_items);
           ImGui::SameLine();
@@ -775,7 +904,145 @@ void RenderOverlay(bool* menu_open) {
 
         // 敌人页
         if (ImGui::BeginTabItem("敌人")) {
-          ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled);
+          if (ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled)) {
+            g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+          }
+          ImGui::SameLine();
+          ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
+          ImGui::SameLine();
+          if (ImGui::Button("刷新敌人")) refresh_enemies();
+          ImGui::SameLine();
+          ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
+          if (g_enemy_esp_disabled) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "敌人扫描已自动关闭(崩溃保护)");
+          }
+
+          // Child 内只绘制一次表格，避免底部再出现重复控件
+          ImGui::BeginChild("enemy_table_child", ImVec2(0, ImGui::GetContentRegionAvail().y - 4.0f), true);
+          ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;
+          if (ImGui::BeginTable("enemy_table_view", 5, flags)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("距离", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("坐标", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableHeadersRow();
+
+            for (const auto& st : g_cached_enemies) {
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%s",
+                st.has_name ? st.name.c_str() : "Enemy");
+              ImGui::TableSetColumnIndex(1);
+              if (last_state.has_position && st.has_position) {
+                float dx = st.x - last_state.x;
+                float dy = st.y - last_state.y;
+                float dz = st.z - last_state.z;
+                ImGui::Text("%.1fm", std::sqrt(dx * dx + dy * dy + dz * dz));
+              }
+              else {
+                ImGui::TextDisabled("-");
+              }
+              ImGui::TableSetColumnIndex(2);
+              if (st.has_layer) ImGui::Text("%d", st.layer); else ImGui::TextDisabled("-");
+              ImGui::TableSetColumnIndex(3);
+              if (st.has_position) {
+                ImGui::Text("%.2f, %.2f, %.2f", st.x, st.y, st.z);
+              }
+              else {
+                ImGui::TextDisabled("无坐标");
+              }
+              ImGui::TableSetColumnIndex(4);
+              ImGui::Text("%s", "Hostile");
+            }
+            ImGui::EndTable();
+          }
+          ImGui::EndChild();
+
+          ImGui::EndTabItem();
+        }
+
+        // 设置页（最右）
+        if (ImGui::BeginTabItem("设置", nullptr, ImGuiTabItemFlags_Trailing)) {
+          SectionLabel("日志 / 存档路径");
+          ImGui::InputText("日志路径", log_path_buf, sizeof(log_path_buf));
+          ImGui::SameLine();
+          if (ImGui::Button("应用路径")) {
+            MonoSetLogPath(log_path_buf);
+            saved.log_path = log_path_buf;
+          }
+
+          SectionLabel("默认开关");
+          ImGui::Checkbox("启动时加载上次参数", &saved.load_on_start);
+          ImGui::SameLine();
+          ImGui::Checkbox("每局重置为默认", &reset_each_round);
+          ImGui::Checkbox("默认绘制覆盖层", &g_esp_enabled);
+          ImGui::Checkbox("默认物品ESP", &g_item_esp_enabled);
+          ImGui::SameLine();
+          ImGui::Checkbox("默认敌人ESP", &g_enemy_esp_enabled);
+          ImGui::Checkbox("默认原生高亮", &g_native_highlight_active);
+          ImGui::SameLine();
+          ImGui::Checkbox("默认防摔倒", &no_fall_enabled);
+          ImGui::Checkbox("默认自动刷新玩家状态", &auto_refresh);
+          ImGui::SameLine();
+          ImGui::Checkbox("默认自动刷新物品", &auto_refresh_items);
+          ImGui::SameLine();
+          ImGui::Checkbox("默认自动刷新敌人", &auto_refresh_enemies);
+          ImGui::InputFloat("默认速度倍率", &speed_mult, 0.1f, 0.5f, "%.2f");
+          g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+
+          SectionLabel("持久化操作");
+          if (ImGui::Button("保存设置")) {
+            saved.auto_refresh = auto_refresh;
+            saved.auto_refresh_items = auto_refresh_items;
+            saved.auto_refresh_enemies = auto_refresh_enemies;
+            saved.item_esp = g_item_esp_enabled;
+            saved.enemy_esp = g_enemy_esp_enabled;
+            saved.native_highlight = g_native_highlight_active;
+            saved.no_fall = no_fall_enabled;
+            saved.speed_mult = speed_mult;
+            saved.reset_each_round = reset_each_round;
+            saved.log_path = log_path_buf;
+            SaveSettings(saved);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("重新加载设置")) {
+            if (LoadSettings(saved)) {
+              auto_refresh = saved.auto_refresh;
+              auto_refresh_items = saved.auto_refresh_items;
+              auto_refresh_enemies = saved.auto_refresh_enemies;
+              g_item_esp_enabled = saved.item_esp;
+              g_enemy_esp_enabled = saved.enemy_esp;
+              g_native_highlight_active = saved.native_highlight;
+              no_fall_enabled = saved.no_fall;
+              speed_mult = saved.speed_mult;
+              reset_each_round = saved.reset_each_round;
+              g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+              if (!saved.log_path.empty()) {
+                strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
+                MonoSetLogPath(saved.log_path);
+              }
+            }
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("重置为默认")) {
+            ResetUiDefaults(auto_refresh, auto_refresh_items, auto_refresh_enemies,
+              g_item_esp_enabled, g_enemy_esp_enabled, g_native_highlight_active, no_fall_enabled,
+              speed_mult, extra_jump_count, infinite_jump_enabled, god_mode_enabled);
+            g_esp_enabled = false;
+          }
+
+          ImGui::EndTabItem();
+        }
+
+        // 敌人页
+        if (ImGui::BeginTabItem("敌人")) {
+          if (ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled)) {
+            g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+          }
           ImGui::SameLine();
           ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
           ImGui::SameLine();
@@ -841,7 +1108,7 @@ void RenderOverlay(bool* menu_open) {
   // Auto-maintenance toggles
   if (last_ok) {
     if (no_fall_enabled) {
-      // 防摔倒：仅尝试去掉击倒/摔落的体力消耗与硬直，而不附加无敌
+      MonoSetInvincible(2.0f);
       MonoOverrideJumpCooldown(0.0f);
     }
     if (infinite_jump_enabled && extra_jump_count > 0) {

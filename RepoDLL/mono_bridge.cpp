@@ -18,6 +18,7 @@
 #include <mutex>
 #include <deque>
 #include <atomic>
+#include <filesystem>
 #include "MinHook.h"
 
 #include "config.h"
@@ -31,7 +32,7 @@ bool g_enemy_esp_disabled = false;
 bool g_enemy_esp_enabled = false;
 bool g_items_disabled = false;
 bool g_enemy_cache_disabled = false;
-bool g_item_esp_enabled = true;
+bool g_item_esp_enabled = false;
 int g_item_esp_cap = 512;
 int g_enemy_esp_cap = 256;
 
@@ -321,8 +322,41 @@ namespace {
   };
 
   constexpr size_t kLogRingCap = 256;
-  constexpr const char* kLogPath = "D:\\Project\\REPO_LOG.txt";
-  constexpr const char* kCrashPath = "D:\\Project\\REPO_CRASH.txt";
+  std::string g_log_path;
+  std::string DefaultLogPath() {
+    char* buf = nullptr;
+    size_t sz = 0;
+    std::string base = "C:";
+#if defined(_WIN32)
+    if (_dupenv_s(&buf, &sz, "USERPROFILE") == 0 && buf) {
+      base.assign(buf);
+      free(buf);
+    }
+#else
+    const char* user = std::getenv("HOME");
+    if (user) base.assign(user);
+#endif
+    std::string path = base + "\\AppData\\LocalLow\\semiwork\\Repo\\repodll\\REPO_LOG.txt";
+    return path;
+  }
+  void EnsureLogDir(const std::string& path) {
+    try {
+      std::filesystem::path p(path);
+      std::filesystem::create_directories(p.parent_path());
+    }
+    catch (...) {
+    }
+  }
+  void EnsureLogPath() {
+    if (!g_log_path.empty()) return;
+    g_log_path = DefaultLogPath();
+    EnsureLogDir(g_log_path);
+  }
+  std::string CrashPath() {
+    EnsureLogPath();
+    std::filesystem::path p(g_log_path);
+    return (p.parent_path() / "REPO_CRASH.txt").string();
+  }
 
   std::mutex g_log_mutex;
   std::deque<LogEntry> g_log_ring;
@@ -352,7 +386,8 @@ namespace {
   }
 
   void WriteLogLineUnlocked(const LogEntry& e) {
-    std::ofstream file(kLogPath, std::ios::app);
+    EnsureLogPath();
+    std::ofstream file(g_log_path, std::ios::app);
     if (!file) return;
     file << "[" << e.ts << "] "
          << "L" << static_cast<int>(e.level) << " "
@@ -407,6 +442,17 @@ namespace {
     g_log_level.store(static_cast<int>(lvl), std::memory_order_relaxed);
   }
 
+  const std::string& InternalGetLogPath() {
+    EnsureLogPath();
+    return g_log_path;
+  }
+
+  void InternalSetLogPath(const std::string& path_utf8) {
+    if (path_utf8.empty()) return;
+    g_log_path = path_utf8;
+    EnsureLogDir(g_log_path);
+  }
+
   bool GetLogSnapshot(int max_lines, std::vector<std::string>& out) {
     out.clear();
     std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -429,7 +475,7 @@ namespace {
   // Crash report dumps last N log lines for diagnosis.
   void WriteCrashReport(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
-    std::ofstream f(kCrashPath, std::ios::app);
+    std::ofstream f(CrashPath(), std::ios::app);
     if (!f) {
       AppendLogInternal(LogLevel::kError, "crash", "WriteCrashReport: cannot open crash file");
       return;
@@ -2555,6 +2601,14 @@ namespace {
     return true;
   }
 }  // namespace
+
+const std::string& MonoGetLogPath() {
+  return InternalGetLogPath();
+}
+
+void MonoSetLogPath(const std::string& path_utf8) {
+  InternalSetLogPath(path_utf8);
+}
 
 void SetCrashStage(const char* stage) {
   g_crash_stage.store(stage ? stage : "null", std::memory_order_relaxed);
@@ -4982,7 +5036,28 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLogOnce("MonoListEnemies_cache", "MonoListEnemies: populated from cached EnemyRigidbody list");
       return true;
     }
-    // 缓存为空时不再做 Physics.OverlapSphere 全局扫描，等待 EnemyRigidbody::Awake 填充缓存，避免 0xC0000005。
+
+    // 缓存为空：尝试安全的 FindObjectsOfType 路径填充缓存（包含未激活对象），避免 Physics.OverlapSphere 崩溃。
+    if (!g_enemy_cache_disabled && RefreshEnemyCacheSafe()) {
+      EnemyCachePruneDead();
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      cache_snapshot = g_enemy_cache;
+    } else {
+      AppendLogOnce("MonoListEnemies_cache_disabled", "MonoListEnemies: enemy cache disabled or refresh failed");
+    }
+
+    for (uint32_t h : cache_snapshot) {
+      MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
+      if (enemy_obj && AddEnemyFromObject(enemy_obj, out_enemies)) {
+        ++cached_added;
+        if (cached_added >= 512) break;
+      }
+    }
+    if (cached_added > 0) {
+      AppendLogOnce("MonoListEnemies_cache_refill", "MonoListEnemies: cache refilled via FindObjectsOfType");
+      return true;
+    }
+
     AppendLogOnce("MonoListEnemies_skip_overlap", "MonoListEnemies: cache empty, skip global scan");
     return true;
 
