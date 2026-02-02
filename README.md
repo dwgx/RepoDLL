@@ -1,32 +1,31 @@
-﻿# RepoDLL
+﻿# RepoDLL Overlay — 高级说明
 
-基于 DirectX11 + ImGui 的游戏覆盖层 DLL，通过 Mono 反射与游戏交互。
+轻量、稳健的 Unity Mono 叠加层，默认“冷启动”：不改游戏状态、不自动开 ESP，先观察再操作。
 
-## 功能
-- DX11 Present/WndProc 钩子，创建 ImGui 覆盖层。
-- 读取/设置本地玩家状态：位置、生命、体力、速度、跳跃、抓取等。
-- 货币/推车价值写入，自动刷新相关 UI。
-- 可选的卸载清理：释放 DX11 资源、恢复窗口过程、移除 MinHook。
+## 核心特性
+- **ESP**：物品/敌人，可选原生高亮，独立上限控制，覆盖层总开关联动。
+- **队友辅助**：队伍列表、倒地标记、一键复活（可含自己）。
+- **防摔倒**：短时无敌 + 零跳跃冷却，抑制跌倒/击倒。
+- **动作/数值调节**：速度、跳跃、抓取范围&强度、关卡收集进度锁定、伪房主。
+- **稳定性守护**：敌人扫描优先用 FindObjectsOfType(EnemyRigidbody, true)，避免高风险 OverlapSphere；崩溃保护可一键重置。
+- **配置持久化**：日志路径、默认开关写入 epodll_settings.ini；支持启动加载、每局重置、重置为出厂。
 
-## 构建
-- 环境：Visual Studio 2022（MSVC 14.3+），x64。
-- 依赖：项目自带 MinHook、ImGui（third_party）。
-- 配置：打开 `RepoDLL.slnx`，选择 Debug/Release x64 编译生成 `x64/Debug|Release/RepoDLL.dll`。
+## 默认行为（安全模式）
+- 注入后：ESP/自动刷新/无敌/防摔倒等全部关闭；速度倍率=1，额外跳跃=0。
+- 日志：%USERPROFILE%/AppData/LocalLow/semiwork/Repo/repodll/REPO_LOG.txt；同目录保存 epodll_settings.ini。
 
-## 使用
-1. 将 DLL 注入目标进程（确保游戏为 DX11）。
-2. Insert 键切换菜单。
-3. 日志输出默认写入 `D:\Project\REPO_LOG.txt`，如需通用路径，可修改 `mono_bridge.cpp`/`dllmain.cpp` 的日志路径。
+## 快速上手
+1. 菜单 → “物品/ESP” 或 “敌人”，勾选需要的 ESP，必要时启用“自动刷新”。
+2. 若提示禁用，去“调试”页点“重置物品禁用/重置敌人禁用”，再刷新。
+3. 想保存偏好：在“设置”页调整默认值并“保存设置”；如需每局回默认，勾“每局重置为默认”。
+4. 改日志路径：在“设置”页修改并“应用路径”。排查问题时附上最新 REPO_LOG.txt 尾部即可。
 
-## 目录
-- `dllmain.cpp`：入口与线程创建。
-- `hook_dx11.*`：DXGI Present 钩子、ImGui 初始化/清理。
-- `mono_bridge.*`：Mono 反射/字段解析、状态读写。
-- `ui.*`：ImGui 覆盖层 UI。
-- `third_party/`：MinHook、ImGui。
-- `docs/`：功能点说明。
+## 常见问题速查
+- **ESP 不显示**：确认“绘制覆盖层”与对应 ESP 勾选；调试页重置禁用后刷新。
+- **敌人列表空**：关卡内刷新，等待 FindObjectsOfType 补缓存；日志若有 cache_refill 说明正在补。
+- **跌倒仍发生**：防摔倒是软保护，脚本强制击倒需进一步反混淆对应状态机。
+- **日志缺失**：检查设置页的日志路径是否存在/可写。
 
-## 注意
-- 日志路径可根据实际环境修改。
-- 部分功能依赖游戏版本的托管字段/方法名，更新后需重新确认。
-- 卸载时调用 `UnhookDx11` 可恢复窗口过程并释放 DX11 资源。
+## 目录位置
+- 日志：%USERPROFILE%/AppData/LocalLow/semiwork/Repo/repodll/REPO_LOG.txt
+- 配置：同目录 epodll_settings.ini（可自定义路径并保存）
