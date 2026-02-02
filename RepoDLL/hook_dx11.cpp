@@ -4,6 +4,7 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 
 #include "MinHook.h"
 #include "imgui.h"
@@ -37,6 +38,9 @@ WNDPROC g_original_wndproc = nullptr;
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
+UINT g_bb_width = 0;
+UINT g_bb_height = 0;
+uintptr_t g_bb_ptr_tag = 0;
 void* g_present_fn = nullptr;
 void* g_resize_fn = nullptr;
 bool g_imgui_initialized = false;
@@ -98,10 +102,19 @@ void SetupFonts(ImGuiIO& io) {
 }
 
 void CreateRenderTarget(IDXGISwapChain* swap_chain) {
+  if (!g_device) return;
   ID3D11Texture2D* back_buffer = nullptr;
   if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))) && back_buffer) {
     g_device->CreateRenderTargetView(back_buffer, nullptr, &g_rtv);
+    D3D11_TEXTURE2D_DESC bb_desc{};
+    back_buffer->GetDesc(&bb_desc);
+    g_bb_width = bb_desc.Width;
+    g_bb_height = bb_desc.Height;
+    g_bb_ptr_tag = reinterpret_cast<uintptr_t>(back_buffer);
     back_buffer->Release();
+    LogMessage("CreateRenderTarget: new RTV created");
+  } else {
+    LogMessage("CreateRenderTarget: failed to obtain back buffer");
   }
 }
 
@@ -110,6 +123,8 @@ void CleanupRenderTarget() {
     g_rtv->Release();
     g_rtv = nullptr;
   }
+  g_bb_width = g_bb_height = 0;
+  g_bb_ptr_tag = 0;
 }
 
 HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count, UINT width,
@@ -288,6 +303,40 @@ static bool DeviceWasRemoved() {
   return FAILED(removed);
 }
 
+// Detect backbuffer changes (size or pointer) and rebuild RTV when needed.
+static void EnsureRenderTargetFresh(IDXGISwapChain* swap_chain) {
+  bool need_rebuild = (g_rtv == nullptr);
+
+  DXGI_SWAP_CHAIN_DESC desc{};
+  if (SUCCEEDED(swap_chain->GetDesc(&desc))) {
+    if (desc.BufferDesc.Width != g_bb_width || desc.BufferDesc.Height != g_bb_height) {
+      need_rebuild = true;
+      std::ostringstream oss;
+      oss << "PresentFrame: backbuffer size changed " << g_bb_width << "x" << g_bb_height
+          << " -> " << desc.BufferDesc.Width << "x" << desc.BufferDesc.Height;
+      LogMessage(oss.str());
+    }
+  }
+
+  ID3D11Texture2D* bb = nullptr;
+  if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&bb))) && bb) {
+    uintptr_t tag = reinterpret_cast<uintptr_t>(bb);
+    if (tag != g_bb_ptr_tag) {
+      need_rebuild = true;
+      std::ostringstream oss;
+      oss << "PresentFrame: backbuffer pointer changed tag=0x" << std::hex << g_bb_ptr_tag
+          << " -> 0x" << tag;
+      LogMessage(oss.str());
+    }
+    bb->Release();
+  }
+
+  if (need_rebuild) {
+    CleanupRenderTarget();
+    CreateRenderTarget(swap_chain);
+  }
+}
+
 static void ResetImguiDeviceState() {
   ImGui_ImplDX11_Shutdown();
   CleanupRenderTarget();
@@ -356,6 +405,12 @@ static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT
       return g_original_present(swap_chain, sync_interval, flags);
     }
 
+    EnsureRenderTargetFresh(swap_chain);
+    if (!g_rtv) {
+      LogMessage("HookPresent: g_rtv null after refresh, rendering skipped");
+      return g_original_present(swap_chain, sync_interval, flags);
+    }
+
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -385,6 +440,8 @@ HRESULT __stdcall HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UI
     return PresentFrame(swap_chain, sync_interval, flags);
   }
   __except (LogCrash("HookPresent", GetExceptionCode(), GetExceptionInformation())) {
+    g_overlay_disabled = true;
+    ResetImguiDeviceState();
     return g_original_present ? g_original_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
   }
 #else

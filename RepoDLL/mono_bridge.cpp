@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 
 #include "mono_bridge.h"
 
@@ -17,8 +17,7 @@
 #include <mutex>
 #include <deque>
 #include <atomic>
-#include <algorithm>
-#include <eh.h>
+#include "MinHook.h"
 
 #include "config.h"
 
@@ -34,28 +33,6 @@ bool g_enemy_cache_disabled = false;
 bool g_item_esp_enabled = true;
 int g_item_esp_cap = 512;
 int g_enemy_esp_cap = 256;
-std::atomic<int> g_enemy_scan_failures{0};
-constexpr int kEnemyFailureLimit = 3;
-
-struct SeException {
-  unsigned int code;
-  EXCEPTION_POINTERS* info;
-};
-
-// Install per-thread SEH→C++ translator so try/catch can handle access violations.
-void __cdecl SehTranslator(unsigned int code, EXCEPTION_POINTERS* info) {
-  throw SeException{code, info};
-}
-
-static thread_local bool g_seh_installed = false;
-static void EnsureSehTranslator() {
-#if defined(_MSC_VER)
-  if (!g_seh_installed) {
-    _set_se_translator(SehTranslator);
-    g_seh_installed = true;
-  }
-#endif
-}
 
 namespace {
   using MonoDomain = void;
@@ -93,6 +70,10 @@ namespace {
     MonoObject* (__cdecl* mono_string_new)(MonoDomain*, const char*) = nullptr;
     char* (__cdecl* mono_string_to_utf8)(MonoObject*) = nullptr;
     void(__cdecl* mono_free)(void*) = nullptr;
+    void* (__cdecl* mono_compile_method)(MonoMethod*) = nullptr;
+    uint32_t(__cdecl* mono_gchandle_new)(MonoObject*, int) = nullptr;
+    void(__cdecl* mono_gchandle_free)(uint32_t) = nullptr;
+    MonoObject* (__cdecl* mono_gchandle_get_target)(uint32_t) = nullptr;
   };
 
   struct MonoArray {
@@ -105,6 +86,13 @@ namespace {
 
   // Forward declaration for SafeInvoke (defined later).
   static MonoObject* SafeInvoke(MonoMethod* method, MonoObject* obj, void** args, const char* tag);
+  // Forward declarations for enemy cache helpers / hooks
+  static bool EnsureMinHookReady();
+  static bool IsUnityNull(MonoObject* obj);
+  static void EnemyCacheAdd(MonoObject* obj);
+  static void EnemyCachePruneDead();
+  static void __stdcall EnemyAwakeHook(MonoObject* self);
+  static void InstallEnemyAwakeHook();
 
   MonoApi g_mono;
   MonoDomain* g_domain = nullptr;
@@ -159,6 +147,7 @@ namespace {
 
   MonoClass* g_unity_object_class = nullptr;
   MonoMethod* g_unity_object_get_name = nullptr;
+  MonoMethod* g_unity_object_op_eq = nullptr;
 
   MonoClass* g_transform_class = nullptr;
   MonoMethod* g_transform_get_local_to_world = nullptr;
@@ -203,38 +192,18 @@ namespace {
   MonoObject* g_item_attributes_type_obj = nullptr;
 
   MonoClass* g_valuable_object_class = nullptr;
-    MonoClassField* g_valuable_object_value_field = nullptr;
-    MonoClass* g_enemy_rigidbody_class = nullptr;
-    std::vector<MonoObject*> g_enemy_cache;
-    uint64_t g_enemy_cache_last_refresh = 0;
-    const uint64_t k_enemy_cache_interval_ms = 2000;  // 2s low-frequency refresh
-    const uint64_t k_enemy_cache_max_age_ms = 5000;   // drop cache after 5s
-
-    static bool IsEnemyCacheFresh(uint64_t now) {
-      if (g_enemy_cache_last_refresh == 0) return false;
-      return (now - g_enemy_cache_last_refresh) <= k_enemy_cache_max_age_ms;
-    }
-
-    static int GetEnemyLayerMask() {
-      int enemy_layer = -1;
-      if (g_layer_mask_name_to_layer && g_mono.mono_string_new) {
-        MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
-        MonoObject* layer_name = g_mono.mono_string_new(dom, "Enemy");
-        if (layer_name) {
-          void* args[1] = { layer_name };
-          MonoObject* exc = nullptr;
-          MonoObject* layer_obj =
-            g_mono.mono_runtime_invoke(g_layer_mask_name_to_layer, nullptr, args, &exc);
-          if (!exc && layer_obj && g_mono.mono_object_unbox) {
-            enemy_layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-          }
-        }
-      }
-      if (enemy_layer < 0) return -1;
-      return (1 << enemy_layer);
-    }
-    MonoClass* g_valuable_director_class = nullptr;
-    MonoVTable* g_valuable_director_vtable = nullptr;
+  MonoClassField* g_valuable_object_value_field = nullptr;
+  MonoClass* g_enemy_rigidbody_class = nullptr;
+  std::vector<uint32_t> g_enemy_cache;  // GCHandles
+  std::mutex g_enemy_cache_mutex;
+  uint64_t g_enemy_cache_last_refresh = 0;
+  const uint64_t k_enemy_cache_interval_ms = 2000;  // 2s low-frequency refresh
+  MonoMethod* g_enemy_awake_method = nullptr;
+  using EnemyAwakeFn = void(*)(MonoObject*);
+  EnemyAwakeFn g_enemy_awake_orig = nullptr;
+  bool g_enemy_awake_hooked = false;
+  MonoClass* g_valuable_director_class = nullptr;
+  MonoVTable* g_valuable_director_vtable = nullptr;
     MonoClassField* g_valuable_director_instance_field = nullptr;
     MonoClassField* g_valuable_director_list_field = nullptr;
     MonoClass* g_valuable_discover_class = nullptr;
@@ -273,12 +242,21 @@ namespace {
   MonoClassField* g_shop_secret_item_volumes_field = nullptr;
 
   MonoClass* g_pun_manager_class = nullptr;
+  MonoMethod* g_pun_upgrade_extra_jump = nullptr;
   MonoMethod* g_pun_upgrade_grab_strength = nullptr;
   MonoMethod* g_pun_upgrade_throw_strength = nullptr;
   MonoMethod* g_pun_set_run_stat_set = nullptr;
   MonoClassField* g_pun_manager_instance_field = nullptr;
   MonoVTable* g_pun_manager_vtable = nullptr;
 
+  // RoundDirector (鍏冲崱鏀堕泦闃舵)
+  MonoClass* g_round_director_class = nullptr;
+  MonoVTable* g_round_director_vtable = nullptr;
+  MonoClassField* g_round_director_instance_field = nullptr;
+  MonoClassField* g_round_current_haul_field = nullptr;
+  MonoClassField* g_round_current_haul_max_field = nullptr;
+  MonoClassField* g_round_haul_goal_field = nullptr;
+  MonoClassField* g_round_stage_field = nullptr;  // 鍙€?
   MonoMethod* g_player_controller_override_speed = nullptr;
   MonoMethod* g_player_controller_override_jump_cooldown = nullptr;
 
@@ -312,6 +290,15 @@ namespace {
   // Shutdown guard
   bool g_shutting_down = false;
 
+  void ClearEnemyCacheHandles() {
+    if (!g_mono.mono_gchandle_free) return;
+    std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+    for (uint32_t h : g_enemy_cache) {
+      g_mono.mono_gchandle_free(h);
+    }
+    g_enemy_cache.clear();
+  }
+
   // ------------------------------------------------------------
   // Structured logging (thread-safe, low-noise, ring-buffered)
   // ------------------------------------------------------------
@@ -332,7 +319,7 @@ namespace {
   std::mutex g_log_mutex;
   std::deque<LogEntry> g_log_ring;
   std::unordered_set<std::string> g_log_once;
-  std::atomic<int> g_log_level(static_cast<int>(LogLevel::kWarn));
+  std::atomic<int> g_log_level(static_cast<int>(LogLevel::kInfo));
   std::atomic<bool> g_env_logged{false};
   std::atomic<const char*> g_crash_stage{"init"};
 
@@ -413,7 +400,10 @@ namespace {
   void WriteCrashReport(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
     std::ofstream f(kCrashPath, std::ios::app);
-    if (!f) return;
+    if (!f) {
+      AppendLogInternal(LogLevel::kError, "crash", "WriteCrashReport: cannot open crash file");
+      return;
+    }
     f << "=== Crash ===\n";
     f << "when: " << (where ? where : "<unknown>") << "\n";
     f << "code: 0x" << std::hex << code << std::dec << "\n";
@@ -644,7 +634,11 @@ namespace {
       !ResolveProc(module, "mono_object_get_class", api.mono_object_get_class) ||
       !ResolveProc(module, "mono_object_unbox", api.mono_object_unbox) ||
       !ResolveProc(module, "mono_field_get_offset", api.mono_field_get_offset) ||
-      !ResolveProc(module, "mono_string_new", api.mono_string_new)) {
+      !ResolveProc(module, "mono_string_new", api.mono_string_new) ||
+      !ResolveProc(module, "mono_compile_method", api.mono_compile_method) ||
+      !ResolveProc(module, "mono_gchandle_new", api.mono_gchandle_new) ||
+      !ResolveProc(module, "mono_gchandle_free", api.mono_gchandle_free) ||
+      !ResolveProc(module, "mono_gchandle_get_target", api.mono_gchandle_get_target)) {
       AppendLog("Failed to resolve one or more Mono exports");
       return false;
     }
@@ -1272,6 +1266,16 @@ namespace {
         AppendLog("Failed to resolve UnityEngine.Object::get_name");
       }
     }
+    if (g_unity_object_class && !g_unity_object_op_eq) {
+      g_unity_object_op_eq =
+        g_mono.mono_class_get_method_from_name(g_unity_object_class, "op_Equality", 2);
+      if (g_unity_object_op_eq) {
+        AppendLog("Resolved UnityEngine.Object::op_Equality");
+      }
+      else {
+        AppendLog("Failed to resolve UnityEngine.Object::op_Equality");
+      }
+    }
 
     if (!g_transform_class) {
       // First try the Unity image we found
@@ -1583,6 +1587,91 @@ namespace {
       }
       if (!g_pun_manager_instance_field) {
         AppendLog("Failed to resolve PunManager::instance field");
+      }
+    }
+
+    // RoundDirector
+    if (!g_round_director_class && g_image) {
+      g_round_director_class = g_mono.mono_class_from_name(g_image, "", "RoundDirector");
+      if (!g_round_director_class) {
+        g_round_director_class = FindClassAnyAssembly("", "RoundDirector");
+      }
+      if (g_round_director_class) {
+        AppendLog("Resolved RoundDirector class");
+      }
+      else {
+        AppendLogOnce("RoundDirector_class_missing", "Failed to resolve RoundDirector class");
+      }
+    }
+    if (g_round_director_class && !g_round_director_vtable) {
+      g_round_director_vtable = g_mono.mono_class_vtable(g_domain, g_round_director_class);
+    }
+    if (g_round_director_class && !g_round_director_instance_field) {
+      const char* inst_names[] = { "instance", "Instance", "s_Instance", "m_Instance", "staticInstance" };
+      for (const char* name : inst_names) {
+        g_round_director_instance_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, name);
+        if (g_round_director_instance_field) {
+          AppendLog(std::string("Resolved RoundDirector instance field as: ") + name);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_current_haul_field) {
+      const char* names[] = { "currentHaul", "haulCurrent", "currentValue" };
+      for (const char* n : names) {
+        g_round_current_haul_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_current_haul_field) {
+          AppendLog(std::string("Resolved RoundDirector::currentHaul as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_current_haul_max_field) {
+      const char* names[] = { "currentHaulMax", "haulCurrentMax", "haulMax" };
+      for (const char* n : names) {
+        g_round_current_haul_max_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_current_haul_max_field) {
+          AppendLog(std::string("Resolved RoundDirector::currentHaulMax as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_haul_goal_field) {
+      const char* names[] = { "haulGoal", "currentGoal", "targetHaul" };
+      for (const char* n : names) {
+        g_round_haul_goal_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_haul_goal_field) {
+          AppendLog(std::string("Resolved RoundDirector::haulGoal as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_stage_field) {
+      const char* names[] = { "currentStage", "stage", "round", "roundIndex" };
+      for (const char* n : names) {
+        g_round_stage_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_stage_field) {
+          AppendLog(std::string("Resolved RoundDirector stage field as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_pun_manager_class && !g_pun_upgrade_extra_jump) {
+      for (int argc : {2, 1, 0}) {
+        g_pun_upgrade_extra_jump = g_mono.mono_class_get_method_from_name(
+          g_pun_manager_class, config::kPunManagerUpgradeExtraJumpMethod, argc);
+        if (g_pun_upgrade_extra_jump) {
+          AppendLog("Resolved PunManager::UpgradePlayerExtraJump argc=" + std::to_string(argc));
+          break;
+        }
+      }
+      if (g_pun_upgrade_extra_jump) {
+        // already logged
       }
     }
     if (g_pun_manager_class && !g_pun_set_run_stat_set) {
@@ -1920,6 +2009,7 @@ namespace {
       }
       if (g_enemy_rigidbody_class) {
         AppendLog("Resolved EnemyRigidbody class");
+        InstallEnemyAwakeHook();
       }
       else {
         AppendLogOnce("EnemyRigidbody_class_missing", "Failed to resolve EnemyRigidbody class");
@@ -2108,75 +2198,140 @@ namespace {
     return false;
   }
 
-  // 从 EnemyRigidbody 对象抽取位置/名称/Layer。
-  void NoteEnemyScanFailure(const char* reason) {
-    int count = ++g_enemy_scan_failures;
-    std::ostringstream oss;
-    oss << "Enemy scan failure " << count << ": " << (reason ? reason : "<unknown>");
-    AppendLog(oss.str());
-    if (count >= kEnemyFailureLimit && !g_enemy_esp_disabled) {
-      g_enemy_esp_disabled = true;
-      AppendLog("Enemy scan disabled after repeated failures");
+  bool EnsureMinHookReady() {
+    static bool inited = false;
+    if (inited) return true;
+    MH_STATUS st = MH_Initialize();
+    if (st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED) {
+      inited = true;
+      return true;
+    }
+    AppendLog("MinHook initialize failed");
+    return false;
+  }
+
+  // 鍒ゆ柇 UnityEngine.Object 鏄惁琚攢姣侊紙op_Equality(obj, null) == true锛?
+  bool IsUnityNull(MonoObject* obj) {
+    if (!obj) return true;
+    if (!g_unity_object_op_eq) return false;  // 娌℃湁绛夊彿鏂规硶鏃讹紝淇濆畧璁や负浠嶅瓨娲?
+    void* args[2] = { obj, nullptr };
+    MonoObject* ret = SafeInvoke(g_unity_object_op_eq, nullptr, args, "Object.op_Equality");
+    if (!ret || !g_mono.mono_object_unbox) return false;
+    return *static_cast<bool*>(g_mono.mono_object_unbox(ret));
+  }
+
+  void EnemyCacheAdd(MonoObject* obj) {
+    if (!obj || !g_mono.mono_gchandle_new || !g_mono.mono_gchandle_get_target) return;
+    std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+    for (uint32_t h : g_enemy_cache) {
+      MonoObject* cur = g_mono.mono_gchandle_get_target(h);
+      if (cur == obj) return;
+    }
+    if (g_enemy_cache.size() >= 2048) return;
+    uint32_t handle = g_mono.mono_gchandle_new(obj, 0);
+    if (handle) {
+      g_enemy_cache.push_back(handle);
+      g_enemy_cache_last_refresh = GetTickCount64();
     }
   }
 
-  static bool IsLikelyEnemyName(const std::string& name) {
-    if (name.empty()) return true;
-    std::string lower = name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("trigger") != std::string::npos) return false;
-    if (lower.find("volume") != std::string::npos) return false;
-    if (lower.find("box") != std::string::npos) return false;
-    if (lower.find("hide") != std::string::npos) return false;
-    return true;
+  void EnemyCachePruneDead() {
+    if (!g_mono.mono_gchandle_get_target || !g_mono.mono_gchandle_free) return;
+    std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+    auto it = g_enemy_cache.begin();
+    while (it != g_enemy_cache.end()) {
+      MonoObject* obj = g_mono.mono_gchandle_get_target(*it);
+      if (!obj || IsUnityNull(obj)) {
+        g_mono.mono_gchandle_free(*it);
+        it = g_enemy_cache.erase(it);
+      }
+      else {
+        ++it;
+      }
+    }
   }
 
-  bool PopulateEnemyStateFromObject(MonoObject* enemy_obj, PlayerState& out_state) {
-    if (!enemy_obj) {
-      NoteEnemyScanFailure("Enemy object null");
-      return false;
+  void __stdcall EnemyAwakeHook(MonoObject* self) {
+    EnemyCacheAdd(self);
+    if (g_enemy_awake_orig) {
+      g_enemy_awake_orig(self);
     }
+  }
+
+  void InstallEnemyAwakeHook() {
+    if (g_enemy_awake_hooked || !g_enemy_rigidbody_class || !g_mono.mono_class_get_method_from_name) return;
+    if (!EnsureMinHookReady()) return;
+    if (!g_enemy_awake_method) {
+      g_enemy_awake_method = g_mono.mono_class_get_method_from_name(g_enemy_rigidbody_class, "Awake", 0);
+      if (!g_enemy_awake_method) {
+        AppendLogOnce("EnemyAwake_notfound", "EnemyRigidbody::Awake not found; cache hook skipped");
+        return;
+      }
+    }
+    void* native_ptr = g_mono.mono_compile_method ? g_mono.mono_compile_method(g_enemy_awake_method) : nullptr;
+    if (!native_ptr) {
+      AppendLogOnce("EnemyAwake_compile_fail", "mono_compile_method failed for EnemyRigidbody::Awake");
+      return;
+    }
+    if (MH_CreateHook(native_ptr, reinterpret_cast<LPVOID>(EnemyAwakeHook),
+      reinterpret_cast<LPVOID*>(&g_enemy_awake_orig)) != MH_OK) {
+      AppendLogOnce("EnemyAwake_create_fail", "MH_CreateHook failed for EnemyRigidbody::Awake");
+      return;
+    }
+    if (MH_EnableHook(native_ptr) != MH_OK) {
+      AppendLogOnce("EnemyAwake_enable_fail", "MH_EnableHook failed for EnemyRigidbody::Awake");
+      MH_RemoveHook(native_ptr);
+      return;
+    }
+    g_enemy_awake_hooked = true;
+    AppendLogOnce("EnemyAwake_hook_ok", "Installed hook for EnemyRigidbody::Awake");
+  }
+
+  // 浠?EnemyRigidbody 瀵硅薄鎶藉彇浣嶇疆/鍚嶇О/Layer锛屽～鍏?out_enemies銆?
+  bool AddEnemyFromObject(MonoObject* enemy_obj, std::vector<PlayerState>& out_enemies) {
+    if (!enemy_obj) return false;
     MonoObject* tr = SafeInvoke(g_component_get_transform, enemy_obj, nullptr, "EnemyRigidbody.get_transform");
-    if (!tr) {
-      NoteEnemyScanFailure("Enemy transform missing");
-      return false;
-    }
-    out_state = {};
-    out_state.category = PlayerState::Category::kEnemy;
-    if (!TryGetPositionFromTransform(tr, out_state, false)) {
-      NoteEnemyScanFailure("Enemy position missing");
-      return false;
-    }
+    if (!tr) return false;
+    PlayerState st{};
+    st.category = PlayerState::Category::kEnemy;
+    if (!TryGetPositionFromTransform(tr, st, false)) return false;
     if (g_component_get_game_object) {
       MonoObject* go = SafeInvoke(g_component_get_game_object, enemy_obj, nullptr, "EnemyRigidbody.get_gameObject");
       if (go && g_unity_object_get_name) {
         MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, go, nullptr, "GameObject.get_name");
         if (name_obj) {
-          out_state.name = MonoStringToUtf8(name_obj);
-          out_state.has_name = !out_state.name.empty();
+          st.name = MonoStringToUtf8(name_obj);
+          st.has_name = !st.name.empty();
         }
       }
       if (go && g_game_object_get_layer) {
         MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, go, nullptr, "GameObject.get_layer");
         if (layer_obj && g_mono.mono_object_unbox) {
-          out_state.layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-          out_state.has_layer = true;
+          st.layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
+          st.has_layer = true;
         }
       }
     }
-    return true;
-  }
-
-  bool AddEnemyFromObject(MonoObject* enemy_obj, std::vector<PlayerState>& out_enemies) {
-    PlayerState st{};
-    if (!PopulateEnemyStateFromObject(enemy_obj, st)) return false;
     out_enemies.push_back(st);
     return true;
   }
 
-  // 低频刷新 EnemyRigidbody 缓存，避免每帧全局扫描导致崩溃。
+  // 浣庨鍒锋柊 EnemyRigidbody 缂撳瓨锛岄伩鍏嶆瘡甯у叏灞€鎵弿瀵艰嚧宕╂簝銆?
   bool RefreshEnemyCache() {
     if (g_enemy_cache_disabled) return false;
+    // 濡傛灉 Mono 灏氭湭鍔犺浇鏈湴鐜╁涓斿浜庤彍鍗曪紝璺宠繃鍒锋柊
+    PlayerState lp{};
+    if (!MonoGetLocalPlayerState(lp) || !lp.has_position) {
+      return false;
+    }
+    EnemyCachePruneDead();
+    {
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      if (!g_enemy_cache.empty()) {
+        g_enemy_cache_last_refresh = GetTickCount64();
+        return true;  // 鏈夋椿璺冪紦瀛樺氨涓嶅叏灞€鎵弿
+      }
+    }
     if (!g_enemy_rigidbody_class) {
       AppendLogOnce("EnemyCache_class_missing", "RefreshEnemyCache: EnemyRigidbody class unresolved");
       return false;
@@ -2212,49 +2367,48 @@ namespace {
     if (!arr || !arr->vector || arr->max_length == 0) {
       AppendLogOnce("EnemyCache_empty", "RefreshEnemyCache: FindObjectsOfType returned empty/invalid array");
       g_enemy_cache.clear();
-      g_enemy_cache_last_refresh = 0;
       return false;
     }
 
     int lim = static_cast<int>(arr->max_length);
     if (lim > 2048) lim = 2048;
-    std::vector<MonoObject*> tmp;
+    std::vector<uint32_t> tmp;
     tmp.reserve(lim);
     for (int i = 0; i < lim; ++i) {
       MonoObject* enemy_obj = reinterpret_cast<MonoObject*>(arr->vector[i]);
-      if (enemy_obj) tmp.push_back(enemy_obj);
+      if (!enemy_obj) continue;
+      if (!g_mono.mono_gchandle_new) continue;
+      uint32_t h = g_mono.mono_gchandle_new(enemy_obj, 0);
+      if (h) tmp.push_back(h);
     }
-    g_enemy_cache.swap(tmp);
+    size_t cached_sz = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      ClearEnemyCacheHandles();
+      g_enemy_cache.swap(tmp);
+      cached_sz = g_enemy_cache.size();
+    }
     g_enemy_cache_last_refresh = GetTickCount64();
     std::ostringstream oss;
-    oss << "RefreshEnemyCache: cached " << g_enemy_cache.size() << " EnemyRigidbody objects";
+    oss << "RefreshEnemyCache: cached " << cached_sz << " EnemyRigidbody objects";
     AppendLog(oss.str());
     return !g_enemy_cache.empty();
   }
 
-  static bool ShouldRefreshEnemyCache() {
-    PlayerState local;
-    if (!MonoGetLocalPlayerState(local) || !local.has_position) return false;
-    Matrix4x4 view{}, proj{};
-    if (!MonoGetCameraMatrices(view, proj)) return false;
-    return true;
-  }
-
+#ifdef _MSC_VER
+  // SEH 瀹夊叏灏佽锛岄槻姝?FindObjectsOfType 宕╂簝銆?
   static bool RefreshEnemyCacheSafe() {
-    EnsureSehTranslator();
-    try {
+    __try {
       return RefreshEnemyCache();
     }
-    catch (const SeException& ex) {
-      LogCrash("RefreshEnemyCacheSafe", ex.code, ex.info);
-      g_enemy_cache_disabled = true;
-      return false;
-    }
-    catch (...) {
+    __except (LogCrash("RefreshEnemyCacheSafe", GetExceptionCode(), GetExceptionInformation())) {
       g_enemy_cache_disabled = true;
       return false;
     }
   }
+#else
+  static bool RefreshEnemyCacheSafe() { return RefreshEnemyCache(); }
+#endif
 
   // Safe invoke helper to guard mono_runtime_invoke with C++ exceptions only.
   static MonoObject* SafeInvoke(MonoMethod* method, MonoObject* obj, void** args, const char* tag) {
@@ -2363,7 +2517,8 @@ long LogCrash(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
     << " code=0x" << std::hex << code
     << " addr=0x"
     << std::hex
-    << (info && info->ExceptionRecord ? reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress) : 0);
+    << (info && info->ExceptionRecord ? reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress) : 0)
+    << " stage=" << g_crash_stage.load(std::memory_order_relaxed);
   AppendLogInternal(LogLevel::kError, "crash", oss.str());
   WriteCrashReport(where, code, info);
   return EXCEPTION_EXECUTE_HANDLER;
@@ -2371,7 +2526,6 @@ long LogCrash(const char* where, unsigned long code, EXCEPTION_POINTERS* info) {
 
 bool MonoInitialize() {
   if (g_shutting_down) return false;
-  EnsureSehTranslator();
   LogEnvironmentOnce();
   return EnsureThreadAttached();
 }
@@ -2380,6 +2534,7 @@ bool MonoBeginShutdown() {
   g_shutting_down = true;
   g_pending_cart_active = false;
   g_cart_apply_in_progress = false;
+  ClearEnemyCacheHandles();
   return true;
 }
 
@@ -2687,6 +2842,73 @@ bool SetRunCurrencyViaPunManager(int amount) {
   return true;
 }
 
+// RoundDirector helpers ----------------------------------------------------
+
+static MonoObject* GetRoundDirectorInstance() {
+  MonoObject* inst = nullptr;
+  if (g_round_director_vtable && g_round_director_instance_field) {
+    g_mono.mono_field_static_get_value(
+      g_round_director_vtable, g_round_director_instance_field, &inst);
+  }
+  if (inst) return inst;
+
+  // Fallback: FindObjectsOfType RoundDirector
+  if (g_object_find_objects_of_type && g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
+    MonoType* rd_type = g_mono.mono_class_get_type(g_round_director_class);
+    MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
+    MonoObject* type_obj =
+      (rd_type && g_mono.mono_type_get_object) ? g_mono.mono_type_get_object(dom, rd_type) : nullptr;
+    if (type_obj) {
+      void* args[1] = { type_obj };
+      MonoObject* arr_obj = SafeInvoke(g_object_find_objects_of_type, nullptr, args,
+        "FindObjectsOfType(RoundDirector)");
+      MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
+      if (arr && arr->max_length > 0) {
+        inst = static_cast<MonoObject*>(arr->vector[0]);
+      }
+    }
+  }
+  return inst;
+}
+
+bool MonoGetRoundState(RoundState& out_state) {
+  out_state = {};
+  if (!CacheManagedRefs()) return false;
+  if (!g_round_director_class) return false;
+  MonoObject* rd = GetRoundDirectorInstance();
+  if (!rd) return false;
+
+  auto read_int = [&](MonoClassField* f, int& dst) {
+    if (!f) return false;
+    g_mono.mono_field_get_value(rd, f, &dst);
+    return true;
+  };
+
+  read_int(g_round_current_haul_field, out_state.current);
+  read_int(g_round_current_haul_max_field, out_state.current_max);
+  read_int(g_round_haul_goal_field, out_state.goal);
+  int stage_tmp = -1;
+  if (read_int(g_round_stage_field, stage_tmp)) out_state.stage = stage_tmp;
+  out_state.ok = true;
+  return true;
+}
+
+bool MonoSetRoundState(int current, int goal, int current_max) {
+  if (!CacheManagedRefs()) return false;
+  if (!g_round_director_class) return false;
+  MonoObject* rd = GetRoundDirectorInstance();
+  if (!rd) return false;
+
+  auto write_int = [&](MonoClassField* f, int v) {
+    if (!f) return;
+    g_mono.mono_field_set_value(rd, f, &v);
+  };
+  if (current >= 0) write_int(g_round_current_haul_field, current);
+  if (current_max >= 0) write_int(g_round_current_haul_max_field, current_max);
+  if (goal >= 0) write_int(g_round_haul_goal_field, goal);
+  return true;
+}
+
 bool ReadRunCurrency(int& out_value) {
   if (!g_semi_func_stat_get_run_currency) return false;
   MonoObject* exc = nullptr;
@@ -2828,6 +3050,50 @@ bool MonoApplyPendingCartValue() {
   return applied;
 }
 
+bool MonoSetRunCurrency(int amount) {
+  if (g_shutting_down) return false;
+  if (!CacheManagedRefs()) {
+    AppendLog("MonoSetRunCurrency: CacheManagedRefs failed");
+    return false;
+  }
+  if (!g_semi_func_stat_set_run_currency) {
+    AppendLog("MonoSetRunCurrency: StatSetRunCurrency method unresolved");
+  }
+
+  bool success = false;
+  if (g_semi_func_stat_set_run_currency) {
+    void* args[1] = { &amount };
+    MonoObject* exc = nullptr;
+    g_mono.mono_runtime_invoke(g_semi_func_stat_set_run_currency, nullptr, args, &exc);
+    if (!exc) {
+      success = true;
+      AppendLog("MonoSetRunCurrency: used StatSetRunCurrency");
+    }
+  }
+
+  if (!success && SetRunCurrencyViaPunManager(amount)) {
+    success = true;
+    AppendLog("MonoSetRunCurrency: used SetRunStatSet fallback");
+  }
+  if (!success && SetRunCurrencyDirectDict(amount)) {
+    success = true;
+    AppendLog("MonoSetRunCurrency: used runStats direct dict");
+  }
+
+  RefreshCurrencyUi("MonoSetRunCurrency");
+
+  int current_currency = 0;
+  if (ReadRunCurrency(current_currency)) {
+    std::ostringstream oss;
+    oss << "MonoSetRunCurrency: current currency=" << current_currency;
+    AppendLog(oss.str());
+  }
+  else {
+    AppendLog("MonoSetRunCurrency: ReadRunCurrency failed");
+  }
+  return true;
+}
+
 bool MonoOverrideSpeed(float multiplier, float duration_seconds) {
   if (!CacheManagedRefs()) {
     AppendLog("MonoOverrideSpeed: CacheManagedRefs failed");
@@ -2859,6 +3125,42 @@ bool MonoOverrideSpeed(float multiplier, float duration_seconds) {
 
   // Fallback: direct field set
   return MonoSetSpeedMultiplierDirect(multiplier, duration_seconds);
+}
+
+bool MonoUpgradeExtraJump(int count) {
+  if (!CacheManagedRefs()) {
+    AppendLog("MonoUpgradeExtraJump: CacheManagedRefs failed");
+    return false;
+  }
+  if (!g_pun_upgrade_extra_jump) {
+    AppendLog("MonoUpgradeExtraJump: UpgradePlayerExtraJump unresolved");
+    return false;
+  }
+  LocalPlayerInfo info;
+  if (!MonoGetLocalPlayer(info) || !info.object) {
+    AppendLog("MonoUpgradeExtraJump: failed to get local player");
+    return false;
+  }
+  if (!g_player_avatar_steamid_field) {
+    AppendLog("MonoUpgradeExtraJump: steamID field unresolved");
+    return false;
+  }
+  void* steam_str = nullptr;
+  g_mono.mono_field_get_value(static_cast<MonoObject*>(info.object),
+    g_player_avatar_steamid_field, &steam_str);
+  if (!steam_str) {
+    AppendLog("MonoUpgradeExtraJump: steamID is null");
+    return false;
+  }
+
+  void* args[2] = { steam_str, &count };
+  MonoObject* exc = nullptr;
+  g_mono.mono_runtime_invoke(g_pun_upgrade_extra_jump, nullptr, args, &exc);
+  if (exc) {
+    AppendLog("MonoUpgradeExtraJump: method threw exception");
+    return false;
+  }
+  return true;
 }
 
 bool MonoOverrideJumpCooldown(float seconds) {
@@ -2933,7 +3235,7 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
       AppendLog("MonoSetGrabStrength: methods unresolved");
       logged = true;
     }
-    return false;
+    // fall through to local field patch
   }
 
   LocalPlayerInfo info;
@@ -2966,10 +3268,15 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
     g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, nullptr, args, &exc);
     if (!exc) ok = true;
   }
+  // 鏃犺 RPC 鏄惁鎴愬姛锛岄兘鐩存帴鍦ㄦ湰鍦?PhysGrabber 涓婃柦鍔犲€硷紝淇濇寔涓嶈仈涓荤鍒�
+  // 官方公式参考：grabStrength += 0.2f * value
+  float desired = 0.2f * static_cast<float>(grab_strength);
+  MonoSetGrabStrengthField(desired);
+
   if (!ok) {
-    AppendLog("MonoSetGrabStrength: failed");
+    AppendLog("MonoSetGrabStrength: RPC failed, applied local field fallback only");
   }
-  return ok;
+  return true;
 }
 
 bool MonoSetGrabStrengthField(float strength) {
@@ -3551,12 +3858,12 @@ bool MonoSetCartValue(int value) {
   return true;
 }
 
-// 安全遍历 List<T>：当 _items 为空或 max_length 异常时，通过枚举器逐项取值。
+// 瀹夊叏閬嶅巻 List<T>锛氬綋 _items 涓虹┖鎴?max_length 寮傚父鏃讹紝閫氳繃鏋氫妇鍣ㄩ€愰」鍙栧€笺€?
 int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObject*)>& on_elem) {
   if (!list_obj || !on_elem) return 0;
   MonoClass* cls = g_mono.mono_object_get_class(list_obj);
   if (!cls) return 0;
-  // Cache per list/enumerator class to减少反射开销
+  // Cache per list/enumerator class to鍑忓皯鍙嶅皠寮€閿€
   static MonoClass* cached_list_cls = nullptr;
   static MonoMethod* cached_get_enum = nullptr;
   if (cls != cached_list_cls) {
@@ -3676,7 +3983,7 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
         return false;
       });
 
-    // 兜底：静态实例也尝试一次，避免列表异常导致全空
+    // 鍏滃簳锛氶潤鎬佸疄渚嬩篃灏濊瘯涓€娆★紝閬垮厤鍒楄〃寮傚父瀵艰嚧鍏ㄧ┖
     if (out_states.empty() && g_player_avatar_instance_field && g_player_avatar_vtable) {
       MonoObject* inst = nullptr;
       g_mono.mono_field_static_get_value(g_player_avatar_vtable, g_player_avatar_instance_field,
@@ -3735,7 +4042,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
 
     auto DisableFadeOnObject = [&](MonoObject* go_obj) {
-      if (!g_esp_enabled) return;  // 只在ESP开启时保持高亮
+      if (!g_esp_enabled) return;  // 鍙湪ESP寮€鍚椂淇濇寔楂樹寒
       if (!go_obj || !g_light_fade_class || !g_light_fade_type || !g_game_object_get_component ||
         !g_mono.mono_type_get_object || !g_mono.mono_runtime_invoke) {
         return;
@@ -3797,7 +4104,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
       MonoClass* cls = g_mono.mono_object_get_class(item_obj);
       if (cls) {
-        // 先尝试 ItemVolume 内部字段
+        // 鍏堝皾璇?ItemVolume 鍐呴儴瀛楁
         if (g_item_volume_class && IsSubclassOf(cls, g_item_volume_class) &&
           g_item_volume_item_attributes_field) {
           MonoObject* attr_obj = nullptr;
@@ -3818,7 +4125,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
             }
           }
         }
-        // 再尝试从 GameObject 上直接取 ItemAttributes 组件（应对 Collider 等）
+        // 鍐嶅皾璇曚粠 GameObject 涓婄洿鎺ュ彇 ItemAttributes 缁勪欢锛堝簲瀵?Collider 绛夛級
         if ((!st.has_value || !st.has_item_type) && go_obj &&
           g_game_object_get_component && g_item_attributes_type_obj) {
           void* args_attr[1] = { g_item_attributes_type_obj };
@@ -3904,24 +4211,23 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       layer_mask = (named_layer >= 0) ? (1 << named_layer) : -1;
 
       MonoObject* arr_obj = nullptr;
-      MonoObject* exc = nullptr;
       void* args4[4] = { center, &radius, &layer_mask, &query };
       void* args3[3] = { center, &radius, &layer_mask };
       void* args2[2] = { center, &radius };
       switch (g_physics_overlap_sphere_argc) {
       case 4:
-        arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args4, &exc);
+        arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args4, "OverlapSphere4");
         break;
       case 3:
-        arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args3, &exc);
+        arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args3, "OverlapSphere3");
         break;
       case 2:
-        arr_obj = g_mono.mono_runtime_invoke(g_physics_overlap_sphere, nullptr, args2, &exc);
+        arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args2, "OverlapSphere2");
         break;
       default:
         return false;
       }
-      if (exc || !arr_obj) {
+      if (!arr_obj) {
         AppendLogOnce("MonoListItems_overlap_null",
           "MonoListItems: OverlapSphere threw or returned null");
         return false;
@@ -3945,29 +4251,19 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         int preview = collider_count < 5 ? collider_count : 5;
         for (int i = 0; i < preview; ++i) {
           MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
-          if (!collider) continue;
+          if (!collider || IsUnityNull(collider)) continue;
           int go_layer = -1;
           std::string go_name;
-          MonoObject* exc_go = nullptr;
-          MonoObject* game_obj =
-            g_component_get_game_object
-            ? g_mono.mono_runtime_invoke(g_component_get_game_object, collider, nullptr, &exc_go)
-            : nullptr;
-          if (!exc_go && game_obj && g_game_object_get_layer) {
-            MonoObject* exc_layer = nullptr;
-            MonoObject* layer_obj =
-              g_mono.mono_runtime_invoke(g_game_object_get_layer, game_obj, nullptr, &exc_layer);
-            if (!exc_layer && layer_obj && g_mono.mono_object_unbox) {
+          MonoObject* game_obj = SafeInvoke(g_component_get_game_object, collider, nullptr, "Collider.preview_get_gameObject");
+          if (game_obj && !IsUnityNull(game_obj) && g_game_object_get_layer) {
+            MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, game_obj, nullptr, "Collider.preview_get_layer");
+            if (layer_obj && g_mono.mono_object_unbox) {
               go_layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
             }
           }
-          if (game_obj && g_unity_object_get_name) {
-            MonoObject* exc_name = nullptr;
-            MonoObject* name_obj =
-              g_mono.mono_runtime_invoke(g_unity_object_get_name, game_obj, nullptr, &exc_name);
-            if (!exc_name && name_obj) {
-              go_name = MonoStringToUtf8(name_obj);
-            }
+          if (game_obj && !IsUnityNull(game_obj) && g_unity_object_get_name) {
+            MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, game_obj, nullptr, "Collider.preview_get_name");
+            if (name_obj) go_name = MonoStringToUtf8(name_obj);
           }
           std::ostringstream oss2;
           oss2 << "  Collider[" << i << "] layer=" << go_layer
@@ -3985,14 +4281,10 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       int valid = 0;
       for (int i = 0; i < limit; ++i) {
         MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
-        if (!collider) continue;
+        if (!collider || IsUnityNull(collider)) continue;
 
-        MonoObject* exc_tr = nullptr;
-        MonoObject* transform_obj =
-          g_mono.mono_runtime_invoke(g_component_get_transform, collider, nullptr, &exc_tr);
-        if (exc_tr || !transform_obj) {
-          continue;
-        }
+        MonoObject* transform_obj = SafeInvoke(g_component_get_transform, collider, nullptr, "Collider.get_transform");
+        if (!transform_obj || IsUnityNull(transform_obj)) continue;
 
         PlayerState st{};
         populate_meta(collider, st);
@@ -4030,7 +4322,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
     static bool logged_no_items = false;
 
-    // --- 已验证补丁：直接字段 + GetAllItemVolumesInScene ---
+    // --- 宸查獙璇佽ˉ涓侊細鐩存帴瀛楁 + GetAllItemVolumesInScene ---
     auto fetch_verified_list = [&]() -> MonoObject* {
       MonoObject* list_obj = nullptr;
       if (manager && g_item_manager_item_volumes_field) {
@@ -4067,7 +4359,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       return list_obj;
       };
 
-    // --- 备选数据源：Populate + FindObjectsOfType<ItemVolume>() ---
+    // --- 澶囬€夋暟鎹簮锛歅opulate + FindObjectsOfType<ItemVolume>() ---
     auto fetch_fallback_list = [&]() -> MonoObject* {
       MonoObject* list_obj = nullptr;
       MonoObject* exception = nullptr;
@@ -4177,7 +4469,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     int list_size = 0;
     read_list(list_obj, items, list_size);
 
-    // 如果拿到了对象但长度为 0，强制调用一次 GetAllItemVolumesInScene 并重复读取。
+    // 濡傛灉鎷垮埌浜嗗璞′絾闀垮害涓?0锛屽己鍒惰皟鐢ㄤ竴娆?GetAllItemVolumesInScene 骞堕噸澶嶈鍙栥€?
     static bool forced_get_all_once = false;
     if (list_size == 0 && manager && g_item_manager_get_all_items && !forced_get_all_once) {
       MonoObject* exc_force = nullptr;
@@ -4219,7 +4511,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // Rescue: 如果 list_size>0 但 items 为空，直接用 FindObjectsOfType 拿 Array。
+    // Rescue: 濡傛灉 list_size>0 浣?items 涓虹┖锛岀洿鎺ョ敤 FindObjectsOfType 鎷?Array銆?
     if (list_size > 0 && (!items || (items && items->max_length == 0)) &&
       g_find_objects_of_type_itemvolume && g_item_volume_class &&
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
@@ -4247,7 +4539,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // 兜底：依然没有 items 就再尝试一次 FindObjectsOfType。
+    // 鍏滃簳锛氫緷鐒舵病鏈?items 灏卞啀灏濊瘯涓€娆?FindObjectsOfType銆?
     if ((!items || list_size <= 0) && g_find_objects_of_type_itemvolume && g_item_volume_class &&
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
       MonoType* iv_type = g_mono.mono_class_get_type(g_item_volume_class);
@@ -4359,13 +4651,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // 如果托管数组指针存在但数据区为空（vector=null），直接放弃以免越界。
-    if (items && !items->vector) {
-      AppendLogOnce("MonoListItems_null_vector", "MonoListItems: items array has null data vector, skipping");
-      return true;
-    }
-
-    // If array missing or max_length异常，使用枚举器兜底。
+    // If array missing or max_length寮傚父锛屼娇鐢ㄦ灇涓惧櫒鍏滃簳銆?
     if (!items || list_size <= 0 || (items && items->max_length <= 0)) {
       int enumerated = EnumerateListObjects(
         list_obj, [&](MonoObject* item_obj) -> bool {
@@ -4405,18 +4691,13 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
     int limit = list_size;
     int max_len = (items && items->max_length > 0) ? static_cast<int>(items->max_length) : list_size;
-    // 当 max_length 异常为 0/负数时，直接用 list_size（已在上方兜底过）
+    // 褰?max_length 寮傚父涓?0/璐熸暟鏃讹紝鐩存帴鐢?list_size锛堝凡鍦ㄤ笂鏂瑰厹搴曡繃锛?
     if (max_len > 0 && limit > max_len) limit = max_len;
     if (limit > 1024) {
       limit = 1024;
     }
 
     int valid_count = 0;
-    // 再次保护：vector 为空则不进入循环。
-    if (!items->vector) {
-      AppendLogOnce("MonoListItems_null_vector_loop", "MonoListItems: items vector null before loop");
-      return true;
-    }
     for (int i = 0; i < limit; ++i) {
       MonoObject* item = static_cast<MonoObject*>(items->vector[i]);
       if (!item) continue;
@@ -4517,22 +4798,37 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
   }
 }
 
-bool MonoListItemsSafe(std::vector<PlayerState>& out_items) {
-  EnsureSehTranslator();
-  try {
-    return MonoListItems(out_items);
+// Thunk with SEH kept minimal to satisfy MSVC "object unwinding" restriction.
+// Avoid local objects with destructors inside the __try block.
+#ifdef _MSC_VER
+__declspec(noinline) static bool __stdcall MonoListItemsSehThunk(std::vector<PlayerState>* out_items) {
+  __try {
+    return MonoListItems(*out_items);
   }
-  catch (const SeException& ex) {
-    LogCrash("MonoListItemsSafe", ex.code, ex.info);
+  __except (LogCrash("MonoListItemsSafe", GetExceptionCode(), GetExceptionInformation())) {
+    return false;
+  }
+}
+#endif
+
+bool MonoListItemsSafe(std::vector<PlayerState>& out_items) {
+#ifdef _MSC_VER
+  bool ok = MonoListItemsSehThunk(&out_items);
+  if (!ok) {
     g_items_disabled = true;
     AppendLogOnce("MonoListItems_disabled", "MonoListItemsSafe crashed; auto item refresh disabled");
-    return false;
+  }
+  return ok;
+#else
+  try {
+    return MonoListItems(out_items);
   }
   catch (...) {
     g_items_disabled = true;
     AppendLogOnce("MonoListItems_disabled", "MonoListItemsSafe crashed; auto item refresh disabled");
     return false;
   }
+#endif
 }
 
 bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
@@ -4543,9 +4839,6 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLog("MonoListEnemies: CacheManagedRefs failed");
       return false;
     }
-    if (UnityHelperReadEnemySnapshot(out_enemies) && !out_enemies.empty()) {
-      return true;
-    }
     if (!g_enemy_rigidbody_class) {
       AppendLogOnce("MonoListEnemies_no_class", "MonoListEnemies: EnemyRigidbody class unresolved");
       return false;
@@ -4554,10 +4847,28 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLogOnce("MonoListEnemies_no_method", "MonoListEnemies: transform/gameObject/GetComponent unresolved");
       return false;
     }
-    // 彻底禁用缓存路径，避免陈旧对象崩溃
-    g_enemy_cache_disabled = true;
-    g_enemy_cache.clear();
-    g_enemy_cache_last_refresh = 0;
+    // 浣庨鍒锋柊缂撳瓨锛?s 涓€娆★級锛岄伩鍏嶆瘡甯у叏灞€鎵弿
+    uint64_t now = GetTickCount64();
+    // 浠呬緷璧?Awake Hook 缁存姢鐨勭紦瀛橈紝绂佺敤鍏ㄥ眬鎵弿浠ヨ閬挎綔鍦ㄥ穿婧?
+    (void)now;
+    EnemyCachePruneDead();
+    std::vector<uint32_t> cache_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      cache_snapshot = g_enemy_cache;
+    }
+    int cached_added = 0;
+    for (uint32_t h : cache_snapshot) {
+      MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
+      if (enemy_obj && AddEnemyFromObject(enemy_obj, out_enemies)) {
+        ++cached_added;
+        if (cached_added >= 512) break;
+      }
+    }
+    if (cached_added > 0) {
+      AppendLogOnce("MonoListEnemies_cache", "MonoListEnemies: populated from cached EnemyRigidbody list");
+      return true;
+    }
     if (!g_physics_overlap_sphere) {
       AppendLogOnce("MonoListEnemies_no_overlap", "MonoListEnemies: Physics.OverlapSphere unresolved");
       return false;
@@ -4601,9 +4912,8 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       return true;
     };
 
-    // 出于稳定性，暂不使用 FindObjectsOfType/Resources 全局扫描，统一走下方 OverlapSphere 近场扫描。
-
-    // 基于玩家位置的近场扫描（兼容旧逻辑）
+    // 鍑轰簬绋冲畾鎬э紝鏆備笉浣跨敤 FindObjectsOfType/Resources 鍏ㄥ眬鎵弿锛岀粺涓€璧颁笅鏂?OverlapSphere 杩戝満鎵弿銆?
+    // 鍩轰簬鐜╁浣嶇疆鐨勮繎鍦烘壂鎻忥紙鍏煎鏃ч€昏緫锛?
     float center[3] = { 0.0f, 0.0f, 0.0f };
     PlayerState local_state{};
     if (MonoGetLocalPlayerState(local_state) && local_state.has_position) {
@@ -4611,8 +4921,8 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       center[1] = local_state.y;
       center[2] = local_state.z;
     }
-    float radius = 800.0f;   // 适中半径，兼顾稳定与覆盖
-    int layer_mask = -1;     // 不限定 Layer，保证能扫到实际敌人
+    float radius = 300.0f;
+    int layer_mask = -1;
     int query = 2;  // QueryTriggerInteraction.Collide
     void* args4[4] = { center, &radius, &layer_mask, &query };
     void* args3[3] = { center, &radius, &layer_mask };
@@ -4642,7 +4952,6 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     int limit = static_cast<int>(colliders->max_length);
     if (limit > 2048) limit = 2048;
     int valid = 0;
-    int fallback_valid = 0;
     for (int i = 0; i < limit; ++i) {
       MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
       if (!collider) continue;
@@ -4650,18 +4959,6 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       if (!game_obj) continue;
       void* comp_args[1] = { enemy_type_obj };
       if (!comp_args[0]) continue;
-      std::string go_name;
-      if (g_unity_object_get_name) {
-        MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, game_obj, nullptr, "GameObject.get_name");
-        if (name_obj) {
-          go_name = MonoStringToUtf8(name_obj);
-        }
-      }
-      if (!IsLikelyEnemyName(go_name)) {
-        continue;
-      }
-
-      // Require Enemy or EnemyRigidbody component; skip pure colliders.
       MonoObject* enemy =
         SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(Enemy)");
       if (!enemy && g_game_object_get_component_in_parent) {
@@ -4670,70 +4967,34 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
         AppendLogOnce("MonoListEnemies_parent_fallback",
           "Collider game object fell back to GameObject::GetComponentInParent(Enemy)");
       }
-      MonoObject* enemy_rb =
-        SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(EnemyRigidbody)");
-
-      MonoObject* target = enemy ? enemy : enemy_rb;
-      if (!target) continue;
-
-      MonoObject* tr = SafeInvoke(g_component_get_transform, target, nullptr, "Enemy.get_transform");
-      if (!tr) continue;
-
-      PlayerState st{};
-      st.category = PlayerState::Category::kEnemy;
-      if (!TryGetPositionFromTransform(tr, st, false)) continue;
-
-      st.is_local = false;
-      st.has_health = false;
-      if (!go_name.empty()) {
-        st.name = go_name;
-        st.has_name = true;
+      // 濡傛灉 Enemy 缁勪欢涓嶅瓨鍦紝灏濊瘯鐩存帴鐢?EnemyRigidbody 缁勪欢/瀵硅薄
+      bool added = false;
+      if (enemy) {
+        MonoObject* tr = SafeInvoke(g_component_get_transform, enemy, nullptr, "Enemy.get_transform");
+        if (tr) {
+          PlayerState st{};
+          st.category = PlayerState::Category::kEnemy;
+          if (TryGetPositionFromTransform(tr, st, false) && st.has_position) {
+            st.is_local = false;
+            st.has_health = false;
+            out_enemies.push_back(st);
+            ++valid;
+            added = true;
+          }
+        }
       }
-      out_enemies.push_back(st);
-      ++valid;
+      if (!added) {
+        // Enemy component missing; fall back to the collider (Component) to avoid calling Component
+        // methods on a GameObject, which caused crashes and disabled ESP.
+        if (AddEnemyFromObject(collider, out_enemies)) {
+          ++valid;
+          added = true;
+        }
+      }
       if (valid >= 256) break;
     }
 
-    // If strict pass found nothing, do a conservative fallback: only accept objects that look like enemies.
     if (valid == 0) {
-      for (int i = 0; i < limit && fallback_valid < 128; ++i) {
-        MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
-        if (!collider) continue;
-        MonoObject* game_obj = SafeInvoke(g_component_get_game_object, collider, nullptr, "Collider.get_gameObject");
-        if (!game_obj) continue;
-        int layer = -1;
-        if (g_game_object_get_layer && g_mono.mono_object_unbox) {
-          MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, game_obj, nullptr, "GameObject.get_layer");
-          if (layer_obj) layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-        }
-        if (layer == 0) continue;  // skip default layer to avoid场景资源
-
-        void* comp_args[1] = { enemy_type_obj };
-        MonoObject* enemy = SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(Enemy)");
-        if (!enemy && g_game_object_get_component_in_parent) {
-          enemy = SafeInvoke(g_game_object_get_component_in_parent, game_obj, comp_args,
-            "GameObject.GetComponentInParent(Enemy)");
-        }
-        MonoObject* enemy_rb =
-          SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(EnemyRigidbody)");
-        MonoObject* target = enemy ? enemy : nullptr;
-        if (enemy_rb) target = enemy_rb;  // prefer EnemyRigidbody when available
-        if (!target) continue;
-
-        std::string go_name;
-        if (g_unity_object_get_name) {
-          MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, game_obj, nullptr, "GameObject.get_name");
-          if (name_obj) go_name = MonoStringToUtf8(name_obj);
-        }
-        if (!go_name.empty() && !IsLikelyEnemyName(go_name)) continue;
-
-        if (AddEnemyFromObject(target, out_enemies)) {
-          ++fallback_valid;
-        }
-      }
-    }
-
-    if (valid == 0 && fallback_valid == 0) {
       AppendLogOnce("MonoListEnemies_zero", "MonoListEnemies: found zero enemies after scanning colliders");
     }
     return true;
@@ -4746,21 +5007,24 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
 }
 
 bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies) {
-  EnsureSehTranslator();
+#ifdef _MSC_VER
+  __try {
+    return MonoListEnemies(out_enemies);
+  }
+  __except (LogCrash("MonoListEnemiesSafe", GetExceptionCode(), GetExceptionInformation())) {
+    g_enemy_esp_disabled = true;
+    g_enemy_cache_disabled = true;
+    return false;
+  }
+#else
   try {
     return MonoListEnemies(out_enemies);
   }
-  catch (const SeException& ex) {
-    LogCrash("MonoListEnemiesSafe", ex.code, ex.info);
-    g_enemy_esp_disabled = true;
-    AppendLogOnce("MonoListEnemies_disabled", "Enemy ESP disabled after SEH failure");
-    return false;
-  }
   catch (...) {
     g_enemy_esp_disabled = true;
-    AppendLogOnce("MonoListEnemies_disabled", "Enemy ESP disabled after exception");
     return false;
   }
+#endif
 }
 
 bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
@@ -4958,7 +5222,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     return hit;
   };
 
-  // 1) 优先直接枚举 PhysGrabObject（含非激活）
+  // 1) 浼樺厛鐩存帴鏋氫妇 PhysGrabObject锛堝惈闈炴縺娲伙級
   int total_hit = 0;
   if (g_object_find_objects_of_type_include_inactive && pgo_type_obj) {
     bool include_inactive = true;
@@ -4968,7 +5232,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     total_hit += call_new_on_array(reinterpret_cast<MonoArray*>(arr_obj));
   }
 
-  // 2) 退化：OverlapSphere 物理探测
+  // 2) 閫€鍖栵細OverlapSphere 鐗╃悊鎺㈡祴
   if (total_hit == 0 && g_physics_overlap_sphere && g_component_get_transform) {
     float center[3] = { 0.0f, 0.0f, 0.0f };
     PlayerState local_state{};
@@ -5047,7 +5311,7 @@ bool MonoApplyValuableDiscoverPersistence(bool enable, float wait_seconds, int& 
   return true;
 }
 
-// SEH 安全包装，防止越界崩溃
+// SEH 瀹夊叏鍖呰锛岄槻姝㈣秺鐣屽穿婧?
 bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count) {
   out_count = 0;
   try {
@@ -5073,4 +5337,5 @@ bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, i
 bool MonoNativeHighlightAvailable() {
   return !g_native_highlight_failed;
 }
+
 

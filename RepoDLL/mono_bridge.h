@@ -71,9 +71,11 @@ extern bool g_native_highlight_active;
 // 目前在 HookPresent / RenderOverlay 中设置，用于在崩溃日志里记录阶段
 void SetCrashStage(const char* stage);
 
+bool MonoSetRunCurrency(int amount);
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
 bool MonoOverrideSpeed(float multiplier, float duration_seconds);
+bool MonoUpgradeExtraJump(int count);
 bool MonoOverrideJumpCooldown(float seconds);
 bool MonoSetInvincible(float duration_seconds);
 bool MonoSetGrabStrength(int grab_strength, int throw_strength);
@@ -83,6 +85,17 @@ bool MonoSetJumpForce(float force);
 bool MonoSetCartValue(int value);
 bool MonoSetGrabRange(float range);
 bool MonoSetGrabStrengthField(float strength);
+
+// Round/haul helpers (关卡收集阶段)
+struct RoundState {
+  bool ok{ false };
+  int current{ 0 };
+  int current_max{ 0 };
+  int goal{ 0 };
+  int stage{ -1 };  // 未解析则为 -1
+};
+bool MonoGetRoundState(RoundState& out_state);
+bool MonoSetRoundState(int current, int goal = -1, int current_max = -1);
 
 // Enumerate all PlayerAvatar instances; fills out_states with any player that has a position.
 bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local);
