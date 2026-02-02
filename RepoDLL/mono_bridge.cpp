@@ -273,7 +273,6 @@ namespace {
   MonoClassField* g_shop_secret_item_volumes_field = nullptr;
 
   MonoClass* g_pun_manager_class = nullptr;
-  MonoMethod* g_pun_upgrade_extra_jump = nullptr;
   MonoMethod* g_pun_upgrade_grab_strength = nullptr;
   MonoMethod* g_pun_upgrade_throw_strength = nullptr;
   MonoMethod* g_pun_set_run_stat_set = nullptr;
@@ -1586,19 +1585,6 @@ namespace {
         AppendLog("Failed to resolve PunManager::instance field");
       }
     }
-    if (g_pun_manager_class && !g_pun_upgrade_extra_jump) {
-      for (int argc : {2, 1, 0}) {
-        g_pun_upgrade_extra_jump = g_mono.mono_class_get_method_from_name(
-          g_pun_manager_class, config::kPunManagerUpgradeExtraJumpMethod, argc);
-        if (g_pun_upgrade_extra_jump) {
-          AppendLog("Resolved PunManager::UpgradePlayerExtraJump argc=" + std::to_string(argc));
-          break;
-        }
-      }
-      if (g_pun_upgrade_extra_jump) {
-        // already logged
-      }
-    }
     if (g_pun_manager_class && !g_pun_set_run_stat_set) {
       g_pun_set_run_stat_set = g_mono.mono_class_get_method_from_name(
         g_pun_manager_class, config::kPunManagerSetRunStatSetMethod, 2);
@@ -2842,50 +2828,6 @@ bool MonoApplyPendingCartValue() {
   return applied;
 }
 
-bool MonoSetRunCurrency(int amount) {
-  if (g_shutting_down) return false;
-  if (!CacheManagedRefs()) {
-    AppendLog("MonoSetRunCurrency: CacheManagedRefs failed");
-    return false;
-  }
-  if (!g_semi_func_stat_set_run_currency) {
-    AppendLog("MonoSetRunCurrency: StatSetRunCurrency method unresolved");
-  }
-
-  bool success = false;
-  if (g_semi_func_stat_set_run_currency) {
-    void* args[1] = { &amount };
-    MonoObject* exc = nullptr;
-    g_mono.mono_runtime_invoke(g_semi_func_stat_set_run_currency, nullptr, args, &exc);
-    if (!exc) {
-      success = true;
-      AppendLog("MonoSetRunCurrency: used StatSetRunCurrency");
-    }
-  }
-
-  if (!success && SetRunCurrencyViaPunManager(amount)) {
-    success = true;
-    AppendLog("MonoSetRunCurrency: used SetRunStatSet fallback");
-  }
-  if (!success && SetRunCurrencyDirectDict(amount)) {
-    success = true;
-    AppendLog("MonoSetRunCurrency: used runStats direct dict");
-  }
-
-  RefreshCurrencyUi("MonoSetRunCurrency");
-
-  int current_currency = 0;
-  if (ReadRunCurrency(current_currency)) {
-    std::ostringstream oss;
-    oss << "MonoSetRunCurrency: current currency=" << current_currency;
-    AppendLog(oss.str());
-  }
-  else {
-    AppendLog("MonoSetRunCurrency: ReadRunCurrency failed");
-  }
-  return true;
-}
-
 bool MonoOverrideSpeed(float multiplier, float duration_seconds) {
   if (!CacheManagedRefs()) {
     AppendLog("MonoOverrideSpeed: CacheManagedRefs failed");
@@ -2917,42 +2859,6 @@ bool MonoOverrideSpeed(float multiplier, float duration_seconds) {
 
   // Fallback: direct field set
   return MonoSetSpeedMultiplierDirect(multiplier, duration_seconds);
-}
-
-bool MonoUpgradeExtraJump(int count) {
-  if (!CacheManagedRefs()) {
-    AppendLog("MonoUpgradeExtraJump: CacheManagedRefs failed");
-    return false;
-  }
-  if (!g_pun_upgrade_extra_jump) {
-    AppendLog("MonoUpgradeExtraJump: UpgradePlayerExtraJump unresolved");
-    return false;
-  }
-  LocalPlayerInfo info;
-  if (!MonoGetLocalPlayer(info) || !info.object) {
-    AppendLog("MonoUpgradeExtraJump: failed to get local player");
-    return false;
-  }
-  if (!g_player_avatar_steamid_field) {
-    AppendLog("MonoUpgradeExtraJump: steamID field unresolved");
-    return false;
-  }
-  void* steam_str = nullptr;
-  g_mono.mono_field_get_value(static_cast<MonoObject*>(info.object),
-    g_player_avatar_steamid_field, &steam_str);
-  if (!steam_str) {
-    AppendLog("MonoUpgradeExtraJump: steamID is null");
-    return false;
-  }
-
-  void* args[2] = { steam_str, &count };
-  MonoObject* exc = nullptr;
-  g_mono.mono_runtime_invoke(g_pun_upgrade_extra_jump, nullptr, args, &exc);
-  if (exc) {
-    AppendLog("MonoUpgradeExtraJump: method threw exception");
-    return false;
-  }
-  return true;
 }
 
 bool MonoOverrideJumpCooldown(float seconds) {
@@ -4788,7 +4694,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       if (valid >= 256) break;
     }
 
-    // If strict pass found nothing, do a fallback pass: accept non-zero layer colliders as EnemyRigidbody.
+    // If strict pass found nothing, do a conservative fallback: only accept objects that look like enemies.
     if (valid == 0) {
       for (int i = 0; i < limit && fallback_valid < 128; ++i) {
         MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
@@ -4801,7 +4707,27 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
           if (layer_obj) layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
         }
         if (layer == 0) continue;  // skip default layer to avoid场景资源
-        if (AddEnemyFromObject(collider, out_enemies)) {
+
+        void* comp_args[1] = { enemy_type_obj };
+        MonoObject* enemy = SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(Enemy)");
+        if (!enemy && g_game_object_get_component_in_parent) {
+          enemy = SafeInvoke(g_game_object_get_component_in_parent, game_obj, comp_args,
+            "GameObject.GetComponentInParent(Enemy)");
+        }
+        MonoObject* enemy_rb =
+          SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(EnemyRigidbody)");
+        MonoObject* target = enemy ? enemy : nullptr;
+        if (enemy_rb) target = enemy_rb;  // prefer EnemyRigidbody when available
+        if (!target) continue;
+
+        std::string go_name;
+        if (g_unity_object_get_name) {
+          MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, game_obj, nullptr, "GameObject.get_name");
+          if (name_obj) go_name = MonoStringToUtf8(name_obj);
+        }
+        if (!go_name.empty() && !IsLikelyEnemyName(go_name)) continue;
+
+        if (AddEnemyFromObject(target, out_enemies)) {
           ++fallback_valid;
         }
       }

@@ -111,7 +111,6 @@ constexpr const char* kStatsManagerRunStatsField = "runStats";
 
 constexpr const char* kPunManagerNamespace = "";
 constexpr const char* kPunManagerClass = "PunManager";
-constexpr const char* kPunManagerUpgradeExtraJumpMethod = "UpgradePlayerExtraJump";
 constexpr const char* kPunManagerUpgradeGrabStrengthMethod = "UpgradePlayerGrabStrength";
 constexpr const char* kPunManagerUpgradeThrowStrengthMethod = "UpgradePlayerThrowStrength";
 constexpr const char* kPunManagerSetRunStatSetMethod = "SetRunStatSet";

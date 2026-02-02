@@ -71,11 +71,9 @@ extern bool g_native_highlight_active;
 // 目前在 HookPresent / RenderOverlay 中设置，用于在崩溃日志里记录阶段
 void SetCrashStage(const char* stage);
 
-bool MonoSetRunCurrency(int amount);
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
 bool MonoOverrideSpeed(float multiplier, float duration_seconds);
-bool MonoUpgradeExtraJump(int count);
 bool MonoOverrideJumpCooldown(float seconds);
 bool MonoSetInvincible(float duration_seconds);
 bool MonoSetGrabStrength(int grab_strength, int throw_strength);
