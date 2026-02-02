@@ -124,8 +124,17 @@ void RenderOverlay(bool* menu_open) {
   static uint64_t last_user_edit = 0;
   static uint64_t last_items_update = 0;
   static uint64_t last_enemies_update = 0;
+  static int matrix_refresh_ms = 33;
+  static int items_refresh_ms = 60;
+  static int enemies_refresh_ms = 60;
 
   const uint64_t now = GetTickCount64();
+  auto clamp_int = [](int v, int lo, int hi) {
+    return (v < lo) ? lo : (v > hi ? hi : v);
+  };
+  matrix_refresh_ms = clamp_int(matrix_refresh_ms, 5, 200);
+  items_refresh_ms = clamp_int(items_refresh_ms, 10, 2000);
+  enemies_refresh_ms = clamp_int(enemies_refresh_ms, 10, 2000);
   const bool mono_ready = MonoInitialize();
   const bool user_editing = ImGui::IsAnyItemActive();
   if (user_editing) {
@@ -156,7 +165,16 @@ void RenderOverlay(bool* menu_open) {
     // 若还没有获取过相机矩阵，也跳过（常见于主菜单）
     if (!g_cached_mats_valid) return;
     SetCrashStage("RenderOverlay:MonoListItems");
-    MonoListItemsSafe(g_cached_items);
+#ifdef _MSC_VER
+    __try {
+#endif
+      MonoListItemsSafe(g_cached_items);
+#ifdef _MSC_VER
+    }
+    __except (LogCrash("RenderOverlay:MonoListItems", GetExceptionCode(), GetExceptionInformation())) {
+      g_items_disabled = true;
+    }
+#endif
     last_items_update = now;
   };
   auto refresh_enemies = [&]() {
@@ -165,7 +183,16 @@ void RenderOverlay(bool* menu_open) {
     if (!last_ok || !last_state.has_position) return;
     if (!g_cached_mats_valid) return;
     SetCrashStage("RenderOverlay:MonoListEnemies");
-    MonoListEnemiesSafe(g_cached_enemies);
+#ifdef _MSC_VER
+    __try {
+#endif
+      MonoListEnemiesSafe(g_cached_enemies);
+#ifdef _MSC_VER
+    }
+    __except (LogCrash("RenderOverlay:MonoListEnemies", GetExceptionCode(), GetExceptionInformation())) {
+      g_enemy_esp_disabled = true;
+    }
+#endif
     last_enemies_update = now;
   };
   auto refresh_matrices = [&]() {
@@ -179,14 +206,14 @@ void RenderOverlay(bool* menu_open) {
       g_last_matrix_update = now;
     }
   };
-  // 高频刷新：降低到约 60ms，保证快速转镜时缓存不滞后
-  if (mono_ready && auto_refresh_items && now - last_items_update > 60) {
+  // 高频刷新：默认 60ms，可在 ESP 页自定义，保证快速转镜时缓存不滞后
+  if (mono_ready && auto_refresh_items && now - last_items_update > static_cast<uint64_t>(items_refresh_ms)) {
     refresh_items();
   }
-  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 60) {
+  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > static_cast<uint64_t>(enemies_refresh_ms)) {
     refresh_enemies();
   }
-  if (mono_ready && now - g_last_matrix_update > 33) {
+  if (mono_ready && now - g_last_matrix_update > matrix_refresh_ms) {
     refresh_matrices();
   }
 
@@ -464,32 +491,55 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndTabItem();
         }
 
-        // 物品 / ESP 页
-        if (ImGui::BeginTabItem("物品/ESP")) {
+        // ESP 控制页（所有开关/参数集中）
+        if (ImGui::BeginTabItem("ESP")) {
+          ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.48f, 1.0f), "全局开关");
           ImGui::Checkbox("物品ESP", &g_item_esp_enabled);
           ImGui::SameLine();
-          ImGui::Checkbox("原生高亮", &g_native_highlight_active);
+          ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled);
           ImGui::SameLine();
-          ImGui::Checkbox("自动刷新", &auto_refresh_items);
+          ImGui::Checkbox("原生高亮", &g_native_highlight_active);
+
+          ImGui::Spacing();
+          ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.48f, 1.0f), "刷新与上限");
+          ImGui::Checkbox("自动刷新物品", &auto_refresh_items);
           ImGui::SameLine();
           if (ImGui::Button("刷新物品")) refresh_items();
           ImGui::SameLine();
-          ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_items.size()));
+          ImGui::TextDisabled("物品缓存: %d", static_cast<int>(g_cached_items.size()));
+
+          ImGui::Checkbox("自动刷新敌人", &auto_refresh_enemies);
+          ImGui::SameLine();
+          if (ImGui::Button("刷新敌人")) refresh_enemies();
+          ImGui::SameLine();
+          ImGui::TextDisabled("敌人缓存: %d", static_cast<int>(g_cached_enemies.size()));
+          if (g_enemy_esp_disabled) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "敌人扫描已自动关闭(崩溃保护)");
+          }
+
           ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
           ImGui::SliderInt("敌人ESP上限", &g_enemy_esp_cap, 0, 512);
 
           ImGui::Spacing();
-          ImGui::BeginGroup();
-          int total_items = static_cast<int>(g_cached_items.size());
-          ImGui::TextDisabled("原生高亮状态");
+          ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.48f, 1.0f), "刷新间隔 (毫秒)");
+          ImGui::InputInt("矩阵刷新", &matrix_refresh_ms);
+          ImGui::InputInt("物品刷新", &items_refresh_ms);
+          ImGui::InputInt("敌人刷新", &enemies_refresh_ms);
+          ImGui::TextDisabled("矩阵当前: %dms, 物品: %dms, 敌人: %dms", matrix_refresh_ms, items_refresh_ms, enemies_refresh_ms);
+
+          ImGui::Spacing();
+          ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.48f, 1.0f), "原生高亮");
           ImGui::SliderInt("模式##native_state", &native_highlight_state, 0, 2);
           ImGui::SliderInt("最大数量##native_limit", &native_highlight_limit, 20, 512);
           ImGui::SameLine();
-          ImGui::TextDisabled("当前检测: %d", total_items);
-          ImGui::SameLine();
-          ImGui::TextDisabled("最近触发: %d", last_highlight_count);
-          ImGui::EndGroup();
+          ImGui::TextDisabled("检测: %d | 最近触发: %d", static_cast<int>(g_cached_items.size()), last_highlight_count);
+          ImGui::EndTabItem();
+        }
 
+        // 物品页（纯展示）
+        if (ImGui::BeginTabItem("物品")) {
+          ImGui::TextDisabled("缓存数量: %d", static_cast<int>(g_cached_items.size()));
           ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
             ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Hideable | ImGuiTableFlags_Reorderable;
@@ -560,15 +610,9 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndTabItem();
         }
 
-        // 敌人页
+        // 敌人页（纯展示）
         if (ImGui::BeginTabItem("敌人")) {
-          ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled);
-          ImGui::SameLine();
-          ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
-          ImGui::SameLine();
-          if (ImGui::Button("刷新敌人")) refresh_enemies();
-          ImGui::SameLine();
-          ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
+          ImGui::TextDisabled("缓存数量: %d", static_cast<int>(g_cached_enemies.size()));
           if (g_enemy_esp_disabled) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "敌人扫描已自动关闭(崩溃保护)");

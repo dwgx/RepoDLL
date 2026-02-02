@@ -4453,6 +4453,12 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
+    // 如果托管数组指针存在但数据区为空（vector=null），直接放弃以免越界。
+    if (items && !items->vector) {
+      AppendLogOnce("MonoListItems_null_vector", "MonoListItems: items array has null data vector, skipping");
+      return true;
+    }
+
     // If array missing or max_length异常，使用枚举器兜底。
     if (!items || list_size <= 0 || (items && items->max_length <= 0)) {
       int enumerated = EnumerateListObjects(
@@ -4500,6 +4506,11 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
 
     int valid_count = 0;
+    // 再次保护：vector 为空则不进入循环。
+    if (!items->vector) {
+      AppendLogOnce("MonoListItems_null_vector_loop", "MonoListItems: items vector null before loop");
+      return true;
+    }
     for (int i = 0; i < limit; ++i) {
       MonoObject* item = static_cast<MonoObject*>(items->vector[i]);
       if (!item) continue;
