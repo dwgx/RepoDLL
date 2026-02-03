@@ -210,7 +210,7 @@ void RenderOverlay(bool* menu_open) {
   static bool round_lock_enabled = false;
   static uint64_t round_lock_last_tick = 0;
   static float speed_mult = 1.0f;      // 默认与游戏一致，不主动改动
-  static int extra_jump_count = 0;     // 默认不加跳数，避免注入即改变
+  static int extra_jump_count = 0;     // 初始 0，用户开启时如未设值会自动提升
   static float jump_cooldown = 0.0f;   // 仅在用户修改后生效
   static int grab_strength = 1000;
   static bool infinite_jump_enabled = false;  // 默认关闭，需手动开启
@@ -618,7 +618,8 @@ void RenderOverlay(bool* menu_open) {
             ImGui::Text("跳跃");
             ImGui::TableSetColumnIndex(1);
             if (ImGui::Checkbox("无限跳跃", &infinite_jump_enabled)) {
-              if (infinite_jump_enabled && extra_jump_count > 0) {
+              if (infinite_jump_enabled) {
+                if (extra_jump_count <= 0) extra_jump_count = 9999;
                 MonoSetJumpExtraDirect(extra_jump_count);
               }
             }
@@ -688,6 +689,7 @@ void RenderOverlay(bool* menu_open) {
 
         // 物品 / ESP 页
         if (ImGui::BeginTabItem("物品/ESP")) {
+          ImGui::BeginGroup();
           if (ImGui::Checkbox("物品ESP", &g_item_esp_enabled)) {
             g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
           }
@@ -699,6 +701,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::Checkbox("自动刷新", &auto_refresh_items);
           ImGui::SameLine();
           if (ImGui::Button("刷新物品")) refresh_items();
+          ImGui::EndGroup();
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_items.size()));
           if (MonoItemsDisabled()) {
@@ -710,7 +713,7 @@ void RenderOverlay(bool* menu_open) {
             last_items_update = now;
           }
           ImGui::SameLine();
-          if (ImGui::Button("重置禁用标志")) {
+          if (ImGui::Button("重置物品禁用")) {
             MonoResetItemsDisabled();
           }
           ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
@@ -904,6 +907,7 @@ void RenderOverlay(bool* menu_open) {
 
         // 敌人页
         if (ImGui::BeginTabItem("敌人")) {
+          ImGui::BeginGroup();
           if (ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled)) {
             g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
           }
@@ -911,6 +915,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
           ImGui::SameLine();
           if (ImGui::Button("刷新敌人")) refresh_enemies();
+          ImGui::EndGroup();
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
           if (g_enemy_esp_disabled) {
@@ -1035,66 +1040,6 @@ void RenderOverlay(bool* menu_open) {
             g_esp_enabled = false;
           }
 
-          ImGui::EndTabItem();
-        }
-
-        // 敌人页
-        if (ImGui::BeginTabItem("敌人")) {
-          if (ImGui::Checkbox("敌人ESP", &g_enemy_esp_enabled)) {
-            g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
-          }
-          ImGui::SameLine();
-          ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
-          ImGui::SameLine();
-          if (ImGui::Button("刷新敌人")) refresh_enemies();
-          ImGui::SameLine();
-          ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
-          if (g_enemy_esp_disabled) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "敌人扫描已自动关闭(崩溃保护)");
-          }
-
-          ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;
-          ImVec2 table_size = ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y - 8.0f);
-          if (ImGui::BeginTable("enemy_table_view", 5, flags, table_size)) {
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-            ImGui::TableSetupColumn("距离", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-            ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-            ImGui::TableSetupColumn("坐标", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-            ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-            ImGui::TableHeadersRow();
-
-            for (const auto& st : g_cached_enemies) {
-              ImGui::TableNextRow();
-              ImGui::TableSetColumnIndex(0);
-              ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%s",
-                st.has_name ? st.name.c_str() : "Enemy");
-              ImGui::TableSetColumnIndex(1);
-              if (last_state.has_position && st.has_position) {
-                float dx = st.x - last_state.x;
-                float dy = st.y - last_state.y;
-                float dz = st.z - last_state.z;
-                ImGui::Text("%.1fm", std::sqrt(dx * dx + dy * dy + dz * dz));
-              }
-              else {
-                ImGui::TextDisabled("-");
-              }
-              ImGui::TableSetColumnIndex(2);
-              if (st.has_layer) ImGui::Text("%d", st.layer); else ImGui::TextDisabled("-");
-              ImGui::TableSetColumnIndex(3);
-              if (st.has_position) {
-                ImGui::Text("%.2f, %.2f, %.2f", st.x, st.y, st.z);
-              }
-              else {
-                ImGui::TextDisabled("无坐标");
-              }
-              ImGui::TableSetColumnIndex(4);
-              ImGui::Text("%s", "Hostile");
-            }
-            ImGui::EndTable();
-          }
           ImGui::EndTabItem();
         }
 
