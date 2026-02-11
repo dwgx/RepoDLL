@@ -415,6 +415,7 @@ static HRESULT PresentFrame(IDXGISwapChain* swap_chain, UINT sync_interval, UINT
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+    ImGui::GetIO().MouseDrawCursor = g_menu_open;
 
     SetCrashStage("RenderOverlay");
     // Render without SEH to avoid mixed exception models (C2712). Upstream catch is in HookPresent.

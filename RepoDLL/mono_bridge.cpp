@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <unordered_map>
 #include <psapi.h>
@@ -44,6 +45,7 @@ namespace {
   using MonoClassField = void;
   using MonoType = void;
   using MonoMethod = void;
+  using MonoMethodSignature = void;
   using MonoObject = void;
   using MonoThread = void;
   using MonoVTable = void;
@@ -60,8 +62,15 @@ namespace {
     MonoClassField* (__cdecl* mono_class_get_field_from_name)(MonoClass*, const char*) = nullptr;
     MonoMethod* (__cdecl* mono_class_get_method_from_name)(MonoClass*, const char*, int) = nullptr;
     MonoMethod* (__cdecl* mono_class_get_methods)(MonoClass*, void**) = nullptr;
+    MonoClassField* (__cdecl* mono_class_get_fields)(MonoClass*, void**) = nullptr;
     MonoType* (__cdecl* mono_class_get_type)(MonoClass*) = nullptr;
     int(__cdecl* mono_class_is_subclass_of)(MonoClass*, MonoClass*, bool) = nullptr;
+    MonoType* (__cdecl* mono_field_get_type)(MonoClassField*) = nullptr;
+    int(__cdecl* mono_type_get_type)(MonoType*) = nullptr;
+    const char* (__cdecl* mono_field_get_name)(MonoClassField*) = nullptr;
+    MonoMethodSignature* (__cdecl* mono_method_signature)(MonoMethod*) = nullptr;
+    uint32_t(__cdecl* mono_signature_get_param_count)(MonoMethodSignature*) = nullptr;
+    MonoType* (__cdecl* mono_signature_get_return_type)(MonoMethodSignature*) = nullptr;
     MonoObject* (__cdecl* mono_type_get_object)(MonoDomain*, MonoType*) = nullptr;
     MonoObject* (__cdecl* mono_runtime_invoke)(MonoMethod*, void*, void**, MonoObject**) = nullptr;
     void(__cdecl* mono_field_get_value)(MonoObject*, MonoClassField*, void*) = nullptr;
@@ -102,6 +111,14 @@ namespace {
   static void EnemyCachePruneDead();
   static void __stdcall EnemyAwakeHook(MonoObject* self);
   static void InstallEnemyAwakeHook();
+  static void __stdcall RoundDirectorUpdateHook(MonoObject* self);
+  static void InstallRoundDirectorUpdateHook();
+  static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value);
+  static bool ComputeRunCurrencyBeforeForTarget(int target_haul, int& out_before);
+  struct CodePatchBackup;
+  static bool PatchCodeToReturnInt(void* addr, int forced, CodePatchBackup& backup);
+  static bool RestorePatchedCode(void* addr, const CodePatchBackup& backup);
+  static bool SetRoundUpdateBypass(bool enable);
 
   MonoApi g_mono;
   MonoDomain* g_domain = nullptr;
@@ -211,6 +228,13 @@ namespace {
   using EnemyAwakeFn = void(*)(MonoObject*);
   EnemyAwakeFn g_enemy_awake_orig = nullptr;
   bool g_enemy_awake_hooked = false;
+  MonoMethod* g_round_director_update_method = nullptr;
+  using RoundDirectorUpdateFn = void(*)(MonoObject*);
+  RoundDirectorUpdateFn g_round_director_update_orig = nullptr;
+  bool g_round_director_update_hooked = false;
+  std::atomic<bool> g_force_round_haul_enabled{ false };
+  std::atomic<int> g_force_round_haul_value{ 0 };
+  std::atomic<int> g_force_round_haul_goal{ -1 };
   MonoClass* g_valuable_director_class = nullptr;
   MonoVTable* g_valuable_director_vtable = nullptr;
     MonoClassField* g_valuable_director_instance_field = nullptr;
@@ -258,14 +282,27 @@ namespace {
   MonoClassField* g_pun_manager_instance_field = nullptr;
   MonoVTable* g_pun_manager_vtable = nullptr;
 
-  // RoundDirector (鍏冲崱鏀堕泦闃舵)
+// Non-ASCII comment normalized.
   MonoClass* g_round_director_class = nullptr;
   MonoVTable* g_round_director_vtable = nullptr;
   MonoClassField* g_round_director_instance_field = nullptr;
   MonoClassField* g_round_current_haul_field = nullptr;
   MonoClassField* g_round_current_haul_max_field = nullptr;
   MonoClassField* g_round_haul_goal_field = nullptr;
-  MonoClassField* g_round_stage_field = nullptr;  // 鍙€?
+  MonoClassField* g_round_total_haul_field = nullptr;
+  MonoClassField* g_round_haul_goal_max_field = nullptr;
+  MonoClassField* g_round_extraction_point_surplus_field = nullptr;
+  MonoClassField* g_round_extraction_haul_goal_field = nullptr;
+  MonoClassField* g_round_extraction_points_field = nullptr;
+  MonoClassField* g_round_extraction_point_current_field = nullptr;
+  MonoClassField* g_round_dollar_haul_list_field = nullptr;
+  MonoClassField* g_round_extraction_points_completed_field = nullptr;
+  MonoClassField* g_round_all_extraction_points_completed_field = nullptr;
+  MonoClassField* g_round_stage_field = nullptr;  // Non-ASCII comment normalized.
+  MonoMethod* g_round_set_current_haul_method = nullptr;
+  MonoMethod* g_round_set_haul_goal_method = nullptr;
+  MonoMethod* g_round_apply_haul_method = nullptr;
+  MonoMethod* g_round_refresh_haul_method = nullptr;
   MonoMethod* g_player_controller_override_speed = nullptr;
   MonoMethod* g_player_controller_override_jump_cooldown = nullptr;
 
@@ -289,6 +326,13 @@ namespace {
   MonoClass* g_extraction_point_class = nullptr;
   MonoClassField* g_extraction_point_haul_goal_field = nullptr;
   MonoClassField* g_extraction_point_haul_current_field = nullptr;
+  MonoClassField* g_extraction_point_extraction_haul_field = nullptr;
+  MonoClassField* g_extraction_point_run_currency_before_field = nullptr;
+  MonoMethod* g_extraction_point_set_current_haul_method = nullptr;
+  MonoMethod* g_extraction_point_set_haul_goal_method = nullptr;
+  MonoMethod* g_extraction_point_apply_haul_method = nullptr;
+  MonoMethod* g_extraction_point_set_haul_text_method = nullptr;
+  MonoMethod* g_extraction_point_refresh_method = nullptr;
 
   // Visual / gamma / post-processing
   // Pending cart value
@@ -298,14 +342,35 @@ namespace {
 
   // Shutdown guard
   bool g_shutting_down = false;
+  constexpr bool k_enable_enemy_awake_hook = false;
+  // Disabled by default: we use byte patch fallback for RoundDirector::Update to avoid hook misses.
+  constexpr bool k_enable_round_update_hook = false;
+  // Experimental method calls on RoundDirector/ExtractionPoint are crash-prone on some builds.
+  // Keep disabled by default; rely on field writes for stability.
+  constexpr bool k_enable_experimental_haul_method_calls = false;
+  struct CodePatchBackup {
+    std::array<uint8_t, 16> bytes{};
+    size_t size{ 0 };
+  };
+  std::unordered_map<void*, CodePatchBackup> g_collector_getter_patches;
+  void* g_round_update_patch_addr = nullptr;
+  CodePatchBackup g_round_update_patch_backup{};
+  bool g_round_update_patch_active = false;
 
-  void ClearEnemyCacheHandles() {
-    if (!g_mono.mono_gchandle_free) return;
-    std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+  void ClearEnemyCacheHandlesUnlocked() {
+    if (!g_mono.mono_gchandle_free) {
+      g_enemy_cache.clear();
+      return;
+    }
     for (uint32_t h : g_enemy_cache) {
       g_mono.mono_gchandle_free(h);
     }
     g_enemy_cache.clear();
+  }
+
+  void ClearEnemyCacheHandles() {
+    std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+    ClearEnemyCacheHandlesUnlocked();
   }
 
   // ------------------------------------------------------------
@@ -701,6 +766,7 @@ namespace {
       !ResolveProc(module, "mono_class_get_field_from_name", api.mono_class_get_field_from_name) ||
       !ResolveProc(module, "mono_class_get_method_from_name", api.mono_class_get_method_from_name) ||
       !ResolveProc(module, "mono_class_get_methods", api.mono_class_get_methods) ||
+      !ResolveProc(module, "mono_class_get_fields", api.mono_class_get_fields) ||
       !ResolveProc(module, "mono_class_get_type", api.mono_class_get_type) ||
       !ResolveProc(module, "mono_class_is_subclass_of", api.mono_class_is_subclass_of) ||
       !ResolveProc(module, "mono_type_get_object", api.mono_type_get_object) ||
@@ -714,12 +780,18 @@ namespace {
       !ResolveProc(module, "mono_string_new", api.mono_string_new) ||
       !ResolveProc(module, "mono_compile_method", api.mono_compile_method) ||
       !ResolveProc(module, "mono_method_get_name", api.mono_method_get_name) ||
+      !ResolveProc(module, "mono_field_get_name", api.mono_field_get_name) ||
       !ResolveProc(module, "mono_gchandle_new", api.mono_gchandle_new) ||
       !ResolveProc(module, "mono_gchandle_free", api.mono_gchandle_free) ||
       !ResolveProc(module, "mono_gchandle_get_target", api.mono_gchandle_get_target)) {
       AppendLog("Failed to resolve one or more Mono exports");
       return false;
     }
+    ResolveProc(module, "mono_field_get_type", api.mono_field_get_type);
+    ResolveProc(module, "mono_type_get_type", api.mono_type_get_type);
+    ResolveProc(module, "mono_method_signature", api.mono_method_signature);
+    ResolveProc(module, "mono_signature_get_param_count", api.mono_signature_get_param_count);
+    ResolveProc(module, "mono_signature_get_return_type", api.mono_signature_get_return_type);
     ResolveProc(module, "mono_string_to_utf8", api.mono_string_to_utf8);
     ResolveProc(module, "mono_free", api.mono_free);
 
@@ -1635,6 +1707,28 @@ namespace {
       g_extraction_point_haul_current_field = g_mono.mono_class_get_field_from_name(
         g_extraction_point_class, config::kExtractionPointHaulCurrentField);
     }
+    if (g_extraction_point_class && !g_extraction_point_extraction_haul_field) {
+      const char* names[] = { "extractionHaul", "haulExtracted", "extractedHaul" };
+      for (const char* n : names) {
+        g_extraction_point_extraction_haul_field =
+          g_mono.mono_class_get_field_from_name(g_extraction_point_class, n);
+        if (g_extraction_point_extraction_haul_field) {
+          AppendLog(std::string("Resolved ExtractionPoint::extractionHaul as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_run_currency_before_field) {
+      const char* names[] = { "runCurrencyBefore", "currencyBefore", "runCurrencyStart" };
+      for (const char* n : names) {
+        g_extraction_point_run_currency_before_field =
+          g_mono.mono_class_get_field_from_name(g_extraction_point_class, n);
+        if (g_extraction_point_run_currency_before_field) {
+          AppendLog(std::string("Resolved ExtractionPoint::runCurrencyBefore as: ") + n);
+          break;
+        }
+      }
+    }
 
     // PunManager methods (upgrades and strength)
     if (!g_pun_manager_class) {
@@ -1728,6 +1822,174 @@ namespace {
         }
       }
     }
+    if (g_round_director_class && !g_round_total_haul_field) {
+      const char* names[] = { "totalHaul", "haulTotal", "runHaulTotal" };
+      for (const char* n : names) {
+        g_round_total_haul_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_total_haul_field) {
+          AppendLog(std::string("Resolved RoundDirector::totalHaul as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_haul_goal_max_field) {
+      const char* names[] = { "haulGoalMax", "goalMax", "maxHaulGoal" };
+      for (const char* n : names) {
+        g_round_haul_goal_max_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_haul_goal_max_field) {
+          AppendLog(std::string("Resolved RoundDirector::haulGoalMax as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_extraction_point_surplus_field) {
+      const char* names[] = { "extractionPointSurplus", "haulSurplus", "surplusHaul" };
+      for (const char* n : names) {
+        g_round_extraction_point_surplus_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_extraction_point_surplus_field) {
+          AppendLog(std::string("Resolved RoundDirector::extractionPointSurplus as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_extraction_haul_goal_field) {
+      const char* names[] = { "extractionHaulGoal", "extractionGoal", "haulGoalExtraction" };
+      for (const char* n : names) {
+        g_round_extraction_haul_goal_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_extraction_haul_goal_field) {
+          AppendLog(std::string("Resolved RoundDirector::extractionHaulGoal as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_set_current_haul_method) {
+      const char* names[] = {
+        "SetCurrentHaul", "SetHaulCurrent", "SetHaul", "SetExtractionHaul", "UpdateCurrentHaul",
+        "UpdateHaul", "ApplyCurrentHaul", "SyncCurrentHaul"
+      };
+      for (const char* n : names) {
+        g_extraction_point_set_current_haul_method =
+          g_mono.mono_class_get_method_from_name(g_extraction_point_class, n, 1);
+        if (g_extraction_point_set_current_haul_method) {
+          AppendLog(std::string("Resolved ExtractionPoint current-haul method as: ") + n + "(1)");
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_set_haul_goal_method) {
+      const char* names[] = {
+        "SetHaulGoal", "SetCurrentGoal", "SetGoal", "UpdateHaulGoal", "SetExtractionGoal"
+      };
+      for (const char* n : names) {
+        g_extraction_point_set_haul_goal_method =
+          g_mono.mono_class_get_method_from_name(g_extraction_point_class, n, 1);
+        if (g_extraction_point_set_haul_goal_method) {
+          AppendLog(std::string("Resolved ExtractionPoint haul-goal method as: ") + n + "(1)");
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_apply_haul_method) {
+      const char* names[] = {
+        "SetHaul", "ApplyHaul", "SyncHaul", "SetHaulState", "SetCurrentHaulAndGoal"
+      };
+      for (const char* n : names) {
+        g_extraction_point_apply_haul_method =
+          g_mono.mono_class_get_method_from_name(g_extraction_point_class, n, 2);
+        if (g_extraction_point_apply_haul_method) {
+          AppendLog(std::string("Resolved ExtractionPoint apply-haul method as: ") + n + "(2)");
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_set_haul_text_method) {
+      const char* names[] = {
+        "SetHaulText", "UpdateHaulText", "RefreshHaulText", "UpdateCollectorText"
+      };
+      for (const char* n : names) {
+        g_extraction_point_set_haul_text_method =
+          g_mono.mono_class_get_method_from_name(g_extraction_point_class, n, 0);
+        if (g_extraction_point_set_haul_text_method) {
+          AppendLog(std::string("Resolved ExtractionPoint text method as: ") + n + "(0)");
+          break;
+        }
+      }
+    }
+    if (g_extraction_point_class && !g_extraction_point_refresh_method) {
+      const char* names[] = {
+        "Refresh", "RefreshUI", "UpdateUI", "UpdateDisplay", "Update", "LateUpdate"
+      };
+      for (const char* n : names) {
+        g_extraction_point_refresh_method =
+          g_mono.mono_class_get_method_from_name(g_extraction_point_class, n, 0);
+        if (g_extraction_point_refresh_method) {
+          AppendLog(std::string("Resolved ExtractionPoint refresh method as: ") + n + "(0)");
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_extraction_points_field) {
+      const char* names[] = { "extractionPoints", "extractionPointCount", "extractionTotal" };
+      for (const char* n : names) {
+        g_round_extraction_points_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_extraction_points_field) {
+          AppendLog(std::string("Resolved RoundDirector::extractionPoints as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_extraction_point_current_field) {
+      const char* names[] = { "extractionPointCurrent", "currentByExtractionPoint",
+                              "extractionCurrentList" };
+      for (const char* n : names) {
+        g_round_extraction_point_current_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_extraction_point_current_field) {
+          AppendLog(std::string("Resolved RoundDirector::extractionPointCurrent as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_dollar_haul_list_field) {
+      const char* names[] = { "dollarHaulList", "haulDollarList", "dollarHauls" };
+      for (const char* n : names) {
+        g_round_dollar_haul_list_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_dollar_haul_list_field) {
+          AppendLog(std::string("Resolved RoundDirector::dollarHaulList as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_extraction_points_completed_field) {
+      const char* names[] = { "extractionPointsCompleted", "completedExtractionPoints",
+                              "extractionCompleted" };
+      for (const char* n : names) {
+        g_round_extraction_points_completed_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_extraction_points_completed_field) {
+          AppendLog(std::string("Resolved RoundDirector::extractionPointsCompleted as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_all_extraction_points_completed_field) {
+      const char* names[] = { "allExtractionPointsCompleted", "allExtractionCompleted",
+                              "allPointsCompleted" };
+      for (const char* n : names) {
+        g_round_all_extraction_points_completed_field =
+          g_mono.mono_class_get_field_from_name(g_round_director_class, n);
+        if (g_round_all_extraction_points_completed_field) {
+          AppendLog(std::string("Resolved RoundDirector::allExtractionPointsCompleted as: ") + n);
+          break;
+        }
+      }
+    }
     if (g_round_director_class && !g_round_stage_field) {
       const char* names[] = { "currentStage", "stage", "round", "roundIndex" };
       for (const char* n : names) {
@@ -1738,6 +2000,60 @@ namespace {
           break;
         }
       }
+    }
+    if (g_round_director_class && !g_round_set_current_haul_method) {
+      const char* names[] = {
+        "SetCurrentHaul", "SetHaulCurrent", "SetHaul", "SetExtractionHaul", "UpdateCurrentHaul",
+        "UpdateHaul", "ApplyCurrentHaul", "SyncCurrentHaul"
+      };
+      for (const char* n : names) {
+        g_round_set_current_haul_method =
+          g_mono.mono_class_get_method_from_name(g_round_director_class, n, 1);
+        if (g_round_set_current_haul_method) {
+          AppendLog(std::string("Resolved RoundDirector current-haul method as: ") + n + "(1)");
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_set_haul_goal_method) {
+      const char* names[] = {
+        "SetHaulGoal", "SetCurrentGoal", "SetGoal", "UpdateHaulGoal", "SetExtractionGoal"
+      };
+      for (const char* n : names) {
+        g_round_set_haul_goal_method =
+          g_mono.mono_class_get_method_from_name(g_round_director_class, n, 1);
+        if (g_round_set_haul_goal_method) {
+          AppendLog(std::string("Resolved RoundDirector haul-goal method as: ") + n + "(1)");
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_apply_haul_method) {
+      const char* names[] = { "SetHaul", "ApplyHaul", "SyncHaul", "SetHaulState", "SetRoundHaul" };
+      for (const char* n : names) {
+        g_round_apply_haul_method =
+          g_mono.mono_class_get_method_from_name(g_round_director_class, n, 2);
+        if (g_round_apply_haul_method) {
+          AppendLog(std::string("Resolved RoundDirector apply-haul method as: ") + n + "(2)");
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_refresh_haul_method) {
+      const char* names[] = {
+        "Refresh", "RefreshUI", "UpdateUI", "UpdateHUD", "UpdateHaulText", "SetHaulText", "Update"
+      };
+      for (const char* n : names) {
+        g_round_refresh_haul_method =
+          g_mono.mono_class_get_method_from_name(g_round_director_class, n, 0);
+        if (g_round_refresh_haul_method) {
+          AppendLog(std::string("Resolved RoundDirector refresh method as: ") + n + "(0)");
+          break;
+        }
+      }
+    }
+    if (g_round_director_class && !g_round_director_update_hooked) {
+      InstallRoundDirectorUpdateHook();
     }
     if (g_pun_manager_class && !g_pun_upgrade_extra_jump) {
       for (int argc : {2, 1, 0}) {
@@ -2087,7 +2403,12 @@ namespace {
       }
       if (g_enemy_rigidbody_class) {
         AppendLog("Resolved EnemyRigidbody class");
-        InstallEnemyAwakeHook();
+        if (k_enable_enemy_awake_hook) {
+          InstallEnemyAwakeHook();
+        } else {
+          AppendLogOnce("EnemyAwake_hook_disabled",
+                        "EnemyRigidbody::Awake hook disabled for stability");
+        }
       }
       else {
         AppendLogOnce("EnemyRigidbody_class_missing", "Failed to resolve EnemyRigidbody class");
@@ -2288,10 +2609,10 @@ namespace {
     return false;
   }
 
-  // 鍒ゆ柇 UnityEngine.Object 鏄惁琚攢姣侊紙op_Equality(obj, null) == true锛?
+// Non-ASCII comment normalized.
   bool IsUnityNull(MonoObject* obj) {
     if (!obj) return true;
-    if (!g_unity_object_op_eq) return false;  // 娌℃湁绛夊彿鏂规硶鏃讹紝淇濆畧璁や负浠嶅瓨娲?
+    if (!g_unity_object_op_eq) return false;  // Non-ASCII comment normalized.
     void* args[2] = { obj, nullptr };
     MonoObject* ret = SafeInvoke(g_unity_object_op_eq, nullptr, args, "Object.op_Equality");
     if (!ret || !g_mono.mono_object_unbox) return false;
@@ -2375,7 +2696,83 @@ namespace {
     AppendLogOnce("EnemyAwake_hook_ok", "Installed hook for EnemyRigidbody::Awake");
   }
 
-  // 浠?EnemyRigidbody 瀵硅薄鎶藉彇浣嶇疆/鍚嶇О/Layer锛屽～鍏?out_enemies銆?
+  void __stdcall RoundDirectorUpdateHook(MonoObject* self) {
+    if (g_round_director_update_orig) {
+      g_round_director_update_orig(self);
+    }
+    if (!self || !g_force_round_haul_enabled.load(std::memory_order_relaxed)) {
+      return;
+    }
+    int cur = g_force_round_haul_value.load(std::memory_order_relaxed);
+    int goal = g_force_round_haul_goal.load(std::memory_order_relaxed);
+    if (cur < 0) cur = 0;
+    if (goal < 0) goal = cur;
+
+    WriteFieldNumber(self, g_round_current_haul_field, cur);
+    WriteFieldNumber(self, g_round_current_haul_max_field, cur);
+    WriteFieldNumber(self, g_round_haul_goal_field, goal);
+    WriteFieldNumber(self, g_round_extraction_haul_goal_field, goal);
+    int surplus = cur - goal;
+    if (surplus < 0) surplus = 0;
+    WriteFieldNumber(self, g_round_extraction_point_surplus_field, surplus);
+
+    if (g_round_extraction_point_current_field && g_mono.mono_field_get_value &&
+        g_mono.mono_object_get_class) {
+      MonoObject* ep_obj = nullptr;
+      g_mono.mono_field_get_value(self, g_round_extraction_point_current_field, &ep_obj);
+      if (ep_obj) {
+        MonoClass* ep_cls = g_mono.mono_object_get_class(ep_obj);
+        if (ep_cls && g_extraction_point_class &&
+            (ep_cls == g_extraction_point_class || IsSubclassOf(ep_cls, g_extraction_point_class))) {
+          WriteFieldNumber(ep_obj, g_extraction_point_haul_current_field, cur);
+          WriteFieldNumber(ep_obj, g_extraction_point_haul_goal_field, goal);
+          WriteFieldNumber(ep_obj, g_extraction_point_extraction_haul_field, cur);
+          if (g_extraction_point_run_currency_before_field) {
+            int baseline = 0;
+            if (ComputeRunCurrencyBeforeForTarget(cur, baseline)) {
+              WriteFieldNumber(ep_obj, g_extraction_point_run_currency_before_field, baseline);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void InstallRoundDirectorUpdateHook() {
+    if (!k_enable_round_update_hook || g_round_director_update_hooked || !g_round_director_class ||
+        !g_mono.mono_class_get_method_from_name) {
+      return;
+    }
+    if (!EnsureMinHookReady()) return;
+    if (!g_round_director_update_method) {
+      g_round_director_update_method =
+        g_mono.mono_class_get_method_from_name(g_round_director_class, "Update", 0);
+      if (!g_round_director_update_method) {
+        AppendLogOnce("RoundUpdate_hook_notfound", "RoundDirector::Update not found; haul force hook skipped");
+        return;
+      }
+    }
+    void* native_ptr =
+      g_mono.mono_compile_method ? g_mono.mono_compile_method(g_round_director_update_method) : nullptr;
+    if (!native_ptr) {
+      AppendLogOnce("RoundUpdate_hook_compile_fail", "mono_compile_method failed for RoundDirector::Update");
+      return;
+    }
+    if (MH_CreateHook(native_ptr, reinterpret_cast<LPVOID>(RoundDirectorUpdateHook),
+                      reinterpret_cast<LPVOID*>(&g_round_director_update_orig)) != MH_OK) {
+      AppendLogOnce("RoundUpdate_hook_create_fail", "MH_CreateHook failed for RoundDirector::Update");
+      return;
+    }
+    if (MH_EnableHook(native_ptr) != MH_OK) {
+      AppendLogOnce("RoundUpdate_hook_enable_fail", "MH_EnableHook failed for RoundDirector::Update");
+      MH_RemoveHook(native_ptr);
+      return;
+    }
+    g_round_director_update_hooked = true;
+    AppendLogOnce("RoundUpdate_hook_ok", "Installed hook for RoundDirector::Update");
+  }
+
+// Non-ASCII comment normalized.
   bool AddEnemyFromObject(MonoObject* enemy_obj, std::vector<PlayerState>& out_enemies) {
     if (!enemy_obj) return false;
     MonoObject* tr = SafeInvoke(g_component_get_transform, enemy_obj, nullptr, "EnemyRigidbody.get_transform");
@@ -2404,15 +2801,60 @@ namespace {
     return true;
   }
 
-  // 浣庨鍒锋柊 EnemyRigidbody 缂撳瓨锛岄伩鍏嶆瘡甯у叏灞€鎵弿瀵艰嚧宕╂簝銆?
+  bool ScanEnemiesDirect(std::vector<PlayerState>& out_enemies, int max_count) {
+    if (!g_enemy_rigidbody_class) return false;
+    if (!g_object_find_objects_of_type_include_inactive && !g_object_find_objects_of_type) {
+      return false;
+    }
+
+    MonoType* enemy_type =
+      g_mono.mono_class_get_type ? g_mono.mono_class_get_type(g_enemy_rigidbody_class) : nullptr;
+    MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
+    MonoObject* enemy_type_obj =
+      (enemy_type && g_mono.mono_type_get_object) ? g_mono.mono_type_get_object(dom, enemy_type) : nullptr;
+    if (!enemy_type_obj) return false;
+
+    MonoObject* arr_obj = nullptr;
+    if (g_object_find_objects_of_type_include_inactive) {
+      bool include_inactive = true;
+      void* args2[2] = { enemy_type_obj, &include_inactive };
+      arr_obj = SafeInvoke(g_object_find_objects_of_type_include_inactive, nullptr, args2,
+                           "Object.FindObjectsOfType(EnemyRigidbody, true)");
+    }
+    if (!arr_obj && g_object_find_objects_of_type) {
+      void* args1[1] = { enemy_type_obj };
+      arr_obj = SafeInvoke(g_object_find_objects_of_type, nullptr, args1,
+                           "Object.FindObjectsOfType(EnemyRigidbody)");
+    }
+
+    MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
+    if (!IsValidArray(arr)) return false;
+
+    int limit = static_cast<int>(arr->max_length);
+    if (limit > max_count) limit = max_count;
+    if (limit > 1024) limit = 1024;
+
+    const size_t before = out_enemies.size();
+    for (int i = 0; i < limit; ++i) {
+      MonoObject* enemy_obj = reinterpret_cast<MonoObject*>(arr->vector[i]);
+      if (!enemy_obj || IsUnityNull(enemy_obj)) continue;
+      if (AddEnemyFromObject(enemy_obj, out_enemies) &&
+          static_cast<int>(out_enemies.size() - before) >= max_count) {
+        break;
+      }
+    }
+    return out_enemies.size() > before;
+  }
+
+// Non-ASCII comment normalized.
   bool RefreshEnemyCache() {
     if (g_enemy_cache_disabled) return false;
     static uint64_t last_enemy_empty_ms = 0;
     uint64_t now_ms = GetTickCount64();
     if (!g_enemies_ready.load(std::memory_order_relaxed) && now_ms - last_enemy_empty_ms < 2000) {
-      return false;  // 间隔重试，避免连环崩溃
+      return false;  // Non-ASCII comment normalized.
     }
-    // 濡傛灉 Mono 灏氭湭鍔犺浇鏈湴鐜╁涓斿浜庤彍鍗曪紝璺宠繃鍒锋柊
+// Non-ASCII comment normalized.
     PlayerState lp{};
     if (!MonoGetLocalPlayerState(lp) || !lp.has_position) {
       return false;
@@ -2422,7 +2864,7 @@ namespace {
       std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
       if (!g_enemy_cache.empty()) {
         g_enemy_cache_last_refresh = GetTickCount64();
-        return true;  // 鏈夋椿璺冪紦瀛樺氨涓嶅叏灞€鎵弿
+        return true;  // Non-ASCII comment normalized.
       }
     }
     if (!g_enemy_rigidbody_class) {
@@ -2459,7 +2901,8 @@ namespace {
     MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
     if (!IsValidArray(arr)) {
       AppendLogOnce("EnemyCache_empty", "RefreshEnemyCache: FindObjectsOfType returned empty/invalid array");
-      g_enemy_cache.clear();
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      ClearEnemyCacheHandlesUnlocked();
       last_enemy_empty_ms = now_ms;
       return false;
     }
@@ -2478,7 +2921,7 @@ namespace {
     size_t cached_sz = 0;
     {
       std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
-      ClearEnemyCacheHandles();
+      ClearEnemyCacheHandlesUnlocked();
       g_enemy_cache.swap(tmp);
       cached_sz = g_enemy_cache.size();
     }
@@ -2491,7 +2934,7 @@ namespace {
   }
 
 #ifdef _MSC_VER
-  // SEH 瀹夊叏灏佽锛岄槻姝?FindObjectsOfType 宕╂簝銆?
+// Non-ASCII comment normalized.
   static bool RefreshEnemyCacheSafe() {
     __try {
       return RefreshEnemyCache();
@@ -2637,6 +3080,13 @@ bool MonoBeginShutdown() {
   g_shutting_down = true;
   g_pending_cart_active = false;
   g_cart_apply_in_progress = false;
+  if (g_round_update_patch_active && g_round_update_patch_addr &&
+      g_round_update_patch_backup.size > 0) {
+    RestorePatchedCode(g_round_update_patch_addr, g_round_update_patch_backup);
+    g_round_update_patch_active = false;
+    g_round_update_patch_addr = nullptr;
+    g_round_update_patch_backup = {};
+  }
   ClearEnemyCacheHandles();
   return true;
 }
@@ -2916,6 +3366,8 @@ bool MonoSetJumpExtraDirect(int jump_count) {
   return true;
 }
 
+bool ReadRunCurrency(int& out_value);
+
 bool SetRunCurrencyViaPunManager(int amount) {
   if (!g_pun_set_run_stat_set || !g_pun_manager_instance_field || !g_pun_manager_vtable ||
     !g_mono.mono_string_new) {
@@ -2974,6 +3426,492 @@ static MonoObject* GetRoundDirectorInstance() {
   return inst;
 }
 
+static MonoArray* FindObjectsOfTypeArray(MonoClass* klass, const char* tag) {
+  if (!klass || !g_mono.mono_class_get_type || !g_mono.mono_type_get_object) {
+    return nullptr;
+  }
+  MonoType* type = g_mono.mono_class_get_type(klass);
+  if (!type) {
+    return nullptr;
+  }
+  MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
+  MonoObject* type_obj = g_mono.mono_type_get_object(dom, type);
+  if (!type_obj) {
+    return nullptr;
+  }
+
+  auto try_method = [&](MonoMethod* method, void** args, const char* name) -> MonoArray* {
+    if (!method) {
+      return nullptr;
+    }
+    MonoObject* arr_obj = SafeInvoke(method, nullptr, args, name);
+    if (!arr_obj) {
+      return nullptr;
+    }
+    MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
+    if (!arr || arr->max_length == 0) {
+      return nullptr;
+    }
+    return arr;
+  };
+
+  void* args_type[1] = { type_obj };
+  if (MonoArray* arr = try_method(g_find_objects_of_type_itemvolume, args_type,
+        "FindObjectsOfType(Type)")) {
+    return arr;
+  }
+
+  bool include_inactive = true;
+  void* args_type_inactive[2] = { type_obj, &include_inactive };
+  if (MonoArray* arr = try_method(g_find_objects_of_type_itemvolume_include_inactive,
+        args_type_inactive, "FindObjectsOfType(Type,bool)")) {
+    return arr;
+  }
+
+  if (MonoArray* arr = try_method(g_resources_find_objects_of_type_all, args_type,
+        "Resources.FindObjectsOfTypeAll(Type)")) {
+    return arr;
+  }
+  if (MonoArray* arr = try_method(g_object_find_objects_of_type, args_type,
+        "Object.FindObjectsOfType(Type)")) {
+    return arr;
+  }
+  if (MonoArray* arr = try_method(g_object_find_objects_of_type_include_inactive,
+        args_type_inactive, "Object.FindObjectsOfType(Type,bool)")) {
+    return arr;
+  }
+
+  if (tag) {
+    AppendLogOnce(std::string("find_type_array_missing_") + tag,
+      std::string("FindObjectsOfTypeArray failed for ") + tag);
+  }
+  return nullptr;
+}
+
+enum MonoTypeCode : int {
+  kMonoTypeBoolean = 0x02,
+  kMonoTypeI1 = 0x04,
+  kMonoTypeU1 = 0x05,
+  kMonoTypeI2 = 0x06,
+  kMonoTypeU2 = 0x07,
+  kMonoTypeI4 = 0x08,
+  kMonoTypeU4 = 0x09,
+  kMonoTypeI8 = 0x0a,
+  kMonoTypeU8 = 0x0b,
+  kMonoTypeR4 = 0x0c,
+  kMonoTypeR8 = 0x0d,
+};
+
+static int GetFieldTypeCode(MonoClassField* field) {
+  if (!field || !g_mono.mono_field_get_type || !g_mono.mono_type_get_type) {
+    return -1;
+  }
+  MonoType* ty = g_mono.mono_field_get_type(field);
+  if (!ty) return -1;
+  return g_mono.mono_type_get_type(ty);
+}
+
+static bool ReadFieldNumber(MonoObject* obj, MonoClassField* field, int& out_v) {
+  out_v = 0;
+  if (!obj || !field || !g_mono.mono_field_get_value) return false;
+  const int type_code = GetFieldTypeCode(field);
+  switch (type_code) {
+    case kMonoTypeBoolean: {
+      bool b = false;
+      g_mono.mono_field_get_value(obj, field, &b);
+      out_v = b ? 1 : 0;
+      return true;
+    }
+    case kMonoTypeI1: {
+      int8_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeU1: {
+      uint8_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeI2: {
+      int16_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeU2: {
+      uint16_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeI8: {
+      int64_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeU8: {
+      uint64_t v = 0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = static_cast<int>(v);
+      return true;
+    }
+    case kMonoTypeR4: {
+      float v = 0.0f;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = (v >= 0.0f) ? static_cast<int>(v + 0.5f) : static_cast<int>(v - 0.5f);
+      return true;
+    }
+    case kMonoTypeR8: {
+      double v = 0.0;
+      g_mono.mono_field_get_value(obj, field, &v);
+      out_v = (v >= 0.0) ? static_cast<int>(v + 0.5) : static_cast<int>(v - 0.5);
+      return true;
+    }
+    case kMonoTypeI4:
+    case kMonoTypeU4:
+    default: {
+      int v = 0;
+      float vf = 0.0f;
+      g_mono.mono_field_get_value(obj, field, &v);
+      g_mono.mono_field_get_value(obj, field, &vf);
+      const bool int_ok = v > -200000000 && v < 200000000;
+      const bool float_ok = (vf == vf) && (vf > -200000000.0f) && (vf < 200000000.0f);
+      if (type_code == -1 && float_ok && !int_ok) {
+        out_v = (vf >= 0.0f) ? static_cast<int>(vf + 0.5f) : static_cast<int>(vf - 0.5f);
+      }
+      else {
+        out_v = v;
+      }
+      return true;
+    }
+  }
+}
+
+namespace {
+static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value) {
+  if (!obj || !field || !g_mono.mono_field_set_value) return false;
+  const int type_code = GetFieldTypeCode(field);
+  switch (type_code) {
+    case kMonoTypeBoolean: {
+      bool b = (value != 0);
+      g_mono.mono_field_set_value(obj, field, &b);
+      return true;
+    }
+    case kMonoTypeI1: {
+      int8_t v = static_cast<int8_t>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeU1: {
+      uint8_t v = static_cast<uint8_t>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeI2: {
+      int16_t v = static_cast<int16_t>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeU2: {
+      uint16_t v = static_cast<uint16_t>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeI8: {
+      int64_t v = static_cast<int64_t>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeU8: {
+      uint64_t v = static_cast<uint64_t>(value < 0 ? 0 : value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeR4: {
+      float v = static_cast<float>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeR8: {
+      double v = static_cast<double>(value);
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+    case kMonoTypeI4:
+    case kMonoTypeU4:
+    default: {
+      int v = value;
+      g_mono.mono_field_set_value(obj, field, &v);
+      return true;
+    }
+  }
+}
+}  // namespace
+
+static bool TryInvokeNoArgs(MonoMethod* method, MonoObject* target) {
+  if (!method || !target || !g_mono.mono_runtime_invoke) return false;
+  MonoObject* exc = nullptr;
+  g_mono.mono_runtime_invoke(method, target, nullptr, &exc);
+  return exc == nullptr;
+}
+
+static bool TryInvokeOneNumberArg(MonoMethod* method, MonoObject* target, int v) {
+  if (!method || !target || !g_mono.mono_runtime_invoke) return false;
+  MonoObject* exc = nullptr;
+  void* args[1] = { &v };
+  g_mono.mono_runtime_invoke(method, target, args, &exc);
+  if (!exc) return true;
+  float fv = static_cast<float>(v);
+  exc = nullptr;
+  args[0] = &fv;
+  g_mono.mono_runtime_invoke(method, target, args, &exc);
+  return exc == nullptr;
+}
+
+static bool TryInvokeTwoNumberArgs(MonoMethod* method, MonoObject* target, int a, int b) {
+  if (!method || !target || !g_mono.mono_runtime_invoke) return false;
+  MonoObject* exc = nullptr;
+  void* args_i[2] = { &a, &b };
+  g_mono.mono_runtime_invoke(method, target, args_i, &exc);
+  if (!exc) return true;
+  float fa = static_cast<float>(a);
+  float fb = static_cast<float>(b);
+  exc = nullptr;
+  void* args_f[2] = { &fa, &fb };
+  g_mono.mono_runtime_invoke(method, target, args_f, &exc);
+  return exc == nullptr;
+}
+
+namespace {
+static bool ComputeRunCurrencyBeforeForTarget(int target_haul, int& out_before) {
+  out_before = 0;
+  int run_currency = 0;
+  if (!MonoGetRunCurrency(run_currency) && !ReadRunCurrency(run_currency)) {
+    return false;
+  }
+  int baseline = run_currency - target_haul;
+  // Some game builds derive current haul as (runCurrency - runCurrencyBefore).
+  // Allow negative baseline so target haul can be forced even when run currency is low.
+  if (baseline < -1000000000) baseline = -1000000000;
+  out_before = baseline;
+  return true;
+}
+}  // namespace
+
+static int SyncExtractionPointsHaul(int current, int goal) {
+  if (!g_extraction_point_class || !g_extraction_point_haul_current_field) {
+    return 0;
+  }
+  MonoArray* arr = FindObjectsOfTypeArray(g_extraction_point_class, "ExtractionPoint");
+  if (!arr || arr->max_length == 0) {
+    return 0;
+  }
+  int run_currency_before = 0;
+  const bool has_run_currency_before = ComputeRunCurrencyBeforeForTarget(current, run_currency_before);
+  int written = 0;
+  int method_hits = 0;
+  size_t len = arr->max_length;
+  for (size_t i = 0; i < len; ++i) {
+    MonoObject* ep = static_cast<MonoObject*>(arr->vector[i]);
+    if (!ep) continue;
+    WriteFieldNumber(ep, g_extraction_point_haul_current_field, current);
+    if (goal >= 0 && g_extraction_point_haul_goal_field) {
+      WriteFieldNumber(ep, g_extraction_point_haul_goal_field, goal);
+    }
+    if (g_extraction_point_extraction_haul_field) {
+      WriteFieldNumber(ep, g_extraction_point_extraction_haul_field, current);
+    }
+    if (has_run_currency_before && g_extraction_point_run_currency_before_field) {
+      WriteFieldNumber(ep, g_extraction_point_run_currency_before_field, run_currency_before);
+    }
+
+    if (k_enable_experimental_haul_method_calls) {
+      int invoke_goal = goal >= 0 ? goal : current;
+      if (TryInvokeOneNumberArg(g_extraction_point_set_current_haul_method, ep, current)) {
+        ++method_hits;
+      }
+      if (TryInvokeOneNumberArg(g_extraction_point_set_haul_goal_method, ep, invoke_goal)) {
+        ++method_hits;
+      }
+      if (TryInvokeTwoNumberArgs(g_extraction_point_apply_haul_method, ep, current, invoke_goal)) {
+        ++method_hits;
+      }
+      if (TryInvokeNoArgs(g_extraction_point_set_haul_text_method, ep)) {
+        ++method_hits;
+      }
+      if (TryInvokeNoArgs(g_extraction_point_refresh_method, ep)) {
+        ++method_hits;
+      }
+    }
+    ++written;
+  }
+  if (written > 0) {
+    std::ostringstream oss;
+    oss << "SyncExtractionPointsHaul: wrote " << written << " EPs cur=" << current
+      << " goal=" << goal << " method_hits=" << method_hits;
+    if (has_run_currency_before) {
+      oss << " runCurrencyBefore=" << run_currency_before;
+    }
+    AppendLog(oss.str());
+  }
+  return written;
+}
+
+static int ReadListCount(MonoObject* list_obj) {
+  if (!list_obj || !g_mono.mono_object_get_class) return 0;
+  MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
+  if (!list_class) return 0;
+  MonoMethod* get_count = g_mono.mono_class_get_method_from_name(list_class, "get_Count", 0);
+  if (!get_count || !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) return 0;
+  MonoObject* exc = nullptr;
+  MonoObject* count_obj = g_mono.mono_runtime_invoke(get_count, list_obj, nullptr, &exc);
+  if (exc || !count_obj) return 0;
+  int count = *static_cast<int*>(g_mono.mono_object_unbox(count_obj));
+  return count > 0 ? count : 0;
+}
+
+static bool ReadBoxedNumberGuess(MonoObject* boxed, double& out_v, bool& out_is_float) {
+  out_v = 0.0;
+  out_is_float = false;
+  if (!boxed || !g_mono.mono_object_unbox) return false;
+  void* p = g_mono.mono_object_unbox(boxed);
+  if (!p) return false;
+  int vi = *static_cast<int*>(p);
+  float vf = *static_cast<float*>(p);
+
+  const bool int_ok = vi > -50000000 && vi < 50000000;
+  const bool float_ok = (vf == vf) && (vf > -50000000.0f) && (vf < 50000000.0f);
+
+  if (!int_ok && float_ok) {
+    out_v = static_cast<double>(vf);
+    out_is_float = true;
+    return true;
+  }
+  if (int_ok && (!float_ok || (vf > -1e-20f && vf < 1e-20f && vi != 0))) {
+    out_v = static_cast<double>(vi);
+    out_is_float = false;
+    return true;
+  }
+  if (int_ok) {
+    out_v = static_cast<double>(vi);
+    out_is_float = false;
+    return true;
+  }
+  if (float_ok) {
+    out_v = static_cast<double>(vf);
+    out_is_float = true;
+    return true;
+  }
+  return false;
+}
+
+static bool ReadListTotalNumber(MonoObject* list_obj, int& out_total) {
+  out_total = 0;
+  if (!list_obj || !g_mono.mono_object_get_class || !g_mono.mono_runtime_invoke) return false;
+  MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
+  if (!list_class) return false;
+  MonoMethod* get_item = g_mono.mono_class_get_method_from_name(list_class, "get_Item", 1);
+  if (!get_item) return false;
+  int count = ReadListCount(list_obj);
+  if (count <= 0) return false;
+
+  double sum = 0.0;
+  int sampled = 0;
+  for (int i = 0; i < count; ++i) {
+    void* args[1] = { &i };
+    MonoObject* exc = nullptr;
+    MonoObject* item_obj = g_mono.mono_runtime_invoke(get_item, list_obj, args, &exc);
+    if (exc || !item_obj) continue;
+    double v = 0.0;
+    bool is_float = false;
+    if (ReadBoxedNumberGuess(item_obj, v, is_float)) {
+      sum += v;
+      ++sampled;
+    }
+  }
+  if (sampled <= 0) return false;
+  out_total = sum >= 0.0 ? static_cast<int>(sum + 0.5) : static_cast<int>(sum - 0.5);
+  return true;
+}
+
+static int WriteListTotalNumber(MonoObject* list_obj, int total, const char* tag) {
+  if (!list_obj || !g_mono.mono_object_get_class || !g_mono.mono_runtime_invoke) return 0;
+  MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
+  if (!list_class) return 0;
+  MonoMethod* get_item = g_mono.mono_class_get_method_from_name(list_class, "get_Item", 1);
+  MonoMethod* set_item = g_mono.mono_class_get_method_from_name(list_class, "set_Item", 2);
+  if (!set_item) return 0;
+  int count = ReadListCount(list_obj);
+  if (count <= 0) return 0;
+
+  bool use_float = false;
+  if (get_item) {
+    int idx0 = 0;
+    void* args0[1] = { &idx0 };
+    MonoObject* exc0 = nullptr;
+    MonoObject* item0 = g_mono.mono_runtime_invoke(get_item, list_obj, args0, &exc0);
+    if (!exc0 && item0) {
+      double v0 = 0.0;
+      bool is_float0 = false;
+      if (ReadBoxedNumberGuess(item0, v0, is_float0)) {
+        use_float = is_float0;
+      }
+    }
+  }
+
+  int base = total / count;
+  int rem = total % count;
+  if (rem < 0) rem = -rem;
+  int written = 0;
+
+  for (int i = 0; i < count; ++i) {
+    int vi = base + ((i < rem) ? 1 : 0);
+    MonoObject* exc = nullptr;
+    void* args[2] = { &i, nullptr };
+
+    if (!use_float) {
+      args[1] = &vi;
+      g_mono.mono_runtime_invoke(set_item, list_obj, args, &exc);
+      if (exc) {
+        float vf = static_cast<float>(vi);
+        exc = nullptr;
+        args[1] = &vf;
+        g_mono.mono_runtime_invoke(set_item, list_obj, args, &exc);
+        if (!exc) {
+          use_float = true;
+        }
+      }
+    }
+    else {
+      float vf = static_cast<float>(vi);
+      args[1] = &vf;
+      g_mono.mono_runtime_invoke(set_item, list_obj, args, &exc);
+      if (exc) {
+        exc = nullptr;
+        args[1] = &vi;
+        g_mono.mono_runtime_invoke(set_item, list_obj, args, &exc);
+        if (!exc) {
+          use_float = false;
+        }
+      }
+    }
+    if (!exc) {
+      ++written;
+    }
+  }
+
+  if (written > 0) {
+    std::ostringstream oss;
+    oss << "WriteListTotalNumber(" << (tag ? tag : "?") << "): count=" << count
+        << " total=" << total << " mode=" << (use_float ? "float" : "int");
+    AppendLog(oss.str());
+  }
+  return written;
+}
+
 bool MonoGetRoundState(RoundState& out_state) {
   out_state = {};
   if (!CacheManagedRefs()) return false;
@@ -2982,16 +3920,46 @@ bool MonoGetRoundState(RoundState& out_state) {
   if (!rd) return false;
 
   auto read_int = [&](MonoClassField* f, int& dst) {
-    if (!f) return false;
-    g_mono.mono_field_get_value(rd, f, &dst);
-    return true;
+    return ReadFieldNumber(rd, f, dst);
   };
 
   read_int(g_round_current_haul_field, out_state.current);
   read_int(g_round_current_haul_max_field, out_state.current_max);
   read_int(g_round_haul_goal_field, out_state.goal);
+  if (out_state.current <= 0) {
+    MonoObject* list_obj = nullptr;
+    if (g_round_extraction_point_current_field) {
+      g_mono.mono_field_get_value(rd, g_round_extraction_point_current_field, &list_obj);
+      int sum = 0;
+      if (ReadListTotalNumber(list_obj, sum) && sum > out_state.current) {
+        out_state.current = sum;
+      }
+    }
+    list_obj = nullptr;
+    if (g_round_dollar_haul_list_field) {
+      g_mono.mono_field_get_value(rd, g_round_dollar_haul_list_field, &list_obj);
+      int sum = 0;
+      if (ReadListTotalNumber(list_obj, sum) && sum > out_state.current) {
+        out_state.current = sum;
+      }
+    }
+  }
   int stage_tmp = -1;
-  if (read_int(g_round_stage_field, stage_tmp)) out_state.stage = stage_tmp;
+  if (read_int(g_round_stage_field, stage_tmp)) {
+    out_state.stage = stage_tmp;
+  }
+  else {
+    // Fallback: many builds do not expose a dedicated stage field.
+    // Use completed extraction count so UI can display a meaningful phase.
+    int completed_tmp = -1;
+    if (read_int(g_round_extraction_points_completed_field, completed_tmp) && completed_tmp >= 0) {
+      out_state.stage = completed_tmp;
+    }
+  }
+  if (out_state.current_max <= 0 && out_state.goal > 0) {
+    // Collector progress usually treats goal as the effective max target.
+    out_state.current_max = out_state.goal;
+  }
   out_state.ok = true;
   return true;
 }
@@ -3002,14 +3970,264 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
   MonoObject* rd = GetRoundDirectorInstance();
   if (!rd) return false;
 
-  auto write_int = [&](MonoClassField* f, int v) {
-    if (!f) return;
-    g_mono.mono_field_set_value(rd, f, &v);
+  auto read_int = [&](MonoClassField* f, int& dst) {
+    return ReadFieldNumber(rd, f, dst);
   };
-  if (current >= 0) write_int(g_round_current_haul_field, current);
-  if (current_max >= 0) write_int(g_round_current_haul_max_field, current_max);
-  if (goal >= 0) write_int(g_round_haul_goal_field, goal);
+  auto write_int = [&](MonoClassField* f, int v) {
+    WriteFieldNumber(rd, f, v);
+  };
+
+  int cur = current;
+  int cur_max = current_max;
+  int haul_goal = goal;
+  if (cur < 0) {
+    read_int(g_round_current_haul_field, cur);
+  }
+  if (haul_goal < 0) {
+    read_int(g_round_haul_goal_field, haul_goal);
+  }
+  if (cur_max < 0) {
+    if (!read_int(g_round_current_haul_max_field, cur_max)) {
+      cur_max = cur;
+    }
+  }
+  if (cur >= 0 && haul_goal > 0 && cur > haul_goal) {
+    cur = haul_goal;
+  }
+  if (cur >= 0 && cur_max < cur) {
+    cur_max = cur;
+  }
+
+  if (cur >= 0) write_int(g_round_current_haul_field, cur);
+  if (cur_max >= 0) write_int(g_round_current_haul_max_field, cur_max);
+  if (haul_goal >= 0) write_int(g_round_haul_goal_field, haul_goal);
+
+  if (cur >= 0 && g_round_total_haul_field) {
+    int total = cur;
+    int prev_total = 0;
+    if (read_int(g_round_total_haul_field, prev_total) && prev_total > total) {
+      total = prev_total;
+    }
+    write_int(g_round_total_haul_field, total);
+  }
+  if (haul_goal >= 0 && g_round_haul_goal_max_field) {
+    int goal_max = haul_goal;
+    int prev_goal_max = 0;
+    if (read_int(g_round_haul_goal_max_field, prev_goal_max) && prev_goal_max > goal_max) {
+      goal_max = prev_goal_max;
+    }
+    write_int(g_round_haul_goal_max_field, goal_max);
+  }
+  if (haul_goal >= 0 && g_round_extraction_haul_goal_field) {
+    write_int(g_round_extraction_haul_goal_field, haul_goal);
+  }
+  if (cur >= 0 && haul_goal >= 0 && g_round_extraction_point_surplus_field) {
+    int surplus = cur - haul_goal;
+    if (surplus < 0) surplus = 0;
+    write_int(g_round_extraction_point_surplus_field, surplus);
+  }
+  if (cur >= 0) {
+    int list_writes = 0;
+    if (g_round_extraction_point_current_field) {
+      MonoObject* list_obj = nullptr;
+      g_mono.mono_field_get_value(rd, g_round_extraction_point_current_field, &list_obj);
+      if (!list_obj) {
+        AppendLogOnce("MonoSetRoundState_list_extraction_current_null",
+                      "MonoSetRoundState: extractionPointCurrent list is null");
+      }
+      list_writes += WriteListTotalNumber(list_obj, cur, "extractionPointCurrent");
+    }
+    if (g_round_dollar_haul_list_field) {
+      MonoObject* list_obj = nullptr;
+      g_mono.mono_field_get_value(rd, g_round_dollar_haul_list_field, &list_obj);
+      if (!list_obj) {
+        AppendLogOnce("MonoSetRoundState_list_dollar_null",
+                      "MonoSetRoundState: dollarHaulList list is null");
+      }
+      list_writes += WriteListTotalNumber(list_obj, cur, "dollarHaulList");
+    }
+    if (list_writes > 0) {
+      std::ostringstream lss;
+      lss << "MonoSetRoundState: list_writes=" << list_writes;
+      AppendLog(lss.str());
+    }
+  }
+  if (cur >= 0 && haul_goal > 0 && cur >= haul_goal) {
+    int extraction_points = 0;
+    if (!read_int(g_round_extraction_points_field, extraction_points) || extraction_points <= 0) {
+      extraction_points = 2;
+    }
+    if (g_round_extraction_points_completed_field) {
+      write_int(g_round_extraction_points_completed_field, extraction_points);
+    }
+    if (g_round_all_extraction_points_completed_field) {
+      write_int(g_round_all_extraction_points_completed_field, 1);
+    }
+  }
+
+  if (cur >= 0 && k_enable_experimental_haul_method_calls) {
+    int method_hits = 0;
+    if (TryInvokeOneNumberArg(g_round_set_current_haul_method, rd, cur)) {
+      ++method_hits;
+    }
+    if (haul_goal >= 0 && TryInvokeOneNumberArg(g_round_set_haul_goal_method, rd, haul_goal)) {
+      ++method_hits;
+    }
+    if (TryInvokeTwoNumberArgs(g_round_apply_haul_method, rd, cur, haul_goal >= 0 ? haul_goal : cur)) {
+      ++method_hits;
+    }
+    if (TryInvokeNoArgs(g_round_refresh_haul_method, rd)) {
+      ++method_hits;
+    }
+    if (method_hits > 0) {
+      std::ostringstream mss;
+      mss << "MonoSetRoundState: round_method_hits=" << method_hits;
+      AppendLog(mss.str());
+    }
+
+    int ep_writes = SyncExtractionPointsHaul(cur, haul_goal >= 0 ? haul_goal : cur);
+    if (ep_writes <= 0) {
+      AppendLogOnce("MonoSetRoundState_ep_sync_zero",
+                    "MonoSetRoundState: SyncExtractionPointsHaul wrote 0 (collector chain not found)");
+    }
+  }
+
+  int verify_cur = -1;
+  int verify_goal = -1;
+  read_int(g_round_current_haul_field, verify_cur);
+  read_int(g_round_haul_goal_field, verify_goal);
+  std::ostringstream oss;
+  oss << "MonoSetRoundState: cur=" << cur << " goal=" << haul_goal
+      << " readback=" << verify_cur << "/" << verify_goal;
+  AppendLog(oss.str());
   return true;
+}
+
+bool MonoSetRoundStateSafe(int current, int goal, int current_max) {
+#ifdef _MSC_VER
+  __try {
+    return MonoSetRoundState(current, goal, current_max);
+  }
+  __except (LogCrash("MonoSetRoundStateSafe", GetExceptionCode(), GetExceptionInformation())) {
+    return false;
+  }
+#else
+  try {
+    return MonoSetRoundState(current, goal, current_max);
+  }
+  catch (...) {
+    return false;
+  }
+#endif
+}
+
+bool MonoGetRoundProgress(RoundProgressState& out_state) {
+  out_state = {};
+  if (!CacheManagedRefs()) return false;
+  if (!g_round_director_class) return false;
+  MonoObject* rd = GetRoundDirectorInstance();
+  if (!rd) return false;
+
+  int v = 0;
+  if (g_round_extraction_points_completed_field &&
+      ReadFieldNumber(rd, g_round_extraction_points_completed_field, v)) {
+    out_state.completed = v;
+    out_state.ok = true;
+  }
+  if (g_round_extraction_points_field &&
+      ReadFieldNumber(rd, g_round_extraction_points_field, v)) {
+    out_state.total = v;
+    out_state.ok = true;
+  }
+  if (g_round_stage_field && ReadFieldNumber(rd, g_round_stage_field, v)) {
+    out_state.stage = v;
+  }
+  if (g_round_all_extraction_points_completed_field &&
+      ReadFieldNumber(rd, g_round_all_extraction_points_completed_field, v)) {
+    out_state.all_completed = (v != 0);
+    out_state.ok = true;
+  }
+  return out_state.ok;
+}
+
+bool MonoSetRoundProgress(int completed, int total, int stage, int all_completed) {
+  if (!CacheManagedRefs()) return false;
+  if (!g_round_director_class) return false;
+  MonoObject* rd = GetRoundDirectorInstance();
+  if (!rd) return false;
+
+  bool wrote = false;
+  int final_total = total;
+  int final_completed = completed;
+
+  if (final_total >= 0 && g_round_extraction_points_field) {
+    if (final_total < 0) final_total = 0;
+    WriteFieldNumber(rd, g_round_extraction_points_field, final_total);
+    wrote = true;
+  }
+  if (final_completed >= 0 && g_round_extraction_points_completed_field) {
+    if (final_completed < 0) final_completed = 0;
+    if (final_total >= 0 && final_completed > final_total) {
+      final_completed = final_total;
+    }
+    WriteFieldNumber(rd, g_round_extraction_points_completed_field, final_completed);
+    wrote = true;
+  }
+  int final_all = all_completed;
+  if (final_all < 0 && final_completed >= 0 && final_total >= 0) {
+    final_all = (final_completed >= final_total) ? 1 : 0;
+  }
+  if (final_all >= 0 && g_round_all_extraction_points_completed_field) {
+    WriteFieldNumber(rd, g_round_all_extraction_points_completed_field, final_all != 0 ? 1 : 0);
+    wrote = true;
+  }
+  if (stage >= 0 && g_round_stage_field) {
+    WriteFieldNumber(rd, g_round_stage_field, stage);
+    wrote = true;
+  }
+
+  if (wrote) {
+    std::ostringstream oss;
+    oss << "MonoSetRoundProgress: completed=" << final_completed
+        << " total=" << final_total
+        << " stage=" << stage
+        << " all=" << final_all;
+    AppendLog(oss.str());
+  }
+  return wrote;
+}
+
+bool MonoSetRoundProgressSafe(int completed, int total, int stage, int all_completed) {
+#ifdef _MSC_VER
+  __try {
+    return MonoSetRoundProgress(completed, total, stage, all_completed);
+  }
+  __except (LogCrash("MonoSetRoundProgressSafe", GetExceptionCode(), GetExceptionInformation())) {
+    return false;
+  }
+#else
+  try {
+    return MonoSetRoundProgress(completed, total, stage, all_completed);
+  }
+  catch (...) {
+    return false;
+  }
+#endif
+}
+
+void MonoSetRoundHaulOverride(bool enabled, int current, int goal) {
+  g_force_round_haul_enabled.store(enabled, std::memory_order_relaxed);
+  g_force_round_haul_value.store(current, std::memory_order_relaxed);
+  g_force_round_haul_goal.store(goal, std::memory_order_relaxed);
+
+  if (g_shutting_down) return;
+
+  // Hard fallback: bypass RoundDirector::Update reset path when lock is enabled.
+  static bool last_enabled = false;
+  if (enabled != last_enabled || (enabled && !g_round_update_patch_active)) {
+    SetRoundUpdateBypass(enabled);
+    last_enabled = enabled;
+  }
 }
 
 bool ReadRunCurrency(int& out_value) {
@@ -3371,8 +4589,8 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
     g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, nullptr, args, &exc);
     if (!exc) ok = true;
   }
-  // 鏃犺 RPC 鏄惁鎴愬姛锛岄兘鐩存帴鍦ㄦ湰鍦?PhysGrabber 涓婃柦鍔犲€硷紝淇濇寔涓嶈仈涓荤鍒�
-  // 官方公式参考：grabStrength += 0.2f * value
+// Non-ASCII comment normalized.
+// Non-ASCII comment normalized.
   float desired = 0.2f * static_cast<float>(grab_strength);
   MonoSetGrabStrengthField(desired);
 
@@ -3547,9 +4765,45 @@ bool MonoSetCartValue(int value) {
     AppendLog("MonoSetCartValue: currency via runStats");
     RefreshCurrencyUi("MonoSetCartValue");
   }
-  if (currency_ok) {
-    return true;
+
+  bool haul_ok = false;
+  int haul_goal = -1;
+  int haul_current = value;
+  int haul_current_max = value;
+  RoundState rs{};
+  if (MonoGetRoundState(rs) && rs.ok) {
+    if (rs.goal >= 0) {
+      haul_goal = rs.goal;
+    }
+    if (rs.current_max > haul_current_max) {
+      haul_current_max = rs.current_max;
+    }
   }
+  if (haul_goal > 0 && haul_current > haul_goal) {
+    haul_current = haul_goal;
+  }
+  if (haul_current < 0) {
+    haul_current = 0;
+  }
+  int haul_ep_goal = haul_goal >= 0 ? haul_goal : haul_current;
+  if (MonoSetRoundState(haul_current, haul_goal, haul_current_max)) {
+    haul_ok = true;
+  }
+  {
+    if (SyncExtractionPointsHaul(haul_current, haul_ep_goal) > 0) {
+      haul_ok = true;
+    }
+  }
+  {
+    std::ostringstream oss;
+    oss << "MonoSetCartValue: haul_apply cur=" << haul_current << " goal=" << haul_goal;
+    AppendLog(oss.str());
+  }
+  if (haul_ok) {
+    AppendLogOnce("MonoSetCartValue_haul_sync",
+      "MonoSetCartValue: synced RoundDirector/ExtractionPoint haul values");
+  }
+
   {
     std::ostringstream oss;
     oss << "MonoSetCartValue: begin class=" << g_phys_grab_cart_class
@@ -3933,9 +5187,26 @@ bool MonoSetCartValue(int value) {
 
     MonoObject* ep = find_extraction_point();
     if (ep) {
-      g_mono.mono_field_set_value(ep, g_extraction_point_haul_current_field, &value);
+      WriteFieldNumber(ep, g_extraction_point_haul_current_field, haul_current);
       if (g_extraction_point_haul_goal_field) {
-        g_mono.mono_field_set_value(ep, g_extraction_point_haul_goal_field, &value);
+        WriteFieldNumber(ep, g_extraction_point_haul_goal_field, haul_ep_goal);
+      }
+      if (g_extraction_point_extraction_haul_field) {
+        WriteFieldNumber(ep, g_extraction_point_extraction_haul_field, haul_current);
+      }
+      if (g_extraction_point_run_currency_before_field) {
+        int run_currency_before = 0;
+        if (ComputeRunCurrencyBeforeForTarget(haul_current, run_currency_before)) {
+          WriteFieldNumber(ep, g_extraction_point_run_currency_before_field, run_currency_before);
+        }
+      }
+      if (k_enable_experimental_haul_method_calls) {
+        int invoke_goal = haul_ep_goal >= 0 ? haul_ep_goal : haul_current;
+        TryInvokeOneNumberArg(g_extraction_point_set_current_haul_method, ep, haul_current);
+        TryInvokeOneNumberArg(g_extraction_point_set_haul_goal_method, ep, invoke_goal);
+        TryInvokeTwoNumberArgs(g_extraction_point_apply_haul_method, ep, haul_current, invoke_goal);
+        TryInvokeNoArgs(g_extraction_point_set_haul_text_method, ep);
+        TryInvokeNoArgs(g_extraction_point_refresh_method, ep);
       }
       AppendLog("MonoSetCartValue: wrote ExtractionPoint haul as fallback");
       return true;
@@ -3951,7 +5222,7 @@ bool MonoSetCartValue(int value) {
     return true;
   }
 
-  g_mono.mono_field_set_value(cart, g_phys_grab_cart_haul_field, &value);
+  WriteFieldNumber(cart, g_phys_grab_cart_haul_field, haul_current);
 
   if (g_phys_grab_cart_set_haul_text) {
     MonoObject* exc2 = nullptr;
@@ -3961,12 +5232,30 @@ bool MonoSetCartValue(int value) {
   return true;
 }
 
-// 瀹夊叏閬嶅巻 List<T>锛氬綋 _items 涓虹┖鎴?max_length 寮傚父鏃讹紝閫氳繃鏋氫妇鍣ㄩ€愰」鍙栧€笺€?
+bool MonoSetCartValueSafe(int value) {
+#ifdef _MSC_VER
+  __try {
+    return MonoSetCartValue(value);
+  }
+  __except (LogCrash("MonoSetCartValueSafe", GetExceptionCode(), GetExceptionInformation())) {
+    return false;
+  }
+#else
+  try {
+    return MonoSetCartValue(value);
+  }
+  catch (...) {
+    return false;
+  }
+#endif
+}
+
+// Non-ASCII comment normalized.
 int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObject*)>& on_elem) {
   if (!list_obj || !on_elem) return 0;
   MonoClass* cls = g_mono.mono_object_get_class(list_obj);
   if (!cls) return 0;
-  // Cache per list/enumerator class to鍑忓皯鍙嶅皠寮€閿€
+// Non-ASCII comment normalized.
   static MonoClass* cached_list_cls = nullptr;
   static MonoMethod* cached_get_enum = nullptr;
   if (cls != cached_list_cls) {
@@ -4086,7 +5375,7 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
         return false;
       });
 
-    // 鍏滃簳锛氶潤鎬佸疄渚嬩篃灏濊瘯涓€娆★紝閬垮厤鍒楄〃寮傚父瀵艰嚧鍏ㄧ┖
+// Non-ASCII comment normalized.
     if (out_states.empty() && g_player_avatar_instance_field && g_player_avatar_vtable) {
       MonoObject* inst = nullptr;
       g_mono.mono_field_static_get_value(g_player_avatar_vtable, g_player_avatar_instance_field,
@@ -4136,12 +5425,12 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     if (g_shutting_down) return false;
     static uint64_t last_items_empty_ms = 0;
     uint64_t now_ms = GetTickCount64();
-    // 若之前因崩溃被禁用，超时后自动重试
+// Non-ASCII comment normalized.
     if (g_items_disabled && now_ms - g_items_last_crash_ms.load(std::memory_order_relaxed) > 3000) {
       g_items_disabled = false;
     }
     if (!g_items_ready.load(std::memory_order_relaxed) && now_ms - last_items_empty_ms < 1500) {
-      return false;  // 场景尚未就绪时先跳过，避免连续崩溃
+      return false;  // Non-ASCII comment normalized.
     }
     out_items.clear();
     if (!CacheManagedRefs()) {
@@ -4154,7 +5443,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
 
     auto DisableFadeOnObject = [&](MonoObject* go_obj) {
-      if (!g_esp_enabled) return;  // 鍙湪ESP寮€鍚椂淇濇寔楂樹寒
+      if (!g_esp_enabled) return;  // Non-ASCII comment normalized.
       if (!go_obj || !g_light_fade_class || !g_light_fade_type || !g_game_object_get_component ||
         !g_mono.mono_type_get_object || !g_mono.mono_runtime_invoke) {
         return;
@@ -4216,7 +5505,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
       MonoClass* cls = g_mono.mono_object_get_class(item_obj);
       if (cls) {
-        // 鍏堝皾璇?ItemVolume 鍐呴儴瀛楁
+// Non-ASCII comment normalized.
         if (g_item_volume_class && IsSubclassOf(cls, g_item_volume_class) &&
           g_item_volume_item_attributes_field) {
           MonoObject* attr_obj = nullptr;
@@ -4237,7 +5526,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
             }
           }
         }
-        // 鍐嶅皾璇曚粠 GameObject 涓婄洿鎺ュ彇 ItemAttributes 缁勪欢锛堝簲瀵?Collider 绛夛級
+// Non-ASCII comment normalized.
         if ((!st.has_value || !st.has_item_type) && go_obj &&
           g_game_object_get_component && g_item_attributes_type_obj) {
           void* args_attr[1] = { g_item_attributes_type_obj };
@@ -4355,7 +5644,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       int collider_count = 0;
       bool ok = parse_array(arr_obj, colliders, collider_count);
 
-      // 若按指定 Layer 未找到，回退一次全层扫描，防止层名变化导致物品缺失
+// Non-ASCII comment normalized.
       if (!ok || collider_count <= 0) {
         int layer_mask_all = -1;
         void* args4b[4] = { center, &radius, &layer_mask_all, &query };
@@ -4459,7 +5748,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
     static bool logged_no_items = false;
 
-    // --- 宸查獙璇佽ˉ涓侊細鐩存帴瀛楁 + GetAllItemVolumesInScene ---
+// Non-ASCII comment normalized.
     auto fetch_verified_list = [&]() -> MonoObject* {
       MonoObject* list_obj = nullptr;
       if (manager && g_item_manager_item_volumes_field) {
@@ -4496,7 +5785,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       return list_obj;
       };
 
-    // --- 澶囬€夋暟鎹簮锛歅opulate + FindObjectsOfType<ItemVolume>() ---
+// Non-ASCII comment normalized.
     auto fetch_fallback_list = [&]() -> MonoObject* {
       MonoObject* list_obj = nullptr;
       MonoObject* exception = nullptr;
@@ -4618,7 +5907,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     int list_size = 0;
       read_list(list_obj, items, list_size);
 
-      // 濡傛灉鎷垮埌浜嗗璞′絾闀垮害涓?0锛屽己鍒惰皟鐢ㄤ竴娆?GetAllItemVolumesInScene 骞堕噸澶嶈鍙栥€?
+// Non-ASCII comment normalized.
       static bool forced_get_all_once = false;
       if (list_size == 0 && manager && g_item_manager_get_all_items && !forced_get_all_once) {
       MonoObject* exc_force = nullptr;
@@ -4660,7 +5949,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // Rescue: 濡傛灉 list_size>0 浣?items 涓虹┖锛岀洿鎺ョ敤 FindObjectsOfType 鎷?Array銆?
+// Non-ASCII comment normalized.
     if (list_size > 0 && (!items || (items && items->max_length == 0)) &&
       g_find_objects_of_type_itemvolume && g_item_volume_class &&
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
@@ -4688,7 +5977,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // 鍏滃簳锛氫緷鐒舵病鏈?items 灏卞啀灏濊瘯涓€娆?FindObjectsOfType銆?
+// Non-ASCII comment normalized.
     if ((!items || list_size <= 0) && g_find_objects_of_type_itemvolume && g_item_volume_class &&
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
       MonoType* iv_type = g_mono.mono_class_get_type(g_item_volume_class);
@@ -4800,7 +6089,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
-    // If array missing or max_length寮傚父锛屼娇鐢ㄦ灇涓惧櫒鍏滃簳銆?
+// Non-ASCII comment normalized.
     if (!items || list_size <= 0 || (items && items->max_length <= 0)) {
       if (!logged_no_items) {
         std::ostringstream oss;
@@ -4825,7 +6114,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
     int limit = list_size;
     int max_len = (items && items->max_length > 0) ? static_cast<int>(items->max_length) : list_size;
-    // 褰?max_length 寮傚父涓?0/璐熸暟鏃讹紝鐩存帴鐢?list_size锛堝凡鍦ㄤ笂鏂瑰厹搴曡繃锛?
+// Non-ASCII comment normalized.
     if (max_len > 0 && limit > max_len) limit = max_len;
     if (limit > 1024) {
       limit = 1024;
@@ -4985,10 +6274,7 @@ void MonoResetEnemiesDisabled() {
   g_enemies_ready.store(false, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
-    for (uint32_t h : g_enemy_cache) {
-      if (g_mono.mono_gchandle_free) g_mono.mono_gchandle_free(h);
-    }
-    g_enemy_cache.clear();
+    ClearEnemyCacheHandlesUnlocked();
   }
 }
 
@@ -5000,7 +6286,6 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLog("MonoListEnemies: CacheManagedRefs failed");
       return false;
     }
-    // 场景/关卡未就绪时跳过，避免在主菜单/加载界面扫描导致空指针
     RoundState rs{};
     if (!MonoGetRoundState(rs) || !rs.ok) {
       AppendLogOnce("MonoListEnemies_skip_noround", "MonoListEnemies: RoundDirector not ready; skip scan");
@@ -5014,16 +6299,16 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLogOnce("MonoListEnemies_no_method", "MonoListEnemies: transform/gameObject/GetComponent unresolved");
       return false;
     }
-    // 浣庨鍒锋柊缂撳瓨锛?s 涓€娆★級锛岄伩鍏嶆瘡甯у叏灞€鎵弿
+
     uint64_t now = GetTickCount64();
-    // 浠呬緷璧?Awake Hook 缁存姢鐨勭紦瀛橈紝绂佺敤鍏ㄥ眬鎵弿浠ヨ閬挎綔鍦ㄥ穿婧?
-    (void)now;
     EnemyCachePruneDead();
+
     std::vector<uint32_t> cache_snapshot;
     {
       std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
       cache_snapshot = g_enemy_cache;
     }
+
     int cached_added = 0;
     for (uint32_t h : cache_snapshot) {
       MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
@@ -5037,12 +6322,14 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       return true;
     }
 
-    // 缓存为空：尝试安全的 FindObjectsOfType 路径填充缓存（包含未激活对象），避免 Physics.OverlapSphere 崩溃。
-    if (!g_enemy_cache_disabled && RefreshEnemyCacheSafe()) {
-      EnemyCachePruneDead();
-      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
-      cache_snapshot = g_enemy_cache;
-    } else {
+    if (!g_enemy_cache_disabled) {
+      if (RefreshEnemyCacheSafe()) {
+        EnemyCachePruneDead();
+        std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+        cache_snapshot = g_enemy_cache;
+      }
+    }
+    else {
       AppendLogOnce("MonoListEnemies_cache_disabled", "MonoListEnemies: enemy cache disabled or refresh failed");
     }
 
@@ -5058,126 +6345,16 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       return true;
     }
 
+    static uint64_t s_last_direct_enemy_scan_ms = 0;
+    if (now - s_last_direct_enemy_scan_ms >= 250) {
+      s_last_direct_enemy_scan_ms = now;
+      if (ScanEnemiesDirect(out_enemies, 512)) {
+        AppendLogOnce("MonoListEnemies_direct_scan", "MonoListEnemies: populated via direct FindObjectsOfType scan");
+        return true;
+      }
+    }
+
     AppendLogOnce("MonoListEnemies_skip_overlap", "MonoListEnemies: cache empty, skip global scan");
-    return true;
-
-    // 为了稳定性：若缓存为空，不再用 Physics.OverlapSphere 全局扫描，避免加载/主菜单期崩溃。
-    AppendLogOnce("MonoListEnemies_skip_overlap", "MonoListEnemies: skip OverlapSphere when cache empty");
-    return true;
-
-    // Build Type object for EnemyRigidbody (required for GetComponent)
-    MonoType* enemy_type = g_mono.mono_class_get_type ? g_mono.mono_class_get_type(g_enemy_rigidbody_class) : nullptr;
-    MonoDomain* dom = g_domain ? g_domain : g_mono.mono_get_root_domain();
-    MonoObject* enemy_type_obj =
-      (enemy_type && g_mono.mono_type_get_object) ? g_mono.mono_type_get_object(dom, enemy_type) : nullptr;
-    if (!enemy_type_obj) {
-      AppendLogOnce("MonoListEnemies_type_null", "MonoListEnemies: EnemyRigidbody type object null");
-      return false;
-    }
-
-    auto add_enemy = [&](MonoObject* enemy_obj) -> bool {
-      if (!enemy_obj) return false;
-      MonoObject* tr = SafeInvoke(g_component_get_transform, enemy_obj, nullptr, "Enemy.get_transform");
-      if (!tr) return false;
-      PlayerState st{};
-      st.category = PlayerState::Category::kEnemy;
-      if (!TryGetPositionFromTransform(tr, st, false)) return false;
-      if (g_component_get_game_object) {
-        MonoObject* go = SafeInvoke(g_component_get_game_object, enemy_obj, nullptr, "Enemy.get_gameObject");
-        if (go && g_unity_object_get_name) {
-          MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, go, nullptr, "GameObject.get_name");
-          if (name_obj) {
-            st.name = MonoStringToUtf8(name_obj);
-            st.has_name = !st.name.empty();
-          }
-        }
-        if (go && g_game_object_get_layer) {
-          MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, go, nullptr, "GameObject.get_layer");
-          if (layer_obj && g_mono.mono_object_unbox) {
-            st.layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-            st.has_layer = true;
-          }
-        }
-      }
-      out_enemies.push_back(st);
-      return true;
-    };
-
-    // 鍑轰簬绋冲畾鎬э紝鏆備笉浣跨敤 FindObjectsOfType/Resources 鍏ㄥ眬鎵弿锛岀粺涓€璧颁笅鏂?OverlapSphere 杩戝満鎵弿銆?
-    // 鍩轰簬鐜╁浣嶇疆鐨勮繎鍦烘壂鎻忥紙鍏煎鏃ч€昏緫锛?
-    float center[3] = { 0.0f, 0.0f, 0.0f };
-    PlayerState local_state{};
-    if (MonoGetLocalPlayerState(local_state) && local_state.has_position) {
-      center[0] = local_state.x;
-      center[1] = local_state.y;
-      center[2] = local_state.z;
-    }
-    float radius = 300.0f;
-    int layer_mask = -1;
-    int query = 2;  // QueryTriggerInteraction.Collide
-    void* args4[4] = { center, &radius, &layer_mask, &query };
-    void* args3[3] = { center, &radius, &layer_mask };
-    void* args2[2] = { center, &radius };
-    MonoObject* arr_obj = nullptr;
-    switch (g_physics_overlap_sphere_argc) {
-    case 4:
-      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args4, "Physics.OverlapSphere");
-      break;
-    case 3:
-      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args3, "Physics.OverlapSphere3");
-      break;
-    case 2:
-      arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args2, "Physics.OverlapSphere2");
-      break;
-    default:
-      AppendLogOnce("MonoListEnemies_overlap_args", "MonoListEnemies: unsupported OverlapSphere signature");
-      return false;
-    }
-
-    MonoArray* colliders = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
-    if (!colliders || colliders->max_length <= 0 || !colliders->vector) {
-      AppendLogOnce("MonoListEnemies_empty", "MonoListEnemies: no enemies found via OverlapSphere");
-      return true;
-    }
-
-    int limit = static_cast<int>(colliders->max_length);
-    if (limit > 2048) limit = 2048;
-    int valid = 0;
-    for (int i = 0; i < limit; ++i) {
-      MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
-      if (!collider || IsUnityNull(collider)) continue;
-      MonoObject* game_obj = SafeInvoke(g_component_get_game_object, collider, nullptr, "Collider.get_gameObject");
-      if (!game_obj || IsUnityNull(game_obj)) continue;
-      void* comp_args[1] = { enemy_type_obj };
-      if (!comp_args[0]) continue;
-      MonoObject* enemy =
-        SafeInvoke(g_game_object_get_component, game_obj, comp_args, "GameObject.GetComponent(Enemy)");
-      if (!enemy && g_game_object_get_component_in_parent) {
-        enemy = SafeInvoke(g_game_object_get_component_in_parent, game_obj, comp_args,
-          "GameObject.GetComponentInParent(Enemy)");
-        AppendLogOnce("MonoListEnemies_parent_fallback",
-          "Collider game object fell back to GameObject::GetComponentInParent(Enemy)");
-      }
-      if (!enemy || IsUnityNull(enemy)) {
-        continue;  // 没有 EnemyRigidbody 组件就跳过，避免将普通 Collider 误当敌人
-      }
-      MonoObject* tr = SafeInvoke(g_component_get_transform, enemy, nullptr, "Enemy.get_transform");
-      if (!tr || IsUnityNull(tr)) continue;
-
-      PlayerState st{};
-      st.category = PlayerState::Category::kEnemy;
-      if (TryGetPositionFromTransform(tr, st, false) && st.has_position) {
-        st.is_local = false;
-        st.has_health = false;
-        out_enemies.push_back(st);
-        ++valid;
-      }
-      if (valid >= 256) break;
-    }
-
-    if (valid == 0) {
-      AppendLogOnce("MonoListEnemies_zero", "MonoListEnemies: found zero enemies after scanning colliders");
-    }
     return true;
   }
   catch (...) {
@@ -5208,6 +6385,284 @@ bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies) {
 #endif
 }
 
+static bool ReadCodeBytesSafe(const void* addr, uint8_t* out, size_t size) {
+  if (!addr || !out || size == 0) return false;
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(addr, &mbi, sizeof(mbi))) return false;
+  const DWORD p = mbi.Protect & 0xff;
+  const bool executable =
+    p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE ||
+    p == PAGE_EXECUTE_WRITECOPY;
+  if (!executable) return false;
+#endif
+#ifdef _MSC_VER
+  __try {
+    std::memcpy(out, addr, size);
+    return true;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+#else
+  std::memcpy(out, addr, size);
+  return true;
+#endif
+}
+
+static std::string HexBytes(const uint8_t* data, size_t n) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < n; ++i) {
+    if (i) oss << " ";
+    oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]);
+  }
+  return oss.str();
+}
+
+static bool IsNumericOrBoolTypeCode(int tc) {
+  switch (tc) {
+    case kMonoTypeBoolean:
+    case kMonoTypeI1:
+    case kMonoTypeU1:
+    case kMonoTypeI2:
+    case kMonoTypeU2:
+    case kMonoTypeI4:
+    case kMonoTypeU4:
+    case kMonoTypeI8:
+    case kMonoTypeU8:
+    case kMonoTypeR4:
+    case kMonoTypeR8:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool IsIntLikeTypeCode(int tc) {
+  switch (tc) {
+    case kMonoTypeBoolean:
+    case kMonoTypeI1:
+    case kMonoTypeU1:
+    case kMonoTypeI2:
+    case kMonoTypeU2:
+    case kMonoTypeI4:
+    case kMonoTypeU4:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool IsCollectorKeywordHit(const std::string& name) {
+  return CaseContains(name, "haul") || CaseContains(name, "extract") || CaseContains(name, "currency") ||
+         CaseContains(name, "dollar") || CaseContains(name, "collector") || CaseContains(name, "tax");
+}
+
+static int GetMethodReturnTypeCode(MonoMethod* m) {
+  if (!m || !g_mono.mono_method_signature || !g_mono.mono_signature_get_return_type ||
+      !g_mono.mono_type_get_type) {
+    return -1;
+  }
+  MonoMethodSignature* sig = g_mono.mono_method_signature(m);
+  MonoType* ret_ty = sig ? g_mono.mono_signature_get_return_type(sig) : nullptr;
+  return ret_ty ? g_mono.mono_type_get_type(ret_ty) : -1;
+}
+
+static int GetMethodParamCount(MonoMethod* m) {
+  if (!m || !g_mono.mono_method_signature || !g_mono.mono_signature_get_param_count) {
+    return -1;
+  }
+  MonoMethodSignature* sig = g_mono.mono_method_signature(m);
+  return sig ? static_cast<int>(g_mono.mono_signature_get_param_count(sig)) : -1;
+}
+
+static bool ReadBoxedNumberByType(MonoObject* boxed, int type_code, double& out_v) {
+  out_v = 0.0;
+  if (!boxed || !g_mono.mono_object_unbox) return false;
+  void* p = g_mono.mono_object_unbox(boxed);
+  if (!p) return false;
+  switch (type_code) {
+    case kMonoTypeBoolean: out_v = *static_cast<bool*>(p) ? 1.0 : 0.0; return true;
+    case kMonoTypeI1: out_v = static_cast<double>(*static_cast<int8_t*>(p)); return true;
+    case kMonoTypeU1: out_v = static_cast<double>(*static_cast<uint8_t*>(p)); return true;
+    case kMonoTypeI2: out_v = static_cast<double>(*static_cast<int16_t*>(p)); return true;
+    case kMonoTypeU2: out_v = static_cast<double>(*static_cast<uint16_t*>(p)); return true;
+    case kMonoTypeI4: out_v = static_cast<double>(*static_cast<int32_t*>(p)); return true;
+    case kMonoTypeU4: out_v = static_cast<double>(*static_cast<uint32_t*>(p)); return true;
+    case kMonoTypeI8: out_v = static_cast<double>(*static_cast<int64_t*>(p)); return true;
+    case kMonoTypeU8: out_v = static_cast<double>(*static_cast<uint64_t*>(p)); return true;
+    case kMonoTypeR4: out_v = static_cast<double>(*static_cast<float*>(p)); return true;
+    case kMonoTypeR8: out_v = *static_cast<double*>(p); return true;
+    default: {
+      bool is_float = false;
+      return ReadBoxedNumberGuess(boxed, out_v, is_float);
+    }
+  }
+}
+
+static bool InvokeNoArgMethodNumber(MonoMethod* m, MonoObject* instance_obj, int return_type_code,
+                                    int& out_value, bool& out_used_static) {
+  out_value = 0;
+  out_used_static = false;
+  if (!m || !g_mono.mono_runtime_invoke) return false;
+  auto try_invoke = [&](MonoObject* obj, bool used_static, int& dst) -> bool {
+    MonoObject* exc = nullptr;
+    MonoObject* ret = g_mono.mono_runtime_invoke(m, obj, nullptr, &exc);
+    if (exc || !ret) return false;
+    double v = 0.0;
+    if (!ReadBoxedNumberByType(ret, return_type_code, v)) return false;
+    dst = v >= 0.0 ? static_cast<int>(v + 0.5) : static_cast<int>(v - 0.5);
+    out_used_static = used_static;
+    return true;
+  };
+  if (instance_obj && try_invoke(instance_obj, false, out_value)) {
+    return true;
+  }
+  return try_invoke(nullptr, true, out_value);
+}
+
+static const char* MonoTypeCodeName(int tc) {
+  switch (tc) {
+    case kMonoTypeBoolean: return "bool";
+    case kMonoTypeI1: return "i1";
+    case kMonoTypeU1: return "u1";
+    case kMonoTypeI2: return "i2";
+    case kMonoTypeU2: return "u2";
+    case kMonoTypeI4: return "i4";
+    case kMonoTypeU4: return "u4";
+    case kMonoTypeI8: return "i8";
+    case kMonoTypeU8: return "u8";
+    case kMonoTypeR4: return "r4";
+    case kMonoTypeR8: return "r8";
+    default: return "unk";
+  }
+}
+
+namespace {
+static bool PatchCodeToReturnInt(void* addr, int forced, CodePatchBackup& backup) {
+  if (!addr) return false;
+  uint8_t patch[8]{};
+  patch[0] = 0xB8;  // mov eax, imm32
+  std::memcpy(&patch[1], &forced, sizeof(int));
+  patch[5] = 0xC3;  // ret
+  patch[6] = 0x90;
+  patch[7] = 0x90;
+
+  DWORD old_protect = 0;
+  if (!VirtualProtect(addr, sizeof(patch), PAGE_EXECUTE_READWRITE, &old_protect)) {
+    return false;
+  }
+#ifdef _MSC_VER
+  __try {
+    std::memcpy(backup.bytes.data(), addr, sizeof(patch));
+    backup.size = sizeof(patch);
+    std::memcpy(addr, patch, sizeof(patch));
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    DWORD tmp = 0;
+    VirtualProtect(addr, sizeof(patch), old_protect, &tmp);
+    return false;
+  }
+#else
+  std::memcpy(backup.bytes.data(), addr, sizeof(patch));
+  backup.size = sizeof(patch);
+  std::memcpy(addr, patch, sizeof(patch));
+#endif
+  FlushInstructionCache(GetCurrentProcess(), addr, sizeof(patch));
+  DWORD tmp = 0;
+  VirtualProtect(addr, sizeof(patch), old_protect, &tmp);
+  return true;
+}
+
+static bool RestorePatchedCode(void* addr, const CodePatchBackup& backup) {
+  if (!addr || backup.size == 0 || backup.size > backup.bytes.size()) return false;
+  DWORD old_protect = 0;
+  if (!VirtualProtect(addr, backup.size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+    return false;
+  }
+#ifdef _MSC_VER
+  __try {
+    std::memcpy(addr, backup.bytes.data(), backup.size);
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    DWORD tmp = 0;
+    VirtualProtect(addr, backup.size, old_protect, &tmp);
+    return false;
+  }
+#else
+  std::memcpy(addr, backup.bytes.data(), backup.size);
+#endif
+  FlushInstructionCache(GetCurrentProcess(), addr, backup.size);
+  DWORD tmp = 0;
+  VirtualProtect(addr, backup.size, old_protect, &tmp);
+  return true;
+}
+
+static bool SetRoundUpdateBypass(bool enable) {
+  if (!g_mono.mono_class_get_method_from_name || !g_mono.mono_compile_method) {
+    return false;
+  }
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) {
+    return false;
+  }
+  if (!g_round_director_class) {
+    return false;
+  }
+  if (!g_round_director_update_method) {
+    g_round_director_update_method =
+      g_mono.mono_class_get_method_from_name(g_round_director_class, "Update", 0);
+    if (!g_round_director_update_method) {
+      AppendLogOnce("RoundUpdate_patch_no_method", "RoundDirector::Update not found for byte patch");
+      return false;
+    }
+  }
+
+  void* addr = g_mono.mono_compile_method(g_round_director_update_method);
+  if (!addr) {
+    AppendLogOnce("RoundUpdate_patch_no_code", "mono_compile_method failed for RoundDirector::Update patch");
+    return false;
+  }
+
+  if (enable) {
+    if (g_round_update_patch_active && g_round_update_patch_addr == addr) {
+      return true;
+    }
+    if (g_round_update_patch_active && g_round_update_patch_addr &&
+        g_round_update_patch_backup.size > 0) {
+      RestorePatchedCode(g_round_update_patch_addr, g_round_update_patch_backup);
+      g_round_update_patch_active = false;
+      g_round_update_patch_addr = nullptr;
+      g_round_update_patch_backup = {};
+    }
+
+    CodePatchBackup backup{};
+    if (!PatchCodeToReturnInt(addr, 0, backup)) {
+      AppendLogOnce("RoundUpdate_patch_apply_fail", "Failed to patch RoundDirector::Update");
+      return false;
+    }
+    g_round_update_patch_addr = addr;
+    g_round_update_patch_backup = backup;
+    g_round_update_patch_active = true;
+    AppendLogOnce("RoundUpdate_patch_enabled", "RoundDirector::Update patched to immediate return");
+    return true;
+  }
+
+  if (!g_round_update_patch_active) {
+    return true;
+  }
+
+  bool ok = true;
+  if (g_round_update_patch_addr && g_round_update_patch_backup.size > 0) {
+    ok = RestorePatchedCode(g_round_update_patch_addr, g_round_update_patch_backup);
+  }
+  g_round_update_patch_active = false;
+  g_round_update_patch_addr = nullptr;
+  g_round_update_patch_backup = {};
+  AppendLogOnce("RoundUpdate_patch_disabled", "RoundDirector::Update patch restored");
+  return ok;
+}
+}  // namespace
+
 bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results) {
   out_results.clear();
   if (!keyword || !*keyword) return false;
@@ -5224,6 +6679,8 @@ bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results)
     { g_player_controller_class, "PlayerController" },
     { g_game_director_class, "GameDirector" },
     { g_round_director_class, "RoundDirector" },
+    { g_extraction_point_class, "ExtractionPoint" },
+    { g_phys_grab_cart_class, "PhysGrabCart" },
     { g_pun_manager_class, "PunManager" },
     { g_phys_grabber_class, "PhysGrabber" },
     { g_enemy_rigidbody_class, "EnemyRigidbody" },
@@ -5244,7 +6701,7 @@ bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results)
         out_results.push_back(oss.str());
         ++total_hits;
       }
-      if (total_hits > 512) break;  // 防止日志过大
+      if (total_hits > 512) break;  // Non-ASCII comment normalized.
     }
     if (total_hits > 512) break;
   }
@@ -5253,6 +6710,304 @@ bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results)
   log << "MethodScan '" << needle << "': hits=" << total_hits;
   AppendLog(log.str());
   return total_hits > 0;
+}
+
+bool MonoScanMethodsWithBytes(const char* keyword, std::vector<std::string>& out_results) {
+  out_results.clear();
+  if (!keyword || !*keyword) return false;
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) return false;
+  if (!g_mono.mono_class_get_methods || !g_mono.mono_method_get_name || !g_mono.mono_compile_method) {
+    return false;
+  }
+
+  struct TargetCls {
+    MonoClass* cls;
+    const char* name;
+  };
+  TargetCls targets[] = {
+    { g_round_director_class, "RoundDirector" },
+    { g_extraction_point_class, "ExtractionPoint" },
+    { g_phys_grab_cart_class, "PhysGrabCart" },
+    { g_currency_ui_class, "CurrencyUI" },
+    { g_pun_manager_class, "PunManager" },
+    { g_player_controller_class, "PlayerController" },
+  };
+
+  std::string needle(keyword);
+  int hits = 0;
+  for (const auto& t : targets) {
+    if (!t.cls) continue;
+    void* iter = nullptr;
+    MonoMethod* m = nullptr;
+    while ((m = g_mono.mono_class_get_methods(t.cls, &iter)) != nullptr) {
+      const char* nm = g_mono.mono_method_get_name(m);
+      if (!nm || !CaseContains(nm, needle)) continue;
+
+      void* code = g_mono.mono_compile_method(m);
+      std::ostringstream oss;
+      oss << t.name << "::" << nm;
+      if (code) {
+        uint8_t first[16]{};
+        if (ReadCodeBytesSafe(code, first, sizeof(first))) {
+          oss << " addr=0x" << std::hex << reinterpret_cast<uintptr_t>(code)
+              << " bytes=" << HexBytes(first, sizeof(first));
+        }
+        else {
+          oss << " addr=0x" << std::hex << reinterpret_cast<uintptr_t>(code) << " bytes=<unreadable>";
+        }
+      }
+      else {
+        oss << " addr=<jit-null>";
+      }
+      out_results.push_back(oss.str());
+      ++hits;
+      if (hits > 1024) break;
+    }
+    if (hits > 1024) break;
+  }
+  std::ostringstream log;
+  log << "MethodScanBytes '" << keyword << "': hits=" << hits;
+  AppendLog(log.str());
+  return hits > 0;
+}
+
+bool MonoDumpCollectorNumericFields(std::vector<std::string>& out_results) {
+  out_results.clear();
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) return false;
+  if (!g_mono.mono_class_get_fields || !g_mono.mono_field_get_name) return false;
+
+  auto dump_instance_fields = [&](MonoObject* obj, MonoClass* cls, const char* tag, int limit) -> int {
+    if (!obj || !cls) return 0;
+    int dumped = 0;
+    void* iter = nullptr;
+    MonoClassField* f = nullptr;
+    while ((f = g_mono.mono_class_get_fields(cls, &iter)) != nullptr) {
+      const int tc = GetFieldTypeCode(f);
+      if (!IsNumericOrBoolTypeCode(tc)) continue;
+      int v = 0;
+      if (!ReadFieldNumber(obj, f, v)) continue;
+      const char* fn = g_mono.mono_field_get_name(f);
+      if (!fn) continue;
+      std::ostringstream oss;
+      oss << tag << "." << fn << "=" << v;
+      out_results.push_back(oss.str());
+      ++dumped;
+      if (dumped >= limit) break;
+    }
+    return dumped;
+  };
+
+  int total = 0;
+  MonoObject* rd = GetRoundDirectorInstance();
+  if (rd && g_round_director_class) {
+    total += dump_instance_fields(rd, g_round_director_class, "RoundDirector", 256);
+  }
+  if (g_round_extraction_point_current_field) {
+    MonoObject* list_obj = nullptr;
+    if (rd) g_mono.mono_field_get_value(rd, g_round_extraction_point_current_field, &list_obj);
+    int sum = 0;
+    if (ReadListTotalNumber(list_obj, sum)) {
+      out_results.push_back(std::string("RoundDirector.extractionPointCurrent.sum=") + std::to_string(sum));
+      ++total;
+    }
+  }
+  if (g_round_dollar_haul_list_field) {
+    MonoObject* list_obj = nullptr;
+    if (rd) g_mono.mono_field_get_value(rd, g_round_dollar_haul_list_field, &list_obj);
+    int sum = 0;
+    if (ReadListTotalNumber(list_obj, sum)) {
+      out_results.push_back(std::string("RoundDirector.dollarHaulList.sum=") + std::to_string(sum));
+      ++total;
+    }
+  }
+
+  MonoArray* eps = FindObjectsOfTypeArray(g_extraction_point_class, "ExtractionPointDump");
+  if (eps && eps->max_length > 0) {
+    const int n = static_cast<int>(eps->max_length > 3 ? 3 : eps->max_length);
+    for (int i = 0; i < n; ++i) {
+      MonoObject* ep = static_cast<MonoObject*>(eps->vector[i]);
+      if (!ep) continue;
+      std::ostringstream tag;
+      tag << "ExtractionPoint[" << i << "]";
+      std::string tag_str = tag.str();
+      total += dump_instance_fields(ep, g_extraction_point_class, tag_str.c_str(), 128);
+    }
+  }
+
+  std::ostringstream log;
+  log << "CollectorFieldDump: lines=" << total;
+  AppendLog(log.str());
+  return total > 0;
+}
+
+bool MonoProbeCollectorMethods(const char* keyword, std::vector<std::string>& out_results) {
+  out_results.clear();
+  if (!keyword || !*keyword) return false;
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) return false;
+  if (!g_mono.mono_class_get_methods || !g_mono.mono_method_get_name || !g_mono.mono_compile_method) {
+    return false;
+  }
+
+  MonoObject* rd = GetRoundDirectorInstance();
+  MonoObject* ep0 = nullptr;
+  MonoObject* cart0 = nullptr;
+  if (MonoArray* eps = FindObjectsOfTypeArray(g_extraction_point_class, "ProbeExtractionPoint")) {
+    if (eps->max_length > 0) ep0 = static_cast<MonoObject*>(eps->vector[0]);
+  }
+  if (MonoArray* carts = FindObjectsOfTypeArray(g_phys_grab_cart_class, "ProbePhysGrabCart")) {
+    if (carts->max_length > 0) cart0 = static_cast<MonoObject*>(carts->vector[0]);
+  }
+
+  struct TargetCls {
+    MonoClass* cls;
+    const char* name;
+    MonoObject* instance;
+  };
+  TargetCls targets[] = {
+    { g_round_director_class, "RoundDirector", rd },
+    { g_extraction_point_class, "ExtractionPoint", ep0 },
+    { g_phys_grab_cart_class, "PhysGrabCart", cart0 },
+    { g_currency_ui_class, "CurrencyUI", nullptr },
+    { g_pun_manager_class, "PunManager", nullptr },
+  };
+
+  const std::string needle(keyword);
+  int hits = 0;
+  for (const auto& t : targets) {
+    if (!t.cls) continue;
+    void* iter = nullptr;
+    MonoMethod* m = nullptr;
+    while ((m = g_mono.mono_class_get_methods(t.cls, &iter)) != nullptr) {
+      const char* nm_raw = g_mono.mono_method_get_name(m);
+      if (!nm_raw) continue;
+      std::string nm(nm_raw);
+      if (!CaseContains(nm, needle)) continue;
+
+      const int argc = GetMethodParamCount(m);
+      if (argc >= 0 && argc != 0) continue;
+      const int rtc = GetMethodReturnTypeCode(m);
+      if (rtc >= 0 && !IsNumericOrBoolTypeCode(rtc)) continue;
+
+      int value = 0;
+      bool used_static = false;
+      const bool ok = InvokeNoArgMethodNumber(m, t.instance, rtc, value, used_static);
+      void* code = g_mono.mono_compile_method(m);
+      std::ostringstream oss;
+      oss << t.name << "::" << nm << " argc=" << (argc >= 0 ? argc : -1)
+          << " ret=" << MonoTypeCodeName(rtc)
+          << " invoke=" << (ok ? "ok" : "fail");
+      if (ok) {
+        oss << " value=" << value << (used_static ? " [static]" : " [instance]");
+      }
+      if (code) {
+        uint8_t first[16]{};
+        if (ReadCodeBytesSafe(code, first, sizeof(first))) {
+          oss << " addr=0x" << std::hex << reinterpret_cast<uintptr_t>(code)
+              << " bytes=" << HexBytes(first, sizeof(first));
+        }
+        else {
+          oss << " addr=0x" << std::hex << reinterpret_cast<uintptr_t>(code) << " bytes=<unreadable>";
+        }
+      }
+      out_results.push_back(oss.str());
+      ++hits;
+      if (hits >= 1024) break;
+    }
+    if (hits >= 1024) break;
+  }
+
+  std::ostringstream log;
+  log << "ProbeCollectorMethods '" << keyword << "': lines=" << hits;
+  AppendLog(log.str());
+  return hits > 0;
+}
+
+bool MonoPatchCollectorGetters(int forced_value, std::vector<std::string>& out_results) {
+  out_results.clear();
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) return false;
+  if (!g_mono.mono_class_get_methods || !g_mono.mono_method_get_name || !g_mono.mono_compile_method) {
+    return false;
+  }
+
+  struct TargetCls {
+    MonoClass* cls;
+    const char* name;
+  };
+  TargetCls targets[] = {
+    { g_round_director_class, "RoundDirector" },
+    { g_extraction_point_class, "ExtractionPoint" },
+    { g_phys_grab_cart_class, "PhysGrabCart" },
+    { g_currency_ui_class, "CurrencyUI" },
+  };
+
+  int patched = 0;
+  for (const auto& t : targets) {
+    if (!t.cls) continue;
+    void* iter = nullptr;
+    MonoMethod* m = nullptr;
+    while ((m = g_mono.mono_class_get_methods(t.cls, &iter)) != nullptr) {
+      const char* nm_raw = g_mono.mono_method_get_name(m);
+      if (!nm_raw) continue;
+      std::string nm(nm_raw);
+      if (!IsCollectorKeywordHit(nm)) continue;
+      if (CaseContains(nm, "set") || CaseContains(nm, "update") || CaseContains(nm, "refresh") ||
+          CaseContains(nm, "awake") || CaseContains(nm, "late")) {
+        continue;
+      }
+
+      const int argc = GetMethodParamCount(m);
+      if (argc > 2) continue;
+
+      const int tc = GetMethodReturnTypeCode(m);
+      if (tc >= 0 && !IsIntLikeTypeCode(tc)) {
+        continue;
+      }
+
+      void* code = g_mono.mono_compile_method(m);
+      if (!code) continue;
+      if (g_collector_getter_patches.find(code) != g_collector_getter_patches.end()) {
+        continue;
+      }
+      CodePatchBackup backup{};
+      if (!PatchCodeToReturnInt(code, forced_value, backup)) {
+        continue;
+      }
+      g_collector_getter_patches.emplace(code, backup);
+      std::ostringstream oss;
+      oss << "patched " << t.name << "::" << nm << " addr=0x" << std::hex
+          << reinterpret_cast<uintptr_t>(code) << " => " << std::dec << forced_value;
+      out_results.push_back(oss.str());
+      ++patched;
+      if (patched >= 64) break;
+    }
+    if (patched >= 64) break;
+  }
+
+  std::ostringstream log;
+  log << "PatchCollectorGetters: patched=" << patched << " forced=" << forced_value;
+  AppendLog(log.str());
+  return patched > 0;
+}
+
+bool MonoRestoreCollectorGetterPatches(std::vector<std::string>& out_results) {
+  out_results.clear();
+  int restored = 0;
+  for (auto it = g_collector_getter_patches.begin(); it != g_collector_getter_patches.end(); ++it) {
+    void* addr = it->first;
+    const CodePatchBackup& backup = it->second;
+    if (RestorePatchedCode(addr, backup)) {
+      std::ostringstream oss;
+      oss << "restored addr=0x" << std::hex << reinterpret_cast<uintptr_t>(addr);
+      out_results.push_back(oss.str());
+      ++restored;
+    }
+  }
+  g_collector_getter_patches.clear();
+
+  std::ostringstream log;
+  log << "RestoreCollectorGetterPatches: restored=" << restored;
+  AppendLog(log.str());
+  return restored > 0;
 }
 
 bool MonoGetLogs(int max_lines, std::vector<std::string>& out_logs) {
@@ -5264,7 +7019,7 @@ bool MonoReviveAllPlayers(bool include_local) {
     if (!CacheManagedRefs()) return false;
     if (!g_player_avatar_is_local_field || !g_player_avatar_health_field) return false;
 
-    // 获取玩家列表（与 MonoListPlayers 相同来源）
+// Non-ASCII comment normalized.
     MonoObject* list_obj = nullptr;
     if (g_game_director_instance_field && g_game_director_player_list_field && g_game_director_vtable) {
       MonoObject* director = nullptr;
@@ -5312,7 +7067,7 @@ bool MonoReviveAllPlayers(bool include_local) {
       if (g_player_health_max_field) {
         g_mono.mono_field_set_value(health_obj, g_player_health_max_field, &max_hp);
       }
-      // 给一点无敌时间，避免刚复活又倒地
+// Non-ASCII comment normalized.
       if (g_player_health_invincible_set) {
         float dur = 5.0f;
         MonoObject* exc = nullptr;
@@ -5338,7 +7093,7 @@ bool MonoReviveAllPlayers(bool include_local) {
       }
     }
     else {
-      // fallback: 枚举器
+// Non-ASCII comment normalized.
       EnumerateListObjects(list_obj, [&](MonoObject* avatar) -> bool {
         if (revive_avatar(avatar)) {
           ++revived;
@@ -5534,7 +7289,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
   const uint64_t kBudgetMs = 30;  // keep under ~30ms to avoid hitching Present thread
 
   auto call_new_on_array = [&](MonoArray* arr) {
-    if (!arr || arr->max_length <= 0) return 0;
+    if (!IsValidArray(arr)) return 0;
     int limit = static_cast<int>(arr->max_length);
     if (max_items > 0 && limit > max_items) limit = max_items;
     if (limit > kObjCap) limit = kObjCap;
@@ -5554,7 +7309,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     return hit;
   };
 
-  // 1) 浼樺厛鐩存帴鏋氫妇 PhysGrabObject锛堝惈闈炴縺娲伙級
+// Non-ASCII comment normalized.
   int total_hit = 0;
   if (g_object_find_objects_of_type_include_inactive && pgo_type_obj) {
     bool include_inactive = true;
@@ -5564,7 +7319,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     total_hit += call_new_on_array(reinterpret_cast<MonoArray*>(arr_obj));
   }
 
-  // 2) 閫€鍖栵細OverlapSphere 鐗╃悊鎺㈡祴
+// Non-ASCII comment normalized.
   if (total_hit == 0 && g_physics_overlap_sphere && g_component_get_transform) {
     float center[3] = { 0.0f, 0.0f, 0.0f };
     PlayerState local_state{};
@@ -5589,7 +7344,11 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     }
     if (!exc && arr_obj && pgo_type_obj) {
       MonoArray* colliders = reinterpret_cast<MonoArray*>(arr_obj);
-      int limit = colliders ? static_cast<int>(colliders->max_length) : 0;
+      if (!IsValidArray(colliders)) {
+        out_count = total_hit;
+        return total_hit > 0;
+      }
+      int limit = static_cast<int>(colliders->max_length);
       if (limit > 4096) limit = 4096;
       for (int i = 0; i < limit; ++i) {
         if (GetTickCount64() - start_ms > kBudgetMs) {
@@ -5643,15 +7402,42 @@ bool MonoApplyValuableDiscoverPersistence(bool enable, float wait_seconds, int& 
   return true;
 }
 
-// SEH 瀹夊叏鍖呰锛岄槻姝㈣秺鐣屽穿婧?
+// Non-ASCII comment normalized.
 bool MonoTriggerValuableDiscoverSafe(int state, int max_items, int& out_count) {
   out_count = 0;
+  static uint64_t s_last_exception_ms = 0;
+  static int s_exception_burst = 0;
   try {
-    return MonoTriggerValuableDiscover(state, max_items, out_count);
+    bool ok = MonoTriggerValuableDiscover(state, max_items, out_count);
+    if (ok) {
+      s_exception_burst = 0;
+    }
+    return ok;
   }
   catch (...) {
+    const uint64_t now = GetTickCount64();
+    if (now - s_last_exception_ms > 5000) {
+      s_exception_burst = 0;
+    }
+    s_last_exception_ms = now;
+    ++s_exception_burst;
+
     g_native_highlight_failed = true;
-    g_overlay_disabled = true;
+    g_native_highlight_active = false;
+    {
+      std::ostringstream oss;
+      oss << "MonoTriggerValuableDiscoverSafe: exception, native highlight disabled"
+          << " burst=" << s_exception_burst;
+      AppendLogInternal(LogLevel::kError, "valuable", oss.str());
+    }
+
+    // Repeated faults in a short window likely indicate deeper corruption.
+    // Keep previous hard-fallback behavior only for burst failures.
+    if (s_exception_burst >= 3) {
+      g_overlay_disabled = true;
+      AppendLogInternal(LogLevel::kError, "valuable",
+                        "MonoTriggerValuableDiscoverSafe: repeated exceptions, overlay disabled");
+    }
     return false;
   }
 }
@@ -5662,6 +7448,10 @@ bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, i
     return MonoApplyValuableDiscoverPersistence(enable, wait_seconds, out_count);
   }
   catch (...) {
+    g_native_highlight_failed = true;
+    g_native_highlight_active = false;
+    AppendLogInternal(LogLevel::kWarn, "valuable",
+                      "MonoApplyValuableDiscoverPersistenceSafe: exception, native highlight disabled");
     return false;
   }
 }
@@ -5669,5 +7459,6 @@ bool MonoApplyValuableDiscoverPersistenceSafe(bool enable, float wait_seconds, i
 bool MonoNativeHighlightAvailable() {
   return !g_native_highlight_failed;
 }
+
 
 

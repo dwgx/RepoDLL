@@ -83,6 +83,7 @@ bool MonoSetJumpExtraDirect(int jump_count);
 bool MonoSetSpeedMultiplierDirect(float multiplier, float duration_seconds);
 bool MonoSetJumpForce(float force);
 bool MonoSetCartValue(int value);
+bool MonoSetCartValueSafe(int value);
 bool MonoSetGrabRange(float range);
 bool MonoSetGrabStrengthField(float strength);
 
@@ -94,8 +95,20 @@ struct RoundState {
   int goal{ 0 };
   int stage{ -1 };  // 未解析则为 -1
 };
+struct RoundProgressState {
+  bool ok{ false };
+  int completed{ 0 };
+  int total{ 0 };
+  int stage{ -1 };
+  bool all_completed{ false };
+};
 bool MonoGetRoundState(RoundState& out_state);
 bool MonoSetRoundState(int current, int goal = -1, int current_max = -1);
+bool MonoSetRoundStateSafe(int current, int goal = -1, int current_max = -1);
+bool MonoGetRoundProgress(RoundProgressState& out_state);
+bool MonoSetRoundProgress(int completed, int total, int stage = -1, int all_completed = -1);
+bool MonoSetRoundProgressSafe(int completed, int total, int stage = -1, int all_completed = -1);
+void MonoSetRoundHaulOverride(bool enabled, int current, int goal = -1);
 
 // Enumerate all PlayerAvatar instances; fills out_states with any player that has a position.
 bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local);
@@ -116,6 +129,11 @@ void MonoResetItemsDisabled();
 bool MonoManualRefreshItems(std::vector<PlayerState>& out_items);
 void MonoResetEnemiesDisabled();
 bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results);
+bool MonoScanMethodsWithBytes(const char* keyword, std::vector<std::string>& out_results);
+bool MonoDumpCollectorNumericFields(std::vector<std::string>& out_results);
+bool MonoProbeCollectorMethods(const char* keyword, std::vector<std::string>& out_results);
+bool MonoPatchCollectorGetters(int forced_value, std::vector<std::string>& out_results);
+bool MonoRestoreCollectorGetterPatches(std::vector<std::string>& out_results);
 bool MonoReviveAllPlayers(bool include_local);
 bool MonoGetLogs(int max_lines, std::vector<std::string>& out_logs);
 const std::string& MonoGetLogPath();

@@ -208,7 +208,10 @@ void RenderOverlay(bool* menu_open) {
   static int round_current_edit = 0;
   static int round_goal_edit = 0;
   static bool round_lock_enabled = false;
-  static uint64_t round_lock_last_tick = 0;
+  static int round_progress_completed_edit = 0;
+  static int round_progress_total_edit = 0;
+  static int round_stage_edit = 0;
+  static bool round_progress_all_completed_edit = false;
   static float speed_mult = 1.0f;      // 默认与游戏一致，不主动改动
   static int extra_jump_count = 0;     // 初始 0，用户开启时如未设值会自动提升
   static float jump_cooldown = 0.0f;   // 仅在用户修改后生效
@@ -227,8 +230,13 @@ void RenderOverlay(bool* menu_open) {
   static bool include_local_squad = true;
   static RoundState cached_round_state{};
   static bool has_round_state = false;
+  static RoundProgressState cached_round_progress{};
+  static bool has_round_progress = false;
   static uint64_t last_round_update = 0;
   static std::vector<std::string> debug_logs;
+  static std::vector<std::string> collector_scan_results;
+  static char collector_scan_kw[64] = "haul";
+  static int collector_force_value = 999999;
   static uint64_t last_log_update = 0;
   static int log_lines = 200;
   static SavedSettings saved{};
@@ -283,6 +291,7 @@ void RenderOverlay(bool* menu_open) {
   // Round/haul state refresh (关卡收集阶段)
   if (mono_ready && safe_to_refresh && now - last_round_update > 500) {
     RoundState rs{};
+    RoundProgressState rps{};
     if (MonoGetRoundState(rs) && rs.ok) {
       has_round_state = true;
       cached_round_state = rs;
@@ -300,6 +309,19 @@ void RenderOverlay(bool* menu_open) {
     }
     else {
       has_round_state = false;
+    }
+    if (MonoGetRoundProgress(rps) && rps.ok) {
+      has_round_progress = true;
+      cached_round_progress = rps;
+      if (!user_editing) {
+        round_progress_completed_edit = rps.completed;
+        round_progress_total_edit = rps.total;
+        if (rps.stage >= 0) round_stage_edit = rps.stage;
+        round_progress_all_completed_edit = rps.all_completed;
+      }
+    }
+    else {
+      has_round_progress = false;
     }
     last_round_update = now;
   }
@@ -345,7 +367,7 @@ void RenderOverlay(bool* menu_open) {
   if (mono_ready && auto_refresh_items && now - last_items_update > 60) {
     refresh_items();
   }
-  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 60) {
+  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 180) {
     refresh_enemies();
   }
   if (mono_ready && safe_to_refresh && now - last_squad_update > 500) {
@@ -355,14 +377,15 @@ void RenderOverlay(bool* menu_open) {
     refresh_matrices();
   }
 
-  // 关卡收集锁定：每 ~200ms 覆盖 currentHaul/haulGoal，绕过房主同步
-  if (mono_ready && round_lock_enabled && now - round_lock_last_tick > 200) {
-    RoundState rs{};
-    if (MonoGetRoundState(rs)) {
-      int target_goal = round_goal_edit > 0 ? round_goal_edit : (rs.goal > 0 ? rs.goal : round_current_edit);
+  if (mono_ready) {
+    if (round_lock_enabled) {
+      int target_goal = round_goal_edit > 0 ? round_goal_edit
+        : ((has_round_state && cached_round_state.goal > 0) ? cached_round_state.goal : round_current_edit);
       int target_cur = round_current_edit > 0 ? round_current_edit : target_goal;
-      MonoSetRoundState(target_cur, target_goal, target_cur);
-      round_lock_last_tick = now;
+      MonoSetRoundHaulOverride(true, target_cur, target_goal);
+    }
+    else {
+      MonoSetRoundHaulOverride(false, 0, -1);
     }
   }
 
@@ -530,7 +553,7 @@ void RenderOverlay(bool* menu_open) {
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text("金钱/推车价值");
+            ImGui::Text("金钱/总价值联动");
             ImGui::TableSetColumnIndex(1);
             bool money_commit = false;
             if (ImGui::InputInt("##money", &currency_edit, 0, 0,
@@ -543,7 +566,8 @@ void RenderOverlay(bool* menu_open) {
               money_commit = true;
             }
             if (money_commit) {
-              MonoSetCartValue(currency_edit);
+              MonoSetRunCurrency(currency_edit);
+              MonoSetCartValueSafe(currency_edit);
             }
             if (has_currency) {
               ImGui::SameLine();
@@ -584,9 +608,9 @@ void RenderOverlay(bool* menu_open) {
               round_apply = true;
             }
             if (round_apply) {
-              MonoSetRoundState(round_current_edit, round_goal_edit, round_current_edit);
+              MonoSetRoundStateSafe(round_current_edit, round_goal_edit, round_current_edit);
             }
-            ImGui::Checkbox("伪房主", &round_lock_enabled);
+            ImGui::Checkbox("超级补丁大法", &round_lock_enabled);
             ImGui::SameLine();
             ImGui::TextDisabled("ZW[ZIWEI]");
 
@@ -683,6 +707,103 @@ void RenderOverlay(bool* menu_open) {
             ImGui::TableSetColumnIndex(1);
 
             ImGui::EndTable();
+          }
+          ImGui::EndTabItem();
+        }
+
+        // 经济 / 关卡页
+        if (ImGui::BeginTabItem("经济/关卡")) {
+          SectionLabel("总金库");
+          if (has_currency) {
+            ImGui::TextDisabled("当前总金库: %d", current_currency);
+          }
+          else {
+            ImGui::TextDisabled("当前总金库: 无数据");
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("读取##econ_refresh_currency")) {
+            has_currency = MonoGetRunCurrency(current_currency);
+          }
+          ImGui::InputInt("目标金额##econ_currency", &currency_edit, 0, 0);
+          if (ImGui::Button("应用总金库##econ_apply_currency")) {
+            MonoSetRunCurrency(currency_edit);
+            has_currency = MonoGetRunCurrency(current_currency);
+          }
+
+          SectionLabel("收集器价格");
+          int display_stage = cached_round_state.stage;
+          if (display_stage < 0 && has_round_progress && cached_round_progress.completed >= 0) {
+            display_stage = cached_round_progress.completed;
+          }
+          if (has_round_state) {
+            ImGui::TextDisabled("当前: %d / 目标: %d / Max: %d / 阶段: %d",
+              cached_round_state.current,
+              cached_round_state.goal,
+              cached_round_state.current_max,
+              display_stage);
+          }
+          else {
+            ImGui::TextDisabled("RoundDirector 无数据（请在局内）");
+          }
+          ImGui::InputInt("收集器当前##econ_haul_cur", &round_current_edit, 0, 0);
+          ImGui::InputInt("收集器目标##econ_haul_goal", &round_goal_edit, 0, 0);
+          if (ImGui::Button("当前=目标##econ_copy_goal")) {
+            round_current_edit = round_goal_edit;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("应用收集器数值##econ_apply_haul")) {
+            MonoSetRoundStateSafe(round_current_edit, round_goal_edit, round_current_edit);
+          }
+          ImGui::Checkbox("锁定收集器(超级补丁大法)##econ_round_lock", &round_lock_enabled);
+          ImGui::TextDisabled("说明: 开启后会拦截 RoundDirector.Update 的重算，按你设定值显示。");
+
+          SectionLabel("关卡切换 / 进度");
+          int display_progress_stage = cached_round_progress.stage;
+          if (display_progress_stage < 0 && cached_round_progress.completed >= 0) {
+            display_progress_stage = cached_round_progress.completed;
+          }
+          if (has_round_progress) {
+            ImGui::TextDisabled("进度: %d / %d | allCompleted=%s | stage=%d",
+              cached_round_progress.completed,
+              cached_round_progress.total,
+              cached_round_progress.all_completed ? "true" : "false",
+              display_progress_stage);
+          }
+          else {
+            ImGui::TextDisabled("进度字段无数据（请在局内）");
+          }
+          ImGui::InputInt("已完成##econ_progress_done", &round_progress_completed_edit, 0, 0);
+          ImGui::InputInt("总节点##econ_progress_total", &round_progress_total_edit, 0, 0);
+          ImGui::InputInt("阶段##econ_progress_stage", &round_stage_edit, 0, 0);
+          ImGui::Checkbox("全部完成##econ_progress_all", &round_progress_all_completed_edit);
+          if (ImGui::Button("应用进度##econ_apply_progress")) {
+            MonoSetRoundProgressSafe(
+              round_progress_completed_edit,
+              round_progress_total_edit,
+              round_stage_edit,
+              round_progress_all_completed_edit ? 1 : 0);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("下一节点##econ_next_progress")) {
+            ++round_progress_completed_edit;
+            MonoSetRoundProgressSafe(
+              round_progress_completed_edit,
+              round_progress_total_edit,
+              round_stage_edit,
+              -1);
+          }
+          if (ImGui::Button("读取全部状态##econ_refresh_all")) {
+            has_currency = MonoGetRunCurrency(current_currency);
+            RoundState rs{};
+            if (MonoGetRoundState(rs) && rs.ok) {
+              has_round_state = true;
+              cached_round_state = rs;
+            }
+            RoundProgressState rps{};
+            if (MonoGetRoundProgress(rps) && rps.ok) {
+              has_round_progress = true;
+              cached_round_progress = rps;
+            }
           }
           ImGui::EndTabItem();
         }
@@ -898,6 +1019,50 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::BeginChild("log_view", ImVec2(0, ImGui::GetContentRegionAvail().y - 8.0f), true);
           for (const auto& line : debug_logs) {
+            ImGui::TextUnformatted(line.c_str());
+          }
+          ImGui::EndChild();
+
+          SectionLabel("收集器杀招扫描");
+          ImGui::InputText("关键词", collector_scan_kw, sizeof(collector_scan_kw));
+          if (ImGui::Button("扫描方法+机器码")) {
+            collector_scan_results.clear();
+            MonoScanMethodsWithBytes(collector_scan_kw, collector_scan_results);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("探测函数返回值")) {
+            collector_scan_results.clear();
+            MonoProbeCollectorMethods(collector_scan_kw, collector_scan_results);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Dump收集字段")) {
+            collector_scan_results.clear();
+            MonoDumpCollectorNumericFields(collector_scan_results);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("快速关键词")) {
+            collector_scan_results.clear();
+            static const char* kws[] = { "haul", "extract", "currency", "collector", "tax" };
+            for (const char* kw : kws) {
+              std::vector<std::string> tmp;
+              if (MonoScanMethodsWithBytes(kw, tmp)) {
+                collector_scan_results.push_back(std::string("== keyword: ") + kw + " ==");
+                collector_scan_results.insert(collector_scan_results.end(), tmp.begin(), tmp.end());
+              }
+            }
+          }
+          ImGui::InputInt("强制值", &collector_force_value, 0, 0);
+          if (ImGui::Button("杀招补丁: Getter=强制值")) {
+            collector_scan_results.clear();
+            MonoPatchCollectorGetters(collector_force_value, collector_scan_results);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("恢复Getter补丁")) {
+            collector_scan_results.clear();
+            MonoRestoreCollectorGetterPatches(collector_scan_results);
+          }
+          ImGui::BeginChild("collector_scan_view", ImVec2(0, 180.0f), true);
+          for (const auto& line : collector_scan_results) {
             ImGui::TextUnformatted(line.c_str());
           }
           ImGui::EndChild();
