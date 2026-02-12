@@ -116,7 +116,6 @@ namespace {
   static void __stdcall RoundDirectorUpdateHook(MonoObject* self);
   static void InstallRoundDirectorUpdateHook();
   static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value);
-  static bool ReadFieldNumber(MonoObject* obj, MonoClassField* field, int& out_v);
   static bool ComputeRunCurrencyBeforeForTarget(int target_haul, int& out_before);
   struct CodePatchBackup;
   static bool PatchCodeToReturnInt(void* addr, int forced, CodePatchBackup& backup);
@@ -3296,6 +3295,8 @@ namespace {
     return true;
   }
 }  // namespace
+
+static bool ReadFieldNumber(MonoObject* obj, MonoClassField* field, int& out_v);
 
 const std::string& MonoGetLogPath() {
   return InternalGetLogPath();
