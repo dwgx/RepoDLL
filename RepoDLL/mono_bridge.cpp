@@ -125,6 +125,10 @@ namespace {
   static bool RestoreSessionMasterPatches();
 #ifdef _MSC_VER
   static bool FieldGetBoolSafeSeh(MonoObject* obj, MonoClassField* field, bool& out_value);
+  static bool FieldGetObjectSafeSeh(MonoObject* obj, MonoClassField* field, MonoObject*& out_value);
+  static bool FieldStaticGetObjectSafeSeh(MonoVTable* vtable, MonoClassField* field, MonoObject*& out_value);
+  static bool FieldGetVector3SafeSeh(MonoObject* obj, MonoClassField* field,
+                                     float& out_x, float& out_y, float& out_z);
 #endif
 
   MonoApi g_mono;
@@ -144,8 +148,11 @@ namespace {
   MonoClassField* g_player_avatar_instance_field = nullptr;
   MonoClassField* g_player_avatar_transform_field = nullptr;
   MonoClassField* g_player_avatar_health_field = nullptr;
+  MonoClassField* g_player_avatar_name_field = nullptr;
   MonoClassField* g_player_avatar_steamid_field = nullptr;
   MonoClassField* g_player_avatar_physgrabber_field = nullptr;
+  MonoClassField* g_player_avatar_client_position_field = nullptr;
+  MonoClassField* g_player_avatar_client_position_current_field = nullptr;
 
   MonoClass* g_player_health_class = nullptr;
   MonoClassField* g_player_health_value_field = nullptr;
@@ -279,6 +286,7 @@ namespace {
   MonoMethod* g_photon_network_get_is_master_client = nullptr;
   MonoMethod* g_photon_network_get_local_player = nullptr;
   MonoMethod* g_photon_network_get_master_client = nullptr;
+  MonoMethod* g_photon_network_set_master_client = nullptr;
   MonoMethod* g_photon_network_get_in_room = nullptr;
   MonoMethod* g_photon_network_get_level_loading_progress = nullptr;
   MonoClass* g_photon_player_class = nullptr;
@@ -384,6 +392,10 @@ namespace {
   // Experimental method calls on RoundDirector/ExtractionPoint are crash-prone on some builds.
   // Keep disabled by default; rely on field writes for stability.
   constexpr bool k_enable_experimental_haul_method_calls = false;
+  // Disabled: forcing session/master authority is unstable and can desync RPC ownership.
+  constexpr bool k_enable_session_master_patch = false;
+  // Disabled: RPC-based grab upgrades can affect multiplayer ownership/state unexpectedly.
+  constexpr bool k_enable_grab_rpc_upgrades = false;
   struct CodePatchBackup {
     std::array<uint8_t, 16> bytes{};
     size_t size{ 0 };
@@ -1088,11 +1100,32 @@ namespace {
         AppendLog("Failed to resolve PlayerAvatar::steamID field");
       }
     }
+    if (g_player_avatar_class && !g_player_avatar_name_field) {
+      g_player_avatar_name_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_class, "playerName");
+      if (g_player_avatar_name_field) {
+        AppendLog("Resolved PlayerAvatar::playerName field");
+      }
+    }
     if (g_player_avatar_class && !g_player_avatar_physgrabber_field) {
       g_player_avatar_physgrabber_field = g_mono.mono_class_get_field_from_name(
         g_player_avatar_class, config::kPlayerAvatarPhysGrabberField);
       if (!g_player_avatar_physgrabber_field) {
         AppendLog("Failed to resolve PlayerAvatar::physGrabber field");
+      }
+    }
+    if (g_player_avatar_class && !g_player_avatar_client_position_field) {
+      g_player_avatar_client_position_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_class, "clientPosition");
+      if (g_player_avatar_client_position_field) {
+        AppendLog("Resolved PlayerAvatar::clientPosition field");
+      }
+    }
+    if (g_player_avatar_class && !g_player_avatar_client_position_current_field) {
+      g_player_avatar_client_position_current_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_class, "clientPositionCurrent");
+      if (g_player_avatar_client_position_current_field) {
+        AppendLog("Resolved PlayerAvatar::clientPositionCurrent field");
       }
     }
 
@@ -1691,6 +1724,13 @@ namespace {
         g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_MasterClient", 0);
       if (g_photon_network_get_master_client) {
         AppendLog("Resolved PhotonNetwork::get_MasterClient");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_set_master_client) {
+      g_photon_network_set_master_client =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "SetMasterClient", 1);
+      if (g_photon_network_set_master_client) {
+        AppendLog("Resolved PhotonNetwork::SetMasterClient");
       }
     }
     if (g_photon_network_class && !g_photon_network_get_in_room) {
@@ -2650,15 +2690,37 @@ namespace {
       return nullptr;
     }
 
-    g_mono.mono_field_static_get_value(g_game_director_vtable, g_game_director_instance_field,
-      &director_instance);
+    bool director_read_ok = true;
+#ifdef _MSC_VER
+    director_read_ok = FieldStaticGetObjectSafeSeh(
+      g_game_director_vtable, g_game_director_instance_field, director_instance);
+#else
+    g_mono.mono_field_static_get_value(
+      g_game_director_vtable, g_game_director_instance_field, &director_instance);
+#endif
+    if (!director_read_ok) {
+      AppendLogOnce("GameDirector_instance_read_fault",
+        "GameDirector::instance read triggered SEH");
+      return nullptr;
+    }
     if (!director_instance) {
       AppendLogOnce("GameDirector_instance_null", "GameDirector::instance is null");
       return nullptr;
     }
 
     MonoObject* player_list = nullptr;
+    bool list_read_ok = true;
+#ifdef _MSC_VER
+    list_read_ok = FieldGetObjectSafeSeh(
+      director_instance, g_game_director_player_list_field, player_list);
+#else
     g_mono.mono_field_get_value(director_instance, g_game_director_player_list_field, &player_list);
+#endif
+    if (!list_read_ok) {
+      AppendLogOnce("PlayerList_read_fault",
+        "GameDirector::PlayerList read triggered SEH");
+      return nullptr;
+    }
     if (!player_list) {
       AppendLogOnce("PlayerList_null", "GameDirector::PlayerList is null");
       return nullptr;
@@ -2807,20 +2869,78 @@ namespace {
       AppendLog("TryGetPosition: player_avatar_obj is null");
       return false;
     }
-    if (!g_player_avatar_transform_field) {
-      AppendLog("TryGetPosition: transform field unresolved");
+    if (IsUnityNull(player_avatar_obj)) {
       return false;
     }
 
-    MonoObject* transform_obj = nullptr;
-    g_mono.mono_field_get_value(player_avatar_obj, g_player_avatar_transform_field, &transform_obj);
-    if (!transform_obj) {
-      AppendLog("TryGetPosition: transform_obj is null");
-      return false;
+    // 1) Preferred path: PlayerAvatar.playerTransform (local avatar usually valid).
+    if (g_player_avatar_transform_field) {
+      MonoObject* transform_obj = nullptr;
+      bool transform_read_ok = true;
+#ifdef _MSC_VER
+      transform_read_ok = FieldGetObjectSafeSeh(
+        player_avatar_obj, g_player_avatar_transform_field, transform_obj);
+#else
+      g_mono.mono_field_get_value(player_avatar_obj, g_player_avatar_transform_field, &transform_obj);
+#endif
+      if (transform_read_ok && transform_obj &&
+          TryGetPositionFromTransform(transform_obj, out_state, false)) {
+        return true;
+      }
+      if (!transform_read_ok) {
+        AppendLogOnce("TryGetPosition_transform_read_fault",
+          "TryGetPosition: reading playerTransform triggered SEH");
+      }
     }
 
-    // Reuse generic transform path.
-    return TryGetPositionFromTransform(transform_obj, out_state);
+    // 2) Fallback path: Component.get_transform() (works for remote avatars).
+    if (g_component_get_transform) {
+      MonoObject* transform_obj = SafeInvoke(
+        g_component_get_transform, player_avatar_obj, nullptr, "PlayerAvatar.get_transform");
+      if (transform_obj && TryGetPositionFromTransform(transform_obj, out_state, false)) {
+        return true;
+      }
+    }
+
+    // 3) Last fallback: network interpolation fields on PlayerAvatar.
+    auto try_read_client_vec = [&](MonoClassField* field, const char* log_key) -> bool {
+      if (!field) return false;
+      float x = 0.0f;
+      float y = 0.0f;
+      float z = 0.0f;
+#ifdef _MSC_VER
+      if (!FieldGetVector3SafeSeh(player_avatar_obj, field, x, y, z)) {
+        return false;
+      }
+#else
+      float raw[3] = {};
+      g_mono.mono_field_get_value(player_avatar_obj, field, raw);
+      x = raw[0];
+      y = raw[1];
+      z = raw[2];
+#endif
+      if (!(x == x) || !(y == y) || !(z == z)) return false;
+      out_state.x = x;
+      out_state.y = y;
+      out_state.z = z;
+      out_state.has_position = true;
+      AppendLogOnce(log_key,
+        "TryGetPosition: using PlayerAvatar clientPosition fallback");
+      return true;
+    };
+
+    if (try_read_client_vec(g_player_avatar_client_position_current_field,
+                            "TryGetPosition_client_pos_current")) {
+      return true;
+    }
+    if (try_read_client_vec(g_player_avatar_client_position_field,
+                            "TryGetPosition_client_pos")) {
+      return true;
+    }
+
+    AppendLogOnce("TryGetPosition_transform_null",
+      "TryGetPosition: playerTransform/get_transform/clientPosition all unavailable");
+    return false;
   }
 
   bool UnityHelperReadEnemySnapshot(std::vector<PlayerState>& out_enemies) {
@@ -3212,6 +3332,57 @@ namespace {
       return false;
     }
   }
+
+  static bool FieldGetObjectSafeSeh(MonoObject* obj, MonoClassField* field, MonoObject*& out_value) {
+    out_value = nullptr;
+    if (!obj || !field || !g_mono.mono_field_get_value) {
+      return false;
+    }
+    __try {
+      g_mono.mono_field_get_value(obj, field, &out_value);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = nullptr;
+      return false;
+    }
+  }
+
+  static bool FieldStaticGetObjectSafeSeh(MonoVTable* vtable, MonoClassField* field, MonoObject*& out_value) {
+    out_value = nullptr;
+    if (!vtable || !field || !g_mono.mono_field_static_get_value) {
+      return false;
+    }
+    __try {
+      g_mono.mono_field_static_get_value(vtable, field, &out_value);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = nullptr;
+      return false;
+    }
+  }
+
+  static bool FieldGetVector3SafeSeh(MonoObject* obj, MonoClassField* field,
+                                     float& out_x, float& out_y, float& out_z) {
+    out_x = 0.0f;
+    out_y = 0.0f;
+    out_z = 0.0f;
+    if (!obj || !field || !g_mono.mono_field_get_value) {
+      return false;
+    }
+    float raw[3] = {};
+    __try {
+      g_mono.mono_field_get_value(obj, field, raw);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+    out_x = raw[0];
+    out_y = raw[1];
+    out_z = raw[2];
+    return true;
+  }
 #endif
 
   bool TryGetHealth(MonoObject* player_avatar_obj, PlayerState& out_state) {
@@ -3333,6 +3504,10 @@ bool MonoBeginShutdown() {
   g_shutting_down = true;
   g_pending_cart_active = false;
   g_cart_apply_in_progress = false;
+  if (g_session_master_patch_active) {
+    RestoreSessionMasterPatches();
+    g_session_master_patch_active = false;
+  }
   if (g_round_update_patch_active && g_round_update_patch_addr &&
       g_round_update_patch_backup.size > 0) {
     RestorePatchedCode(g_round_update_patch_addr, g_round_update_patch_backup);
@@ -3361,8 +3536,24 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
 
   // Prefer static instance first: stable and cheap.
   if (!local_player && g_player_avatar_instance_field && g_player_avatar_vtable) {
+    bool local_read_ok = true;
+#ifdef _MSC_VER
+    local_read_ok = FieldStaticGetObjectSafeSeh(
+      g_player_avatar_vtable, g_player_avatar_instance_field, local_player);
+#else
     g_mono.mono_field_static_get_value(
       g_player_avatar_vtable, g_player_avatar_instance_field, &local_player);
+#endif
+    if (!local_read_ok) {
+      AppendLogOnce("localplayer_static_read_fault",
+        "PlayerAvatar static instance read triggered SEH");
+      local_player = nullptr;
+    }
+    if (local_player && IsUnityNull(local_player)) {
+      AppendLogOnce("localplayer_static_unity_null",
+        "PlayerAvatar static instance is Unity-null, fallback to other strategies");
+      local_player = nullptr;
+    }
     if (local_player) {
       AppendLogOnce("localplayer_static_resolved",
         "Local player resolved via PlayerAvatar static instance");
@@ -3393,6 +3584,13 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
         "SemiFunc::PlayerAvatarLocal threw an exception");
     }
     else if (local_player) {
+      if (IsUnityNull(local_player)) {
+        AppendLogOnce("localplayer_method_unity_null",
+          "SemiFunc::PlayerAvatarLocal returned Unity-null object");
+        local_player = nullptr;
+      }
+    }
+    if (local_player) {
       AppendLogOnce("localplayer_method_resolved",
         "Local player resolved via SemiFunc::PlayerAvatarLocal");
     }
@@ -3405,6 +3603,13 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
   // Last fallback: PlayerList traversal can be noisy/unstable in some sessions.
   if (!local_player) {
     local_player = FindLocalPlayerFromList();
+    if (local_player) {
+      if (IsUnityNull(local_player)) {
+        AppendLogOnce("localplayer_list_unity_null",
+          "PlayerList returned Unity-null local player");
+        local_player = nullptr;
+      }
+    }
     if (local_player) {
       via_list = true;
     }
@@ -3453,7 +3658,16 @@ static bool MonoGetLocalPlayerInternalSafe(LocalPlayerInfo& out_info) {
 
 bool MonoGetLocalPlayer(LocalPlayerInfo& out_info) {
 #ifdef _MSC_VER
-  bool ok = MonoGetLocalPlayerInternalSafe(out_info);
+  bool ok = false;
+  try {
+    ok = MonoGetLocalPlayerInternalSafe(out_info);
+  }
+  catch (...) {
+    out_info = {};
+    ok = false;
+    AppendLogOnce("MonoGetLocalPlayer_cpp_guard",
+      "MonoGetLocalPlayer caught C++ exception and returned false");
+  }
   if (!ok) {
     AppendLogOnce("MonoGetLocalPlayer_seh_guard",
       "MonoGetLocalPlayer caught SEH and returned false (guard active)");
@@ -3475,10 +3689,47 @@ bool MonoGetPlayerStateFromAvatar(void* player_avatar_obj, PlayerState& out_stat
     return false;
   }
 
-  bool ok_position = TryGetPosition(static_cast<MonoObject*>(player_avatar_obj), out_state);
-  bool ok_health = TryGetHealth(static_cast<MonoObject*>(player_avatar_obj), out_state);
-  bool ok_energy = TryGetEnergy(static_cast<MonoObject*>(player_avatar_obj), out_state);
-  return ok_position || ok_health || ok_energy;
+  out_state.object = player_avatar_obj;
+  out_state.has_object = true;
+  MonoObject* avatar_obj = static_cast<MonoObject*>(player_avatar_obj);
+  if (IsUnityNull(avatar_obj)) {
+    return false;
+  }
+  if (g_player_avatar_name_field) {
+    MonoObject* name_obj = nullptr;
+#ifdef _MSC_VER
+    FieldGetObjectSafeSeh(avatar_obj, g_player_avatar_name_field, name_obj);
+#else
+    g_mono.mono_field_get_value(avatar_obj, g_player_avatar_name_field, &name_obj);
+#endif
+    if (name_obj) {
+      out_state.name = MonoStringToUtf8(name_obj);
+      out_state.has_name = !out_state.name.empty();
+    }
+  }
+  if (g_player_avatar_steamid_field) {
+    MonoObject* steam_obj = nullptr;
+#ifdef _MSC_VER
+    FieldGetObjectSafeSeh(avatar_obj, g_player_avatar_steamid_field, steam_obj);
+#else
+    g_mono.mono_field_get_value(avatar_obj, g_player_avatar_steamid_field, &steam_obj);
+#endif
+    if (steam_obj) {
+      out_state.steam_id = MonoStringToUtf8(steam_obj);
+      out_state.has_steam_id = !out_state.steam_id.empty();
+      if (!out_state.has_name && out_state.has_steam_id) {
+        out_state.name = out_state.steam_id;
+        out_state.has_name = true;
+      }
+    }
+  }
+
+  bool ok_position = TryGetPosition(avatar_obj, out_state);
+  bool ok_health = TryGetHealth(avatar_obj, out_state);
+  bool ok_energy = TryGetEnergy(avatar_obj, out_state);
+  const bool has_any_state =
+    ok_position || ok_health || ok_energy || out_state.has_name || out_state.has_steam_id;
+  return has_any_state || out_state.has_object;
 }
 
 bool MonoGetLocalPlayerState(PlayerState& out_state) {
@@ -3543,6 +3794,52 @@ bool MonoSetLocalPlayerPosition(float x, float y, float z) {
   return true;
 }
 
+bool MonoSetPlayerAvatarPosition(void* player_avatar_obj, float x, float y, float z) {
+  if (!player_avatar_obj) {
+    AppendLog("MonoSetPlayerAvatarPosition: player_avatar_obj is null");
+    return false;
+  }
+  if (!CacheManagedRefs()) {
+    AppendLog("MonoSetPlayerAvatarPosition: CacheManagedRefs failed");
+    return false;
+  }
+  if (!g_player_avatar_transform_field) {
+    AppendLog("MonoSetPlayerAvatarPosition: transform field unresolved");
+    return false;
+  }
+
+  MonoObject* transform_obj = nullptr;
+  g_mono.mono_field_get_value(static_cast<MonoObject*>(player_avatar_obj),
+    g_player_avatar_transform_field, &transform_obj);
+  if (!transform_obj) {
+    AppendLog("MonoSetPlayerAvatarPosition: transform_obj is null");
+    return false;
+  }
+
+  MonoClass* transform_class = g_mono.mono_object_get_class(transform_obj);
+  if (!transform_class) {
+    AppendLog("MonoSetPlayerAvatarPosition: transform_class is null");
+    return false;
+  }
+
+  MonoMethod* set_position = g_mono.mono_class_get_method_from_name(
+    transform_class, config::kTransformSetPositionMethod, 1);
+  if (!set_position) {
+    AppendLog("MonoSetPlayerAvatarPosition: set_position method not found");
+    return false;
+  }
+
+  float vec[3] = { x, y, z };
+  void* args[1] = { vec };
+  MonoObject* exception = nullptr;
+  g_mono.mono_runtime_invoke(set_position, transform_obj, args, &exception);
+  if (exception) {
+    AppendLog("MonoSetPlayerAvatarPosition: mono_runtime_invoke set_position threw");
+    return false;
+  }
+  return true;
+}
+
 bool MonoSetLocalPlayerHealth(int health, int max_health) {
   LocalPlayerInfo info;
   if (!MonoGetLocalPlayer(info) || !info.object) {
@@ -3581,6 +3878,41 @@ bool MonoSetLocalPlayerHealth(int health, int max_health) {
   }
   else {
     AppendLog("MonoSetLocalPlayerHealth: maxHealth field unresolved");
+  }
+  return true;
+}
+
+bool MonoSetPlayerAvatarHealth(void* player_avatar_obj, int health, int max_health) {
+  if (!player_avatar_obj) {
+    AppendLog("MonoSetPlayerAvatarHealth: player_avatar_obj is null");
+    return false;
+  }
+  if (!CacheManagedRefs()) {
+    AppendLog("MonoSetPlayerAvatarHealth: CacheManagedRefs failed");
+    return false;
+  }
+  if (!g_player_avatar_health_field) {
+    AppendLog("MonoSetPlayerAvatarHealth: health field unresolved");
+    return false;
+  }
+  if (!g_mono.mono_field_set_value) {
+    AppendLog("MonoSetPlayerAvatarHealth: mono_field_set_value not available");
+    return false;
+  }
+
+  MonoObject* health_obj = nullptr;
+  g_mono.mono_field_get_value(static_cast<MonoObject*>(player_avatar_obj),
+    g_player_avatar_health_field, &health_obj);
+  if (!health_obj) {
+    AppendLog("MonoSetPlayerAvatarHealth: health_obj is null");
+    return false;
+  }
+
+  if (g_player_health_value_field) {
+    g_mono.mono_field_set_value(health_obj, g_player_health_value_field, &health);
+  }
+  if (g_player_health_max_field) {
+    g_mono.mono_field_set_value(health_obj, g_player_health_max_field, &max_health);
   }
   return true;
 }
@@ -3719,7 +4051,13 @@ static MonoObject* GetStaticSingletonInstance(MonoVTable* vtable, MonoClassField
     return nullptr;
   }
   MonoObject* instance = nullptr;
+#ifdef _MSC_VER
+  if (!FieldStaticGetObjectSafeSeh(vtable, field, instance)) {
+    return nullptr;
+  }
+#else
   g_mono.mono_field_static_get_value(vtable, field, &instance);
+#endif
   return instance;
 }
 
@@ -3730,8 +4068,10 @@ static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& 
     return false;
   }
 
+  bool in_room_known = false;
   bool in_room = true;
   if (InvokeStaticBoolMethod(g_photon_network_get_in_room, in_room)) {
+    in_room_known = true;
     if (!in_room) {
       out_transitioning = true;
       out_reason = "PhotonNetwork.InRoom=false";
@@ -3748,54 +4088,41 @@ static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& 
     }
   }
 
+  int value = 0;
   MonoObject* run_manager =
     GetStaticSingletonInstance(g_run_manager_vtable, g_run_manager_instance_field);
-  if (!run_manager) {
-    out_transitioning = true;
-    out_reason = "RunManager.instance=null";
-    return true;
-  }
-
-  int value = 0;
-  if (g_run_manager_restarting_field &&
-      ReadFieldNumber(run_manager, g_run_manager_restarting_field, value) && value != 0) {
-    out_transitioning = true;
-    out_reason = "RunManager.restarting";
-    return true;
-  }
-  if (g_run_manager_wait_to_change_scene_field &&
-      ReadFieldNumber(run_manager, g_run_manager_wait_to_change_scene_field, value) && value != 0) {
-    out_transitioning = true;
-    out_reason = "RunManager.waitToChangeScene";
-    return true;
-  }
-  if (g_run_manager_lobby_join_field &&
-      ReadFieldNumber(run_manager, g_run_manager_lobby_join_field, value) && value != 0) {
-    out_transitioning = true;
-    out_reason = "RunManager.lobbyJoin";
-    return true;
+  if (run_manager) {
+    if (g_run_manager_restarting_field &&
+        ReadFieldNumber(run_manager, g_run_manager_restarting_field, value) && value != 0) {
+      out_transitioning = true;
+      out_reason = "RunManager.restarting";
+      return true;
+    }
+    if (g_run_manager_wait_to_change_scene_field &&
+        ReadFieldNumber(run_manager, g_run_manager_wait_to_change_scene_field, value) && value != 0) {
+      out_transitioning = true;
+      out_reason = "RunManager.waitToChangeScene";
+      return true;
+    }
+    if (g_run_manager_lobby_join_field &&
+        ReadFieldNumber(run_manager, g_run_manager_lobby_join_field, value) && value != 0) {
+      out_transitioning = true;
+      out_reason = "RunManager.lobbyJoin";
+      return true;
+    }
   }
 
   MonoObject* game_director =
     GetStaticSingletonInstance(g_game_director_vtable, g_game_director_instance_field);
-  if (!game_director) {
-    out_transitioning = true;
-    out_reason = "GameDirector.instance=null";
-    return true;
-  }
-
   constexpr int k_game_state_load = 0;
   constexpr int k_game_state_end_wait = 5;
-  if (!g_game_director_current_state_field) {
-    out_transitioning = true;
-    out_reason = "GameDirector.currentState unresolved";
-    return true;
-  }
-  if (ReadFieldNumber(game_director, g_game_director_current_state_field, value)) {
-    if (value == k_game_state_load || value == k_game_state_end_wait) {
-      out_transitioning = true;
-      out_reason = "GameDirector.currentState=Load/EndWait";
-      return true;
+  if (game_director && g_game_director_current_state_field) {
+    if (ReadFieldNumber(game_director, g_game_director_current_state_field, value)) {
+      if (value == k_game_state_load || value == k_game_state_end_wait) {
+        out_transitioning = true;
+        out_reason = "GameDirector.currentState=Load/EndWait";
+        return true;
+      }
     }
   }
 
@@ -3808,18 +4135,14 @@ static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& 
       out_reason = "LevelGenerator.Generated=false";
       return true;
     }
-    constexpr int k_level_state_done = 14;
-    if (g_level_generator_state_field &&
-        ReadFieldNumber(level_generator, g_level_generator_state_field, value) &&
-        value != k_level_state_done) {
-      out_transitioning = true;
-      out_reason = "LevelGenerator.State!=Done";
-      return true;
-    }
   }
 
+  if (!in_room_known) {
+    out_reason = "stable(InRoomUnknown)";
+  } else {
+    out_reason = "stable";
+  }
   out_transitioning = false;
-  out_reason = "stable";
   return true;
 }
 
@@ -3900,6 +4223,64 @@ static void LogPhotonAuthoritySnapshot(const char* tag) {
   }
 }
 
+static bool TryRequestPhotonMasterForLocal(const char* tag) {
+  bool is_master_client = false;
+  bool local_equals_master = false;
+  int local_actor = -1;
+  int master_actor = -1;
+  if (!GetPhotonAuthoritySnapshot(
+        is_master_client, local_equals_master, local_actor, master_actor)) {
+    return false;
+  }
+  if (is_master_client || local_equals_master) {
+    return true;
+  }
+  if (!g_photon_network_set_master_client || !g_photon_network_get_local_player ||
+      !g_mono.mono_runtime_invoke) {
+    AppendLogOnce("PhotonSetMasterClient_unresolved",
+      "PhotonNetwork::SetMasterClient unresolved (real master handover unavailable)");
+    return false;
+  }
+
+  MonoObject* exc = nullptr;
+  MonoObject* local_player =
+    g_mono.mono_runtime_invoke(g_photon_network_get_local_player, nullptr, nullptr, &exc);
+  if (exc || !local_player) {
+    AppendLogOnce("PhotonSetMasterClient_local_missing",
+      "PhotonNetwork::LocalPlayer unavailable when requesting master handover");
+    return false;
+  }
+
+  void* args[1] = { local_player };
+  exc = nullptr;
+  MonoObject* boxed =
+    g_mono.mono_runtime_invoke(g_photon_network_set_master_client, nullptr, args, &exc);
+  if (exc) {
+    AppendLogOnce("PhotonSetMasterClient_throw",
+      "PhotonNetwork::SetMasterClient threw exception");
+    return false;
+  }
+
+  bool request_ok = true;
+  if (boxed && g_mono.mono_object_unbox) {
+    void* raw = g_mono.mono_object_unbox(boxed);
+    if (raw) {
+      request_ok = (*static_cast<uint8_t*>(raw) != 0);
+    }
+  }
+
+  std::ostringstream oss;
+  oss << (tag ? tag : "TryRequestPhotonMasterForLocal")
+      << ": request SetMasterClient(localActor=" << local_actor
+      << ", currentMasterActor=" << master_actor
+      << ") => " << (request_ok ? "accepted" : "rejected");
+  std::ostringstream key;
+  key << "PhotonSetMasterClientReq_" << local_actor << "_" << master_actor << "_"
+      << (request_ok ? 1 : 0);
+  AppendLogOnce(key.str(), oss.str());
+  return request_ok;
+}
+
 bool SetRunCurrencyViaPunManager(int amount) {
   if (!g_pun_set_run_stat_set || !g_pun_manager_instance_field || !g_pun_manager_vtable ||
     !g_mono.mono_string_new) {
@@ -3945,8 +4326,52 @@ bool MonoIsSessionTransitioning() {
   return transitioning;
 }
 
+bool MonoIsRealMasterClient() {
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) {
+    return false;
+  }
+  bool is_master_client = false;
+  bool local_equals_master = false;
+  int local_actor = -1;
+  int master_actor = -1;
+  if (!GetPhotonAuthoritySnapshot(
+        is_master_client, local_equals_master, local_actor, master_actor)) {
+    return false;
+  }
+  if (local_actor < 0 || master_actor < 0) {
+    return false;
+  }
+  return is_master_client && local_equals_master && (local_actor == master_actor);
+}
+
 bool MonoSetSessionMaster(bool enable) {
+  if (!k_enable_session_master_patch) {
+    if (enable) {
+      AppendLogOnce("SessionMasterPatch_feature_disabled",
+        "MonoSetSessionMaster: feature disabled for stability (no RPC/master patch will be applied)");
+      if (g_session_master_patch_active) {
+        RestoreSessionMasterPatches();
+        g_session_master_patch_active = false;
+      }
+      return false;
+    }
+    if (g_session_master_patch_active) {
+      bool ok = RestoreSessionMasterPatches();
+      g_session_master_patch_active = false;
+      return ok;
+    }
+    return true;
+  }
+
   if (enable && g_session_master_patch_active) {
+    if (!CacheManagedRefs()) {
+      AppendLog("MonoSetSessionMaster: CacheManagedRefs failed while refreshing active patch");
+      return false;
+    }
+    TryRequestPhotonMasterForLocal("MonoSetSessionMaster(refresh)");
+    if (ApplySessionMasterPatches()) {
+      AppendLog("MonoSetSessionMaster: refreshed active session-master patches");
+    }
     return true;
   }
   if (!enable && !g_session_master_patch_active) {
@@ -3962,6 +4387,7 @@ bool MonoSetSessionMaster(bool enable) {
   AppendLog(request_log.str());
   LogPhotonAuthoritySnapshot("MonoSetSessionMaster(before)");
   if (enable) {
+    TryRequestPhotonMasterForLocal("MonoSetSessionMaster(enable)");
     if (!ApplySessionMasterPatches()) {
       AppendLog("MonoSetSessionMaster: patch application failed");
       RestoreSessionMasterPatches();
@@ -5157,64 +5583,59 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
         << " throw=" << throw_strength;
     AppendLog(req.str());
   }
-  if (!g_pun_upgrade_grab_strength && !g_pun_upgrade_throw_strength) {
-    static bool logged = false;
-    if (!logged) {
-      AppendLog("MonoSetGrabStrength: methods unresolved");
-      logged = true;
-    }
-    // fall through to local field patch
-  }
-
-  LocalPlayerInfo info;
-  if (!MonoGetLocalPlayer(info) || !info.object) {
-    AppendLog("MonoSetGrabStrength: failed to get local player");
-    return false;
-  }
-  if (!g_player_avatar_steamid_field) {
-    AppendLog("MonoSetGrabStrength: steamID field unresolved");
-    return false;
-  }
-  void* steam_str = nullptr;
-  g_mono.mono_field_get_value(static_cast<MonoObject*>(info.object),
-    g_player_avatar_steamid_field, &steam_str);
-  if (!steam_str) {
-    AppendLog("MonoSetGrabStrength: steamID is null");
-    return false;
-  }
-
   bool ok = false;
-  MonoObject* pun_instance = GetPunManagerInstance();
-  if ((g_pun_upgrade_grab_strength || g_pun_upgrade_throw_strength) && !pun_instance) {
-    AppendLog("MonoSetGrabStrength: PunManager::instance is null");
-  }
-  if (g_pun_upgrade_grab_strength) {
-    void* args[2] = { steam_str, &grab_strength };
-    MonoObject* exc = nullptr;
-    g_mono.mono_runtime_invoke(g_pun_upgrade_grab_strength, pun_instance, args, &exc);
-    if (exc) {
-      AppendLog("MonoSetGrabStrength: UpgradePlayerGrabStrength threw exception");
-    } else {
-      ok = true;
+  if (k_enable_grab_rpc_upgrades) {
+    if (!g_pun_upgrade_grab_strength && !g_pun_upgrade_throw_strength) {
+      static bool logged = false;
+      if (!logged) {
+        AppendLog("MonoSetGrabStrength: methods unresolved");
+        logged = true;
+      }
+    }
+    LocalPlayerInfo info;
+    if (!MonoGetLocalPlayer(info) || !info.object) {
+      AppendLog("MonoSetGrabStrength: failed to get local player");
+      return false;
+    }
+    if (!g_player_avatar_steamid_field) {
+      AppendLog("MonoSetGrabStrength: steamID field unresolved");
+      return false;
+    }
+    void* steam_str = nullptr;
+    g_mono.mono_field_get_value(static_cast<MonoObject*>(info.object),
+      g_player_avatar_steamid_field, &steam_str);
+    if (!steam_str) {
+      AppendLog("MonoSetGrabStrength: steamID is null");
+      return false;
+    }
+    MonoObject* pun_instance = GetPunManagerInstance();
+    if ((g_pun_upgrade_grab_strength || g_pun_upgrade_throw_strength) && !pun_instance) {
+      AppendLog("MonoSetGrabStrength: PunManager::instance is null");
+    }
+    if (g_pun_upgrade_grab_strength) {
+      void* args[2] = { steam_str, &grab_strength };
+      MonoObject* exc = nullptr;
+      g_mono.mono_runtime_invoke(g_pun_upgrade_grab_strength, pun_instance, args, &exc);
+      if (!exc) {
+        ok = true;
+      }
+    }
+    if (g_pun_upgrade_throw_strength) {
+      void* args[2] = { steam_str, &throw_strength };
+      MonoObject* exc = nullptr;
+      g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, pun_instance, args, &exc);
+      if (!exc) {
+        ok = true;
+      }
     }
   }
-  if (g_pun_upgrade_throw_strength) {
-    void* args[2] = { steam_str, &throw_strength };
-    MonoObject* exc = nullptr;
-    g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, pun_instance, args, &exc);
-    if (exc) {
-      AppendLog("MonoSetGrabStrength: UpgradePlayerThrowStrength threw exception");
-    } else {
-      ok = true;
-    }
-  }
-// Non-ASCII comment normalized.
-// Non-ASCII comment normalized.
-  float desired = 0.2f * static_cast<float>(grab_strength);
+
+  const int clamped_grab = std::clamp(grab_strength, 1, 300);
+  float desired = 0.2f * static_cast<float>(clamped_grab);
   bool field_ok = MonoSetGrabStrengthField(desired);
 
   if (!ok) {
-    AppendLog("MonoSetGrabStrength: RPC failed, applied local field fallback only");
+    AppendLog("MonoSetGrabStrength: applied local field only (RPC path disabled)");
   } else {
     AppendLog("MonoSetGrabStrength: PunManager upgrade invoke succeeded");
   }
@@ -5945,14 +6366,67 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
   }
 
   MonoObject* list_obj = nullptr;
+  int added_from_list = 0;
+  int added_from_scan = 0;
+  int added_from_local_fallback = 0;
+  std::unordered_set<MonoObject*> seen;
+  auto add_player = [&](MonoObject* player) -> bool {
+    if (!player) return false;
+    if (IsUnityNull(player)) return false;
+    if (!seen.insert(player).second) return false;
+    bool is_local = false;
+    if (g_player_avatar_is_local_field) {
+#ifdef _MSC_VER
+      bool read_ok = FieldGetBoolSafeSeh(player, g_player_avatar_is_local_field, is_local);
+      if (!read_ok) {
+        return false;
+      }
+#else
+      g_mono.mono_field_get_value(player, g_player_avatar_is_local_field, &is_local);
+#endif
+    }
+    if (!include_local && is_local) {
+      return false;
+    }
+    PlayerState state{};
+    state.is_local = is_local;
+    if (MonoGetPlayerStateFromAvatar(player, state)) {
+      const bool has_identity = state.has_name || state.has_steam_id;
+      const bool has_runtime_state = state.has_position || state.has_health;
+      if (!has_identity && !has_runtime_state && !state.is_local) {
+        return false;
+      }
+      out_states.push_back(state);
+      return true;
+    }
+    return false;
+  };
 
   // First try GameDirector.PlayerList
   if (g_game_director_instance_field && g_game_director_player_list_field) {
     MonoObject* director = nullptr;
+    bool director_ok = true;
+#ifdef _MSC_VER
+    director_ok = FieldStaticGetObjectSafeSeh(
+      g_game_director_vtable, g_game_director_instance_field, director);
+#else
     g_mono.mono_field_static_get_value(g_game_director_vtable, g_game_director_instance_field,
       &director);
+#endif
     if (director) {
+      bool list_ok = true;
+#ifdef _MSC_VER
+      list_ok = FieldGetObjectSafeSeh(director, g_game_director_player_list_field, list_obj);
+#else
       g_mono.mono_field_get_value(director, g_game_director_player_list_field, &list_obj);
+#endif
+      if (!list_ok) {
+        list_obj = nullptr;
+      }
+    }
+    if (!director_ok) {
+      AppendLogOnce("MonoListPlayers_director_read_fault",
+        "MonoListPlayers: GameDirector::instance read triggered SEH");
     }
   }
 
@@ -5966,91 +6440,117 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
     }
   }
 
-  if (!list_obj) {
-    AppendLog("MonoListPlayers: no player list object");
-    return false;
-  }
-
-  MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
-  static MonoClassField* items_field = nullptr;
-  static MonoClassField* size_field = nullptr;
-  if (!items_field || !size_field) {
-    items_field = g_mono.mono_class_get_field_from_name(list_class, "_items");
-    size_field = g_mono.mono_class_get_field_from_name(list_class, "_size");
-  }
-
-  if (!items_field || !size_field) {
-    AppendLog("MonoListPlayers: failed to resolve List fields");
-    return false;
-  }
-
-  MonoArray* items = nullptr;
-  int list_size = 0;
-  g_mono.mono_field_get_value(list_obj, items_field, &items);
-  g_mono.mono_field_get_value(list_obj, size_field, &list_size);
-  if (!items || list_size <= 0 || items->max_length <= 0) {
-    int enumerated = EnumerateListObjects(
-      list_obj, [&](MonoObject* player) -> bool {
-        if (!player) return false;
-        bool is_local = false;
-        if (g_player_avatar_is_local_field) {
-          g_mono.mono_field_get_value(player, g_player_avatar_is_local_field, &is_local);
-        }
-        if (!include_local && is_local) {
-          return false;
-        }
-        PlayerState state{};
-        state.is_local = is_local;
-        if (MonoGetPlayerStateFromAvatar(player, state) && state.has_position) {
-          out_states.push_back(state);
-          return true;
-        }
-        return false;
-      });
-
-// Non-ASCII comment normalized.
-    if (out_states.empty() && g_player_avatar_instance_field && g_player_avatar_vtable) {
-      MonoObject* inst = nullptr;
-      g_mono.mono_field_static_get_value(g_player_avatar_vtable, g_player_avatar_instance_field,
-        &inst);
-      if (inst) {
-        PlayerState state{};
-        state.is_local = true;
-        if (MonoGetPlayerStateFromAvatar(inst, state) && state.has_position) {
-          out_states.push_back(state);
-        }
+  if (list_obj) {
+    MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
+    static MonoClassField* items_field = nullptr;
+    static MonoClassField* size_field = nullptr;
+    if (list_class && (!items_field || !size_field)) {
+      const char* item_names[] = { "_items", "m_Items", "items" };
+      const char* size_names[] = { "_size", "m_Size", "size" };
+      for (const char* n : item_names) {
+        items_field = g_mono.mono_class_get_field_from_name(list_class, n);
+        if (items_field) break;
+      }
+      for (const char* n : size_names) {
+        size_field = g_mono.mono_class_get_field_from_name(list_class, n);
+        if (size_field) break;
       }
     }
 
-    static uint64_t last_log = 0;
-    uint64_t now_ms = GetTickCount64();
-    if (enumerated <= 0 && now_ms - last_log > 2000) {
-      AppendLog("MonoListPlayers: list empty or max_length invalid");
-      last_log = now_ms;
+    MonoArray* items = nullptr;
+    int list_size = 0;
+    if (items_field && size_field) {
+      g_mono.mono_field_get_value(list_obj, items_field, &items);
+      g_mono.mono_field_get_value(list_obj, size_field, &list_size);
     }
-    return true;
+
+    if (items && list_size > 0 && items->max_length > 0) {
+      const int lim = std::min(list_size, static_cast<int>(items->max_length));
+      for (int i = 0; i < lim; ++i) {
+        if (add_player(static_cast<MonoObject*>(items->vector[i]))) {
+          ++added_from_list;
+        }
+      }
+    } else {
+      const int enumerated = EnumerateListObjects(
+        list_obj, [&](MonoObject* player) -> bool { return add_player(player); });
+      if (enumerated > 0) {
+        added_from_list += enumerated;
+      }
+      static uint64_t last_log = 0;
+      const uint64_t now_ms = GetTickCount64();
+      if (enumerated <= 0 && now_ms - last_log > 2000) {
+        AppendLog("MonoListPlayers: list empty or max_length invalid");
+        last_log = now_ms;
+      }
+    }
+  } else {
+    AppendLog("MonoListPlayers: no player list object, fallback to PlayerAvatar scan");
   }
 
-  for (int i = 0; i < list_size && i < static_cast<int>(items->max_length); ++i) {
-    MonoObject* player = static_cast<MonoObject*>(items->vector[i]);
-    if (!player) continue;
-
-    bool is_local = false;
-    if (g_player_avatar_is_local_field) {
-      g_mono.mono_field_get_value(player, g_player_avatar_is_local_field, &is_local);
+  bool need_scene_scan = out_states.empty();
+  if (!need_scene_scan) {
+    bool has_remote = false;
+    for (const auto& st : out_states) {
+      if (!st.is_local) {
+        has_remote = true;
+        break;
+      }
     }
-    if (!include_local && is_local) {
-      continue;
-    }
-
-    PlayerState state{};
-    state.is_local = is_local;
-    if (MonoGetPlayerStateFromAvatar(player, state) && state.has_position) {
-      out_states.push_back(state);
+    if (!has_remote) {
+      need_scene_scan = true;
     }
   }
 
-  return true;
+  // Strong fallback: scan all PlayerAvatar objects in scene.
+  if (need_scene_scan && g_player_avatar_class) {
+    MonoArray* arr = FindObjectsOfTypeArray(g_player_avatar_class, "PlayerAvatar");
+    if (arr && arr->max_length > 0) {
+      int lim = static_cast<int>(arr->max_length);
+      if (lim > 128) lim = 128;
+      for (int i = 0; i < lim; ++i) {
+        if (add_player(static_cast<MonoObject*>(arr->vector[i]))) {
+          ++added_from_scan;
+        }
+      }
+    }
+  }
+
+  // Last fallback to local instance so team tab never fully blanks.
+  if (out_states.empty() && g_player_avatar_instance_field && g_player_avatar_vtable) {
+    MonoObject* inst = nullptr;
+    bool inst_ok = true;
+#ifdef _MSC_VER
+    inst_ok = FieldStaticGetObjectSafeSeh(
+      g_player_avatar_vtable, g_player_avatar_instance_field, inst);
+#else
+    g_mono.mono_field_static_get_value(g_player_avatar_vtable, g_player_avatar_instance_field, &inst);
+#endif
+    if (inst) {
+      if (add_player(inst)) {
+        ++added_from_local_fallback;
+      }
+    }
+    if (!inst_ok) {
+      AppendLogOnce("MonoListPlayers_local_instance_fault",
+        "MonoListPlayers: PlayerAvatar::instance read triggered SEH");
+    }
+  }
+
+  static uint64_t last_stats_log = 0;
+  const uint64_t now_ms = GetTickCount64();
+  if (now_ms - last_stats_log > 2000) {
+    std::ostringstream oss;
+    oss << "MonoListPlayers: total=" << static_cast<int>(out_states.size())
+      << " from_list=" << added_from_list
+      << " from_scan=" << added_from_scan
+      << " from_localfb=" << added_from_local_fallback
+      << " include_local=" << (include_local ? 1 : 0);
+    AppendLog(oss.str());
+    last_stats_log = now_ms;
+  }
+
+  return !out_states.empty();
 }
 
 bool MonoListItems(std::vector<PlayerState>& out_items) {
@@ -7281,9 +7781,6 @@ static const SessionMasterPatchTarget k_session_master_patch_targets[] = {
   { &g_semi_func_is_master_client, 1, "SemiFunc::IsMasterClient" },
   { &g_semi_func_is_master_client_or_singleplayer, 1, "SemiFunc::IsMasterClientOrSingleplayer" },
   { &g_photon_network_get_is_master_client, 1, "PhotonNetwork::get_IsMasterClient" },
-  { &g_semi_func_master_only_rpc, 1, "SemiFunc::MasterOnlyRPC" },
-  { &g_semi_func_owner_only_rpc, 1, "SemiFunc::OwnerOnlyRPC" },
-  { &g_semi_func_master_and_owner_only_rpc, 1, "SemiFunc::MasterAndOwnerOnlyRPC" },
 };
 
 static bool ApplySessionMasterPatches() {
@@ -7876,7 +8373,8 @@ bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
     }
 
     if (!g_unity_camera_get_main || !g_unity_camera_get_projection_matrix) {
-      AppendLog("MonoGetCameraMatrices: camera methods not resolved");
+      AppendLogOnce("MonoGetCameraMatrices_methods_missing",
+        "MonoGetCameraMatrices: camera methods not resolved");
       return false;
     }
 
@@ -7884,14 +8382,16 @@ bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
     MonoObject* main_camera =
       g_mono.mono_runtime_invoke(g_unity_camera_get_main, nullptr, nullptr, &exception);
     if (exception || !main_camera) {
-      AppendLog("MonoGetCameraMatrices: get_main failed");
+      AppendLogOnce("MonoGetCameraMatrices_get_main_failed",
+        "MonoGetCameraMatrices: get_main failed");
       return false;
     }
 
     MonoObject* proj_obj = g_mono.mono_runtime_invoke(
       g_unity_camera_get_projection_matrix, main_camera, nullptr, &exception);
     if (exception || !proj_obj) {
-      AppendLog("MonoGetCameraMatrices: get_projectionMatrix failed");
+      AppendLogOnce("MonoGetCameraMatrices_get_projection_failed",
+        "MonoGetCameraMatrices: get_projectionMatrix failed");
       return false;
     }
 
@@ -7940,7 +8440,8 @@ bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
     }
 
     if (!view_obj) {
-      AppendLog("MonoGetCameraMatrices: failed to get view matrix via any method");
+      AppendLogOnce("MonoGetCameraMatrices_get_view_failed",
+        "MonoGetCameraMatrices: failed to get view matrix via any method");
       return false;
     }
 

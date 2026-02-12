@@ -24,8 +24,12 @@ struct PlayerState {
   bool has_energy = false;
   int layer = -1;
   bool has_layer = false;
+  void* object = nullptr;
+  bool has_object = false;
   std::string name;
   bool has_name = false;
+  std::string steam_id;
+  bool has_steam_id = false;
   int value = 0;
   bool has_value = false;
   int item_type = -1;
@@ -54,6 +58,8 @@ long LogCrash(const char* where, unsigned long code, struct _EXCEPTION_POINTERS*
 bool MonoSetLocalPlayerPosition(float x, float y, float z);
 bool MonoSetLocalPlayerHealth(int health, int max_health);
 bool MonoSetLocalPlayerEnergy(float energy, float max_energy);
+bool MonoSetPlayerAvatarPosition(void* player_avatar_obj, float x, float y, float z);
+bool MonoSetPlayerAvatarHealth(void* player_avatar_obj, int health, int max_health);
 bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection);
 
 // Native in-game highlight (ValuableDiscover)
@@ -74,6 +80,7 @@ void SetCrashStage(const char* stage);
 bool MonoSetRunCurrency(int amount);
 bool MonoSetSessionMaster(bool enable);
 bool MonoIsSessionTransitioning();
+bool MonoIsRealMasterClient();
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
 bool MonoOverrideSpeed(float multiplier, float duration_seconds);

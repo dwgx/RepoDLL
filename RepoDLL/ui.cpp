@@ -51,7 +51,6 @@ struct SavedSettings {
   bool no_fall = false;
   bool load_on_start = true;
   bool reset_each_round = true;
-  bool session_master_override = false;
   int menu_toggle_vk = VK_INSERT;
   float speed_mult = 1.0f;
   std::string log_path;
@@ -92,7 +91,6 @@ void SaveSettings(const SavedSettings& s) {
   f << "speed_mult=" << s.speed_mult << "\n";
   f << "load_on_start=" << s.load_on_start << "\n";
   f << "reset_each_round=" << s.reset_each_round << "\n";
-  f << "session_master_override=" << s.session_master_override << "\n";
   f << "menu_toggle_vk=" << s.menu_toggle_vk << "\n";
   f << "log_path=" << s.log_path << "\n";
 }
@@ -118,7 +116,6 @@ bool LoadSettings(SavedSettings& out) {
       else if (k == "speed_mult") out.speed_mult = std::stof(v);
       else if (k == "load_on_start") out.load_on_start = to_bool(v);
       else if (k == "reset_each_round") out.reset_each_round = to_bool(v);
-      else if (k == "session_master_override") out.session_master_override = to_bool(v);
       else if (k == "menu_toggle_vk") out.menu_toggle_vk = std::stoi(v);
       else if (k == "log_path") out.log_path = v;
     } catch (...) {
@@ -230,6 +227,12 @@ void RenderOverlay(bool* menu_open) {
   static bool auto_refresh_enemies = false;
   static std::vector<PlayerState> squad_states;
   static uint64_t last_squad_update = 0;
+  static int squad_selected_index = -1;
+  static void* squad_selected_object = nullptr;
+  static int squad_target_health = 100;
+  static int squad_target_max_health = 100;
+  static float squad_target_pos[3] = { 0.0f, 0.0f, 0.0f };
+  static float squad_pull_offset[3] = { 0.8f, 0.0f, 0.8f };
   static int native_highlight_state = 0;  // 0=Default, 1=Reminder, 2=Bad
   static int native_highlight_limit = 160;
   static uint64_t last_highlight_tick = 0;
@@ -273,9 +276,9 @@ void RenderOverlay(bool* menu_open) {
   static SavedSettings saved{};
   static bool settings_loaded = false;
   static bool reset_each_round = true;
-  static bool session_master_override = false;
-  static bool session_master_retry = false;
-  static bool session_master_suspended = false;
+  static bool session_master_transitioning = false;
+  static bool is_real_master = false;
+  static uint64_t last_master_state_update = 0;
   static int last_stage_seen = -999;
   static char log_path_buf[260] = {};
 
@@ -303,42 +306,16 @@ void RenderOverlay(bool* menu_open) {
       no_fall_enabled = saved.no_fall;
       speed_mult = saved.speed_mult;
       reset_each_round = saved.reset_each_round;
-      session_master_override = saved.session_master_override;
-      session_master_suspended = false;
-      if (session_master_override) {
-        session_master_retry = true;
-      } else {
-        MonoSetSessionMaster(false);
-        session_master_retry = false;
-      }
     }
     settings_loaded = true;
   }
   if (mono_ready) {
-    const bool transitioning = session_master_override ? MonoIsSessionTransitioning() : false;
-    if (session_master_override) {
-      if (transitioning) {
-        session_master_suspended = true;
-        session_master_retry = true;
-        if (g_session_master_patch_active) {
-          MonoSetSessionMaster(false);
-        }
-      } else {
-        if (session_master_suspended) {
-          session_master_retry = true;
-        }
-        session_master_suspended = false;
-        if (session_master_retry) {
-          session_master_retry = !MonoSetSessionMaster(true);
-        }
-      }
-    } else {
-      session_master_suspended = false;
-      session_master_retry = false;
-      if (g_session_master_patch_active) {
-        MonoSetSessionMaster(false);
-      }
+    session_master_transitioning = MonoIsSessionTransitioning();
+    if (g_session_master_patch_active) {
+      MonoSetSessionMaster(false);
     }
+  } else {
+    session_master_transitioning = true;
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -346,19 +323,36 @@ void RenderOverlay(bool* menu_open) {
     return;
   }
   if (mono_ready && auto_refresh && safe_to_refresh && now - last_update > 500) {
-    SetCrashStage("RenderOverlay:MonoGetLocalPlayer");
-    last_ok = MonoGetLocalPlayer(last_info);
-    if (last_ok) {
-      MonoGetLocalPlayerState(last_state);
-      has_currency = MonoGetRunCurrency(current_currency);
-      MonoApplyPendingCartValue();
-      inputs_synced = false;
+    if (!session_master_transitioning) {
+      SetCrashStage("RenderOverlay:MonoGetLocalPlayer");
+      last_ok = MonoGetLocalPlayer(last_info);
+      if (last_ok) {
+        SetCrashStage("RenderOverlay:MonoGetLocalPlayerState");
+        MonoGetLocalPlayerState(last_state);
+        SetCrashStage("RenderOverlay:MonoGetRunCurrency");
+        has_currency = MonoGetRunCurrency(current_currency);
+        SetCrashStage("RenderOverlay:MonoApplyPendingCartValue");
+        MonoApplyPendingCartValue();
+        inputs_synced = false;
+      } else {
+        has_currency = false;
+      }
+    } else {
+      last_ok = false;
+      has_currency = false;
     }
     last_update = now;
   }
 
+  if (mono_ready && !session_master_transitioning && now - last_master_state_update > 500) {
+    is_real_master = MonoIsRealMasterClient();
+    last_master_state_update = now;
+  } else if (!mono_ready || session_master_transitioning) {
+    is_real_master = false;
+  }
+
   // Round/haul state refresh (关卡收集阶段)
-  if (mono_ready && safe_to_refresh && now - last_round_update > 500) {
+  if (mono_ready && !session_master_transitioning && safe_to_refresh && now - last_round_update > 500) {
     RoundState rs{};
     RoundProgressState rps{};
     if (MonoGetRoundState(rs) && rs.ok) {
@@ -397,6 +391,7 @@ void RenderOverlay(bool* menu_open) {
 
   auto refresh_items = [&]() {
     if (!mono_ready) return;
+    if (session_master_transitioning) return;
     if (g_items_disabled) return;
     // 仅在有可靠本地玩家坐标时刷新，避免主菜单/加载场景扫物品导致崩溃
     if (!last_ok || !last_state.has_position) return;
@@ -406,15 +401,45 @@ void RenderOverlay(bool* menu_open) {
   };
   auto refresh_enemies = [&]() {
     if (!mono_ready) return;
+    if (session_master_transitioning) return;
     if (g_enemy_esp_disabled) return;
     if (!last_ok || !last_state.has_position) return;
     SetCrashStage("RenderOverlay:MonoListEnemies");
     MonoListEnemiesSafe(g_cached_enemies);
     last_enemies_update = now;
   };
+  auto normalize_squad_selection = [&]() {
+    if (squad_states.empty()) {
+      squad_selected_index = -1;
+      squad_selected_object = nullptr;
+      return;
+    }
+
+    if (squad_selected_object) {
+      for (size_t i = 0; i < squad_states.size(); ++i) {
+        if (squad_states[i].has_object && squad_states[i].object == squad_selected_object) {
+          squad_selected_index = static_cast<int>(i);
+          return;
+        }
+      }
+    }
+
+    if (squad_selected_index >= 0 &&
+      squad_selected_index < static_cast<int>(squad_states.size())) {
+      if (squad_states[squad_selected_index].has_object) {
+        squad_selected_object = squad_states[squad_selected_index].object;
+      }
+      return;
+    }
+
+    squad_selected_index = 0;
+    squad_selected_object = squad_states[0].has_object ? squad_states[0].object : nullptr;
+  };
   auto refresh_squad = [&]() {
     if (!mono_ready) return;
+    if (session_master_transitioning) return;
     MonoListPlayers(squad_states, include_local_squad);
+    normalize_squad_selection();
     last_squad_update = now;
   };
   auto refresh_logs = [&]() {
@@ -423,6 +448,8 @@ void RenderOverlay(bool* menu_open) {
   };
   auto refresh_matrices = [&]() {
     if (!mono_ready) return;
+    if (session_master_transitioning) return;
+    if (!last_ok || !last_state.has_position) return;
     SetCrashStage("RenderOverlay:MonoGetCameraMatrices");
     Matrix4x4 v{}, p{};
     if (MonoGetCameraMatrices(v, p)) {
@@ -442,11 +469,11 @@ void RenderOverlay(bool* menu_open) {
   if (mono_ready && safe_to_refresh && now - last_squad_update > 500) {
     refresh_squad();
   }
-  if (mono_ready && now - g_last_matrix_update > 33) {
+  if (mono_ready && !session_master_transitioning && now - g_last_matrix_update > 33) {
     refresh_matrices();
   }
 
-  if (mono_ready) {
+  if (mono_ready && !session_master_transitioning) {
     if (round_lock_enabled) {
       int target_goal = round_goal_edit > 0 ? round_goal_edit
         : ((has_round_state && cached_round_state.goal > 0) ? cached_round_state.goal : round_current_edit);
@@ -456,6 +483,8 @@ void RenderOverlay(bool* menu_open) {
     else {
       MonoSetRoundHaulOverride(false, 0, -1);
     }
+  } else if (mono_ready) {
+    MonoSetRoundHaulOverride(false, 0, -1);
   }
 
   auto native_highlight = [&](uint64_t ts) -> bool {
@@ -478,7 +507,8 @@ void RenderOverlay(bool* menu_open) {
   };
 
   // Native in-game highlight (ValuableDiscover) with SEH guard
-  if (mono_ready && g_esp_enabled && g_native_highlight_active &&
+  if (mono_ready && !session_master_transitioning &&
+    g_esp_enabled && g_native_highlight_active &&
     MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
     native_highlight(now);
   }
@@ -641,27 +671,6 @@ void RenderOverlay(bool* menu_open) {
               if (has_currency) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("当前: %d (总金库)", current_currency);
-              }
-
-              ImGui::TableNextRow();
-              ImGui::TableSetColumnIndex(0);
-              ImGui::Text("Session master");
-              ImGui::TableSetColumnIndex(1);
-              if (ImGui::Checkbox("成为会话主人##session_master", &session_master_override)) {
-                if (session_master_override) {
-                  session_master_retry = true;
-                  session_master_suspended = false;
-                } else {
-                  MonoSetSessionMaster(false);
-                  session_master_retry = false;
-                  session_master_suspended = false;
-                }
-              }
-              ImGui::SameLine();
-              if (session_master_suspended) {
-                ImGui::TextDisabled("会话切换/加载中，已自动暂停");
-              } else {
-                ImGui::TextDisabled("绕过 SemiFunc 权限校验");
               }
 
               ImGui::TableNextRow();
@@ -1014,10 +1023,13 @@ void RenderOverlay(bool* menu_open) {
 
         // 队友/复活
         if (ImGui::BeginTabItem("队友")) {
-          ImGui::Checkbox("包含自己", &include_local_squad);
+          if (ImGui::Checkbox("包含自己", &include_local_squad)) {
+            refresh_squad();
+          }
           ImGui::SameLine();
           if (ImGui::Button("刷新队友")) refresh_squad();
           ImGui::SameLine();
+          ImGui::BeginDisabled(!is_real_master);
           if (ImGui::Button("复活队友")) {
             MonoReviveAllPlayers(false);
             refresh_squad();
@@ -1027,36 +1039,144 @@ void RenderOverlay(bool* menu_open) {
             MonoReviveAllPlayers(true);
             refresh_squad();
           }
+          ImGui::EndDisabled();
           ImGui::SameLine();
           ImGui::TextDisabled("队友数: %d", static_cast<int>(squad_states.size()));
+          ImGui::SameLine();
+          ImGui::TextDisabled("你是房主: %s", is_real_master ? "是" : "否");
+
+          normalize_squad_selection();
+          const PlayerState* selected_state = nullptr;
+          if (squad_selected_index >= 0 &&
+            squad_selected_index < static_cast<int>(squad_states.size())) {
+            selected_state = &squad_states[squad_selected_index];
+          }
+
+          if (selected_state) {
+            std::string selected_name = selected_state->has_name ? selected_state->name : "<player>";
+            ImGui::Text("当前选中: %s", selected_name.c_str());
+            if (selected_state->has_steam_id) {
+              ImGui::SameLine();
+              ImGui::TextDisabled("steamID: %s", selected_state->steam_id.c_str());
+            }
+
+            if (selected_state->has_object) {
+              void* selected_obj = selected_state->object;
+              bool squad_need_refresh = false;
+              const bool can_manage_squad = is_real_master;
+              ImGui::SetNextItemWidth(120.0f);
+              ImGui::InputInt("目标生命##squad_hp", &squad_target_health, 1, 20);
+              ImGui::SameLine();
+              ImGui::SetNextItemWidth(120.0f);
+              ImGui::InputInt("目标最大生命##squad_maxhp", &squad_target_max_health, 1, 20);
+              if (squad_target_max_health < 1) squad_target_max_health = 1;
+              if (squad_target_health < 0) squad_target_health = 0;
+              if (squad_target_health > squad_target_max_health) {
+                squad_target_health = squad_target_max_health;
+              }
+
+              ImGui::BeginDisabled(!can_manage_squad);
+              if (ImGui::Button("设置选中生命")) {
+                MonoSetPlayerAvatarHealth(
+                  selected_obj, squad_target_health, squad_target_max_health);
+                squad_need_refresh = true;
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("选中满血")) {
+                MonoSetPlayerAvatarHealth(
+                  selected_obj, squad_target_max_health, squad_target_max_health);
+                squad_need_refresh = true;
+              }
+
+              ImGui::InputFloat3("目标坐标##squad_pos", squad_target_pos, "%.2f");
+              if (ImGui::Button("传送选中到坐标")) {
+                MonoSetPlayerAvatarPosition(
+                  selected_obj, squad_target_pos[0], squad_target_pos[1], squad_target_pos[2]);
+                squad_need_refresh = true;
+              }
+              ImGui::SameLine();
+              ImGui::BeginDisabled(!last_state.has_position);
+              if (ImGui::Button("拉到我身边")) {
+                const float target_x = last_state.x + squad_pull_offset[0];
+                const float target_y = last_state.y + squad_pull_offset[1];
+                const float target_z = last_state.z + squad_pull_offset[2];
+                MonoSetPlayerAvatarPosition(selected_obj, target_x, target_y, target_z);
+                squad_need_refresh = true;
+              }
+              ImGui::EndDisabled();
+              ImGui::EndDisabled();
+              ImGui::SetNextItemWidth(260.0f);
+              ImGui::InputFloat3("拉取偏移##squad_pull_offset", squad_pull_offset, "%.2f");
+              if (!can_manage_squad) {
+                ImGui::TextDisabled("非房主时仅可查看，传送/拉取/改队友状态不可用");
+              }
+              if (squad_need_refresh) {
+                refresh_squad();
+              }
+            }
+            else {
+              ImGui::TextDisabled("选中对象无效，无法改状态。");
+            }
+          }
+          else {
+            ImGui::TextDisabled("未选中队友。先点击下方列表的一行。");
+          }
 
           ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
             ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;
           ImVec2 table_size = ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y - 8.0f);
-          if (ImGui::BeginTable("squad_table_view", 5, flags, table_size)) {
+          if (ImGui::BeginTable("squad_table_view", 6, flags, table_size)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 1.8f);
+            ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthStretch, 1.8f);
             ImGui::TableSetupColumn("生命", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("状态", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("距离", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("坐标", ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableHeadersRow();
 
-            for (const auto& st : squad_states) {
+            for (size_t i = 0; i < squad_states.size(); ++i) {
+              const auto& st = squad_states[i];
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);
-              ImGui::TextUnformatted(st.has_name ? st.name.c_str() : "<player>");
+              std::string display_name = st.has_name ? st.name : "<player>";
+              if (st.is_local) {
+                display_name = "[本地] " + display_name;
+              }
+              const bool selected = squad_selected_index == static_cast<int>(i);
+              ImGui::PushID(static_cast<int>(i));
+              if (ImGui::Selectable(display_name.c_str(), selected)) {
+                squad_selected_index = static_cast<int>(i);
+                squad_selected_object = st.has_object ? st.object : nullptr;
+                if (st.has_health) {
+                  squad_target_health = std::max(0, st.health);
+                  squad_target_max_health = std::max(1, st.max_health);
+                  if (squad_target_health > squad_target_max_health) {
+                    squad_target_health = squad_target_max_health;
+                  }
+                }
+                if (st.has_position) {
+                  squad_target_pos[0] = st.x;
+                  squad_target_pos[1] = st.y;
+                  squad_target_pos[2] = st.z;
+                }
+              }
+              ImGui::PopID();
 
               ImGui::TableSetColumnIndex(1);
-              if (st.has_health) ImGui::Text("%d / %d", st.health, st.max_health);
+              if (st.has_steam_id) ImGui::TextUnformatted(st.steam_id.c_str());
               else ImGui::TextDisabled("-");
 
               ImGui::TableSetColumnIndex(2);
+              if (st.has_health) ImGui::Text("%d / %d", st.health, st.max_health);
+              else ImGui::TextDisabled("-");
+
+              ImGui::TableSetColumnIndex(3);
               bool downed = st.has_health && st.health <= 0;
               ImVec4 col = downed ? ImVec4(0.9f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.85f, 0.45f, 1.0f);
               ImGui::TextColored(col, "%s", downed ? "倒地" : "存活");
 
-              ImGui::TableSetColumnIndex(3);
+              ImGui::TableSetColumnIndex(4);
               if (last_state.has_position && st.has_position) {
                 float dx = st.x - last_state.x;
                 float dy = st.y - last_state.y;
@@ -1066,7 +1186,7 @@ void RenderOverlay(bool* menu_open) {
                 ImGui::TextDisabled("-");
               }
 
-              ImGui::TableSetColumnIndex(4);
+              ImGui::TableSetColumnIndex(5);
               if (st.has_position) {
                 ImGui::Text("%.2f, %.2f, %.2f", st.x, st.y, st.z);
               } else {
@@ -1285,7 +1405,6 @@ void RenderOverlay(bool* menu_open) {
               saved.no_fall = no_fall_enabled;
               saved.speed_mult = speed_mult;
               saved.reset_each_round = reset_each_round;
-              saved.session_master_override = session_master_override;
               saved.menu_toggle_vk = GetMenuToggleVirtualKey();
               saved.log_path = log_path_buf;
               SaveSettings(saved);
@@ -1302,15 +1421,7 @@ void RenderOverlay(bool* menu_open) {
                 no_fall_enabled = saved.no_fall;
                 speed_mult = saved.speed_mult;
                 reset_each_round = saved.reset_each_round;
-                session_master_override = saved.session_master_override;
-                session_master_suspended = false;
                 SetMenuToggleVirtualKey(saved.menu_toggle_vk);
-                if (session_master_override) {
-                  session_master_retry = true;
-                } else {
-                  MonoSetSessionMaster(false);
-                  session_master_retry = false;
-                }
                 g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
                 if (!saved.log_path.empty()) {
                   strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
@@ -1337,8 +1448,18 @@ void RenderOverlay(bool* menu_open) {
   }
   last_menu_open = menu_visible;
 
+  static uint64_t maint_probe_last = 0;
+  static bool maint_has_local_player = false;
+  if (mono_ready && !session_master_transitioning && now - maint_probe_last > 250) {
+    LocalPlayerInfo probe_info{};
+    maint_has_local_player = MonoGetLocalPlayer(probe_info);
+    maint_probe_last = now;
+  } else if (!mono_ready || session_master_transitioning) {
+    maint_has_local_player = false;
+  }
+
   // Auto-maintenance toggles
-  if (last_ok) {
+  if (mono_ready && maint_has_local_player && !session_master_transitioning) {
     if (no_fall_enabled) {
       MonoSetInvincible(2.0f);
       MonoOverrideJumpCooldown(0.0f);
