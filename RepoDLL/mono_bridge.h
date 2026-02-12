@@ -72,6 +72,8 @@ extern bool g_native_highlight_active;
 void SetCrashStage(const char* stage);
 
 bool MonoSetRunCurrency(int amount);
+bool MonoSetSessionMaster(bool enable);
+bool MonoIsSessionTransitioning();
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
 bool MonoOverrideSpeed(float multiplier, float duration_seconds);
@@ -146,6 +148,7 @@ extern bool g_enemy_cache_disabled;
 extern bool g_item_esp_enabled;
 extern int g_item_esp_cap;
 extern int g_enemy_esp_cap;
+extern bool g_session_master_patch_active;
 
 // ESP开关（在 hook_dx11.cpp 定义）
 extern bool g_esp_enabled;

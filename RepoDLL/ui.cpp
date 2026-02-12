@@ -5,6 +5,7 @@
 #include "imgui.h"
 
 #include "mono_bridge.h"
+#include "hook_dx11.h"
 #include <cmath>
 #include <algorithm>
 #include <cfloat>
@@ -50,6 +51,8 @@ struct SavedSettings {
   bool no_fall = false;
   bool load_on_start = true;
   bool reset_each_round = true;
+  bool session_master_override = false;
+  int menu_toggle_vk = VK_INSERT;
   float speed_mult = 1.0f;
   std::string log_path;
 };
@@ -89,6 +92,8 @@ void SaveSettings(const SavedSettings& s) {
   f << "speed_mult=" << s.speed_mult << "\n";
   f << "load_on_start=" << s.load_on_start << "\n";
   f << "reset_each_round=" << s.reset_each_round << "\n";
+  f << "session_master_override=" << s.session_master_override << "\n";
+  f << "menu_toggle_vk=" << s.menu_toggle_vk << "\n";
   f << "log_path=" << s.log_path << "\n";
 }
 
@@ -113,6 +118,8 @@ bool LoadSettings(SavedSettings& out) {
       else if (k == "speed_mult") out.speed_mult = std::stof(v);
       else if (k == "load_on_start") out.load_on_start = to_bool(v);
       else if (k == "reset_each_round") out.reset_each_round = to_bool(v);
+      else if (k == "session_master_override") out.session_master_override = to_bool(v);
+      else if (k == "menu_toggle_vk") out.menu_toggle_vk = std::stoi(v);
       else if (k == "log_path") out.log_path = v;
     } catch (...) {
       continue;
@@ -166,6 +173,30 @@ void SectionLabel(const char* label) {
     ImVec2(end.x, end.y + 6.0f),
     ImColor(line_col));
   ImGui::Separator();
+}
+
+std::string MenuHotkeyName(int vk) {
+  if (vk == VK_INSERT) {
+    return "INS";
+  }
+  if (vk <= 0 || vk > 0xFF) {
+    return "Unknown";
+  }
+  UINT scan = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+  const bool extended =
+    vk == VK_LEFT || vk == VK_UP || vk == VK_RIGHT || vk == VK_DOWN ||
+    vk == VK_PRIOR || vk == VK_NEXT || vk == VK_END || vk == VK_HOME ||
+    vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE || vk == VK_NUMLOCK ||
+    vk == VK_RMENU || vk == VK_RCONTROL;
+  LONG lparam = static_cast<LONG>(scan << 16);
+  if (extended) {
+    lparam |= 1 << 24;
+  }
+  char name[64] = {};
+  if (GetKeyNameTextA(lparam, name, static_cast<int>(sizeof(name))) > 0) {
+    return name;
+  }
+  return std::string("VK_") + std::to_string(vk);
 }
 }  // namespace
 
@@ -242,6 +273,9 @@ void RenderOverlay(bool* menu_open) {
   static SavedSettings saved{};
   static bool settings_loaded = false;
   static bool reset_each_round = true;
+  static bool session_master_override = false;
+  static bool session_master_retry = false;
+  static bool session_master_suspended = false;
   static int last_stage_seen = -999;
   static char log_path_buf[260] = {};
 
@@ -254,6 +288,7 @@ void RenderOverlay(bool* menu_open) {
   if (!settings_loaded) {
     saved.log_path = MonoGetLogPath();
     LoadSettings(saved);
+    SetMenuToggleVirtualKey(saved.menu_toggle_vk);
     if (!saved.log_path.empty()) {
       strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
       MonoSetLogPath(saved.log_path);
@@ -268,8 +303,42 @@ void RenderOverlay(bool* menu_open) {
       no_fall_enabled = saved.no_fall;
       speed_mult = saved.speed_mult;
       reset_each_round = saved.reset_each_round;
+      session_master_override = saved.session_master_override;
+      session_master_suspended = false;
+      if (session_master_override) {
+        session_master_retry = true;
+      } else {
+        MonoSetSessionMaster(false);
+        session_master_retry = false;
+      }
     }
     settings_loaded = true;
+  }
+  if (mono_ready) {
+    const bool transitioning = session_master_override ? MonoIsSessionTransitioning() : false;
+    if (session_master_override) {
+      if (transitioning) {
+        session_master_suspended = true;
+        session_master_retry = true;
+        if (g_session_master_patch_active) {
+          MonoSetSessionMaster(false);
+        }
+      } else {
+        if (session_master_suspended) {
+          session_master_retry = true;
+        }
+        session_master_suspended = false;
+        if (session_master_retry) {
+          session_master_retry = !MonoSetSessionMaster(true);
+        }
+      }
+    } else {
+      session_master_suspended = false;
+      session_master_retry = false;
+      if (g_session_master_patch_active) {
+        MonoSetSessionMaster(false);
+      }
+    }
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -565,18 +634,39 @@ void RenderOverlay(bool* menu_open) {
             if (ImGui::Button("应用")) {
               money_commit = true;
             }
-            if (money_commit) {
-              MonoSetRunCurrency(currency_edit);
-              MonoSetCartValueSafe(currency_edit);
-            }
-            if (has_currency) {
-              ImGui::SameLine();
-              ImGui::TextDisabled("当前: %d (总金库)", current_currency);
-            }
+              if (money_commit) {
+                MonoSetRunCurrency(currency_edit);
+                MonoSetCartValueSafe(currency_edit);
+              }
+              if (has_currency) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("当前: %d (总金库)", current_currency);
+              }
 
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("关卡收集 (局内)");
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::Text("Session master");
+              ImGui::TableSetColumnIndex(1);
+              if (ImGui::Checkbox("成为会话主人##session_master", &session_master_override)) {
+                if (session_master_override) {
+                  session_master_retry = true;
+                  session_master_suspended = false;
+                } else {
+                  MonoSetSessionMaster(false);
+                  session_master_retry = false;
+                  session_master_suspended = false;
+                }
+              }
+              ImGui::SameLine();
+              if (session_master_suspended) {
+                ImGui::TextDisabled("会话切换/加载中，已自动暂停");
+              } else {
+                ImGui::TextDisabled("绕过 SemiFunc 权限校验");
+              }
+
+              ImGui::TableNextRow();
+              ImGui::TableSetColumnIndex(0);
+              ImGui::Text("关卡收集 (局内)");
             ImGui::TableSetColumnIndex(1);
             ImGui::BeginGroup();
             if (has_round_state) {
@@ -858,9 +948,9 @@ void RenderOverlay(bool* menu_open) {
           ImVec2 table_size = ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y - 8.0f);
           if (ImGui::BeginTable("items_table_view", 6, flags, table_size)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("名称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("物品昵称", ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-            ImGui::TableSetupColumn("价值", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("价值($)", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("距离", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("Layer", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("坐标", ImGuiTableColumnFlags_WidthStretch, 2.0f);
@@ -890,7 +980,7 @@ void RenderOverlay(bool* menu_open) {
               ImGui::TextColored(col, "%s", cat_name(st.category));
 
               ImGui::TableSetColumnIndex(2);
-              if (st.has_value) ImGui::Text("%d", st.value);
+              if (st.has_value) ImGui::Text("$%d", st.value);
               else if (st.has_item_type) ImGui::TextDisabled("type %d", st.item_type);
               else ImGui::TextDisabled("-");
 
@@ -1164,20 +1254,42 @@ void RenderOverlay(bool* menu_open) {
           ImGui::InputFloat("默认速度倍率", &speed_mult, 0.1f, 0.5f, "%.2f");
           g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
 
-          SectionLabel("持久化操作");
-          if (ImGui::Button("保存设置")) {
-            saved.auto_refresh = auto_refresh;
-            saved.auto_refresh_items = auto_refresh_items;
-            saved.auto_refresh_enemies = auto_refresh_enemies;
-            saved.item_esp = g_item_esp_enabled;
-            saved.enemy_esp = g_enemy_esp_enabled;
-            saved.native_highlight = g_native_highlight_active;
-            saved.no_fall = no_fall_enabled;
-            saved.speed_mult = speed_mult;
-            saved.reset_each_round = reset_each_round;
-            saved.log_path = log_path_buf;
-            SaveSettings(saved);
+          SectionLabel("菜单热键");
+          const int menu_vk = GetMenuToggleVirtualKey();
+          const std::string menu_vk_name = MenuHotkeyName(menu_vk);
+          ImGui::Text("打开菜单键: %s", menu_vk_name.c_str());
+          ImGui::SameLine();
+          if (menu_vk == VK_INSERT) {
+            ImGui::TextDisabled("(默认 INS)");
           }
+          if (IsMenuToggleKeyCaptureActive()) {
+            ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.28f, 1.0f), "监听中... 按任意键 (Esc 取消)");
+          } else {
+            if (ImGui::Button("监听按键修改")) {
+              BeginMenuToggleKeyCapture();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("恢复默认 INS")) {
+              SetMenuToggleVirtualKey(VK_INSERT);
+            }
+          }
+
+          SectionLabel("持久化操作");
+            if (ImGui::Button("保存设置")) {
+              saved.auto_refresh = auto_refresh;
+              saved.auto_refresh_items = auto_refresh_items;
+              saved.auto_refresh_enemies = auto_refresh_enemies;
+              saved.item_esp = g_item_esp_enabled;
+              saved.enemy_esp = g_enemy_esp_enabled;
+              saved.native_highlight = g_native_highlight_active;
+              saved.no_fall = no_fall_enabled;
+              saved.speed_mult = speed_mult;
+              saved.reset_each_round = reset_each_round;
+              saved.session_master_override = session_master_override;
+              saved.menu_toggle_vk = GetMenuToggleVirtualKey();
+              saved.log_path = log_path_buf;
+              SaveSettings(saved);
+            }
           ImGui::SameLine();
           if (ImGui::Button("重新加载设置")) {
             if (LoadSettings(saved)) {
@@ -1186,13 +1298,22 @@ void RenderOverlay(bool* menu_open) {
               auto_refresh_enemies = saved.auto_refresh_enemies;
               g_item_esp_enabled = saved.item_esp;
               g_enemy_esp_enabled = saved.enemy_esp;
-              g_native_highlight_active = saved.native_highlight;
-              no_fall_enabled = saved.no_fall;
-              speed_mult = saved.speed_mult;
-              reset_each_round = saved.reset_each_round;
-              g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
-              if (!saved.log_path.empty()) {
-                strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
+                g_native_highlight_active = saved.native_highlight;
+                no_fall_enabled = saved.no_fall;
+                speed_mult = saved.speed_mult;
+                reset_each_round = saved.reset_each_round;
+                session_master_override = saved.session_master_override;
+                session_master_suspended = false;
+                SetMenuToggleVirtualKey(saved.menu_toggle_vk);
+                if (session_master_override) {
+                  session_master_retry = true;
+                } else {
+                  MonoSetSessionMaster(false);
+                  session_master_retry = false;
+                }
+                g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
+                if (!saved.log_path.empty()) {
+                  strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
                 MonoSetLogPath(saved.log_path);
               }
             }
@@ -1202,6 +1323,7 @@ void RenderOverlay(bool* menu_open) {
             ResetUiDefaults(auto_refresh, auto_refresh_items, auto_refresh_enemies,
               g_item_esp_enabled, g_enemy_esp_enabled, g_native_highlight_active, no_fall_enabled,
               speed_mult, extra_jump_count, infinite_jump_enabled, god_mode_enabled);
+            SetMenuToggleVirtualKey(VK_INSERT);
             g_esp_enabled = false;
           }
 

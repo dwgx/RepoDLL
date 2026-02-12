@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <unordered_set>
 #include <unordered_map>
@@ -34,8 +35,9 @@ bool g_enemy_esp_enabled = false;
 bool g_items_disabled = false;
 bool g_enemy_cache_disabled = false;
 bool g_item_esp_enabled = false;
-int g_item_esp_cap = 512;
-int g_enemy_esp_cap = 256;
+int g_item_esp_cap = 65;
+int g_enemy_esp_cap = 8;
+bool g_session_master_patch_active = false;
 
 namespace {
   using MonoDomain = void;
@@ -114,11 +116,17 @@ namespace {
   static void __stdcall RoundDirectorUpdateHook(MonoObject* self);
   static void InstallRoundDirectorUpdateHook();
   static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value);
+  static bool ReadFieldNumber(MonoObject* obj, MonoClassField* field, int& out_v);
   static bool ComputeRunCurrencyBeforeForTarget(int target_haul, int& out_before);
   struct CodePatchBackup;
   static bool PatchCodeToReturnInt(void* addr, int forced, CodePatchBackup& backup);
   static bool RestorePatchedCode(void* addr, const CodePatchBackup& backup);
   static bool SetRoundUpdateBypass(bool enable);
+  static bool ApplySessionMasterPatches();
+  static bool RestoreSessionMasterPatches();
+#ifdef _MSC_VER
+  static bool FieldGetBoolSafeSeh(MonoObject* obj, MonoClassField* field, bool& out_value);
+#endif
 
   MonoApi g_mono;
   MonoDomain* g_domain = nullptr;
@@ -129,6 +137,7 @@ namespace {
   MonoVTable* g_game_director_vtable = nullptr;
   MonoClassField* g_game_director_instance_field = nullptr;
   MonoClassField* g_game_director_player_list_field = nullptr;
+  MonoClassField* g_game_director_current_state_field = nullptr;
 
   MonoClass* g_player_avatar_class = nullptr;
   MonoVTable* g_player_avatar_vtable = nullptr;
@@ -136,7 +145,6 @@ namespace {
   MonoClassField* g_player_avatar_instance_field = nullptr;
   MonoClassField* g_player_avatar_transform_field = nullptr;
   MonoClassField* g_player_avatar_health_field = nullptr;
-  MonoClassField* g_player_avatar_energy_field = nullptr;
   MonoClassField* g_player_avatar_steamid_field = nullptr;
   MonoClassField* g_player_avatar_physgrabber_field = nullptr;
 
@@ -199,7 +207,6 @@ namespace {
   MonoClassField* g_item_manager_spawned_items_field = nullptr;
   MonoMethod* g_item_manager_get_all_items = nullptr;
   int g_item_manager_get_all_items_argc = 0;
-  const char* g_item_manager_get_all_items_name = nullptr;
 
   // Alternative item population methods
   MonoMethod* g_semi_func_shop_populate = nullptr;
@@ -213,12 +220,18 @@ namespace {
   MonoClass* g_item_volume_class = nullptr;
   MonoClassField* g_item_volume_item_attributes_field = nullptr;
   MonoClass* g_item_attributes_class = nullptr;
+  MonoClassField* g_item_attributes_item_field = nullptr;
   MonoClassField* g_item_attributes_value_field = nullptr;
   MonoClassField* g_item_attributes_item_type_field = nullptr;
+  MonoClassField* g_item_attributes_item_name_field = nullptr;
+  MonoClassField* g_item_attributes_instance_name_field = nullptr;
   MonoObject* g_item_attributes_type_obj = nullptr;
+  MonoClass* g_item_class = nullptr;
+  MonoClassField* g_item_item_name_field = nullptr;
 
   MonoClass* g_valuable_object_class = nullptr;
   MonoClassField* g_valuable_object_value_field = nullptr;
+  MonoObject* g_valuable_object_type_obj = nullptr;
   MonoClass* g_enemy_rigidbody_class = nullptr;
   std::vector<uint32_t> g_enemy_cache;  // GCHandles
   std::mutex g_enemy_cache_mutex;
@@ -253,13 +266,37 @@ namespace {
   MonoClassField* g_light_fade_is_fading_field = nullptr;
   MonoClassField* g_light_fade_current_time_field = nullptr;
   MonoClassField* g_light_fade_fade_duration_field = nullptr;
-  // ItemTracker (UI/highlight)
-  // ItemTracker rendering (optional)
-  // Removed unused ItemTracker wiring
 
   // Currency / movement / combat helpers
   MonoMethod* g_semi_func_stat_set_run_currency = nullptr;
   MonoMethod* g_semi_func_stat_get_run_currency = nullptr;
+  MonoMethod* g_semi_func_is_not_master_client = nullptr;
+  MonoMethod* g_semi_func_is_master_client = nullptr;
+  MonoMethod* g_semi_func_is_master_client_or_singleplayer = nullptr;
+  MonoMethod* g_semi_func_master_only_rpc = nullptr;
+  MonoMethod* g_semi_func_owner_only_rpc = nullptr;
+  MonoMethod* g_semi_func_master_and_owner_only_rpc = nullptr;
+  MonoClass* g_photon_network_class = nullptr;
+  MonoMethod* g_photon_network_get_is_master_client = nullptr;
+  MonoMethod* g_photon_network_get_local_player = nullptr;
+  MonoMethod* g_photon_network_get_master_client = nullptr;
+  MonoMethod* g_photon_network_get_in_room = nullptr;
+  MonoMethod* g_photon_network_get_level_loading_progress = nullptr;
+  MonoClass* g_photon_player_class = nullptr;
+  MonoMethod* g_photon_player_get_actor_number = nullptr;
+
+  // Session/load transition guards
+  MonoClass* g_run_manager_class = nullptr;
+  MonoVTable* g_run_manager_vtable = nullptr;
+  MonoClassField* g_run_manager_instance_field = nullptr;
+  MonoClassField* g_run_manager_restarting_field = nullptr;
+  MonoClassField* g_run_manager_wait_to_change_scene_field = nullptr;
+  MonoClassField* g_run_manager_lobby_join_field = nullptr;
+  MonoClass* g_level_generator_class = nullptr;
+  MonoVTable* g_level_generator_vtable = nullptr;
+  MonoClassField* g_level_generator_instance_field = nullptr;
+  MonoClassField* g_level_generator_state_field = nullptr;
+  MonoClassField* g_level_generator_generated_field = nullptr;
 
   // StatsManager
   MonoClass* g_stats_manager_class = nullptr;
@@ -353,6 +390,7 @@ namespace {
     size_t size{ 0 };
   };
   std::unordered_map<void*, CodePatchBackup> g_collector_getter_patches;
+  std::unordered_map<void*, CodePatchBackup> g_session_master_backups;
   void* g_round_update_patch_addr = nullptr;
   CodePatchBackup g_round_update_patch_backup{};
   bool g_round_update_patch_active = false;
@@ -624,63 +662,6 @@ namespace {
       if (!warned_once) {
         AppendLog("PatchAntiMasterChecks: Assembly-CSharp.dll not loaded yet");
         warned_once = true;
-      }
-      return;
-    }
-
-    // If not found, scan all modules to find the signature and patch by pattern.
-    auto pattern_patch = []() {
-      // Signature: 28 92 0F 00 06 2C 01 2A (call IsNotMasterClient; brfalse; ret)
-      const uint8_t sig[] = { 0x28, 0x92, 0x0F, 0x00, 0x06, 0x2C, 0x01, 0x2A };
-      SYSTEM_INFO si{};
-      GetSystemInfo(&si);
-      uintptr_t start = reinterpret_cast<uintptr_t>(si.lpMinimumApplicationAddress);
-      uintptr_t end = reinterpret_cast<uintptr_t>(si.lpMaximumApplicationAddress);
-      size_t patched_count = 0;
-      MEMORY_BASIC_INFORMATION mbi{};
-      for (uintptr_t addr = start; addr < end && patched_count < 3;) {
-        if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != sizeof(mbi)) {
-          addr += 0x1000;
-          continue;
-        }
-        bool readable = (mbi.State == MEM_COMMIT) && (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_READWRITE | PAGE_READONLY));
-        if (readable && !(mbi.Protect & PAGE_GUARD)) {
-          uint8_t* region = static_cast<uint8_t*>(mbi.AllocationBase);
-          size_t region_size = mbi.RegionSize;
-          // scan region
-          for (size_t i = 0; i + sizeof(sig) <= region_size && patched_count < 3; ++i) {
-            uint8_t* p = reinterpret_cast<uint8_t*>(addr) + i;
-            if (memcmp(p, sig, sizeof(sig)) == 0) {
-              DWORD old = 0;
-              if (VirtualProtect(p, sizeof(sig), PAGE_EXECUTE_READWRITE, &old)) {
-                std::memset(p, 0x00, sizeof(sig));  // NOP out
-                DWORD dummy;
-                VirtualProtect(p, sizeof(sig), old, &dummy);
-                ++patched_count;
-              }
-            }
-          }
-        }
-        addr += mbi.RegionSize;
-      }
-      if (patched_count > 0) {
-        std::ostringstream oss;
-        oss << "PatchAntiMasterChecks: pattern patched " << patched_count << " occurrences";
-        AppendLog(oss.str());
-        return true;
-      }
-      return false;
-      };
-
-    if (!mod) {
-      if (!warned_once) {
-        AppendLog("PatchAntiMasterChecks: Assembly-CSharp.dll not loaded yet");
-        warned_once = true;
-      }
-      // Attempt pattern scan to patch anyway
-      if (pattern_patch()) {
-        patched = true;
-        warned_once = false;
       }
       return;
     }
@@ -1026,6 +1007,13 @@ namespace {
         AppendLog("Failed to resolve GameDirector::PlayerList field");
       }
     }
+    if (g_game_director_class && !g_game_director_current_state_field) {
+      g_game_director_current_state_field = g_mono.mono_class_get_field_from_name(
+        g_game_director_class, "currentState");
+      if (g_game_director_current_state_field) {
+        AppendLog("Resolved GameDirector::currentState field");
+      }
+    }
 
     if (!g_player_avatar_class) {
       g_player_avatar_class = g_mono.mono_class_from_name(
@@ -1231,6 +1219,75 @@ namespace {
         g_player_controller_class, config::kPlayerControllerOverrideJumpCooldownMethod, 1);
       if (g_player_controller_override_jump_cooldown) {
         AppendLog("Resolved PlayerController::OverrideJumpCooldown");
+      }
+    }
+
+    if (!g_run_manager_class) {
+      g_run_manager_class = g_mono.mono_class_from_name(g_image, "", "RunManager");
+      if (!g_run_manager_class) {
+        g_run_manager_class = FindClassAnyAssembly("", "RunManager");
+      }
+    }
+    if (g_run_manager_class && !g_run_manager_vtable) {
+      g_run_manager_vtable = g_mono.mono_class_vtable(g_domain, g_run_manager_class);
+    }
+    if (g_run_manager_class && !g_run_manager_instance_field) {
+      g_run_manager_instance_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "instance");
+      if (g_run_manager_instance_field) {
+        AppendLog("Resolved RunManager::instance field");
+      }
+    }
+    if (g_run_manager_class && !g_run_manager_restarting_field) {
+      g_run_manager_restarting_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "restarting");
+      if (g_run_manager_restarting_field) {
+        AppendLog("Resolved RunManager::restarting field");
+      }
+    }
+    if (g_run_manager_class && !g_run_manager_wait_to_change_scene_field) {
+      g_run_manager_wait_to_change_scene_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "waitToChangeScene");
+      if (g_run_manager_wait_to_change_scene_field) {
+        AppendLog("Resolved RunManager::waitToChangeScene field");
+      }
+    }
+    if (g_run_manager_class && !g_run_manager_lobby_join_field) {
+      g_run_manager_lobby_join_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "lobbyJoin");
+      if (g_run_manager_lobby_join_field) {
+        AppendLog("Resolved RunManager::lobbyJoin field");
+      }
+    }
+
+    if (!g_level_generator_class) {
+      g_level_generator_class = g_mono.mono_class_from_name(g_image, "", "LevelGenerator");
+      if (!g_level_generator_class) {
+        g_level_generator_class = FindClassAnyAssembly("", "LevelGenerator");
+      }
+    }
+    if (g_level_generator_class && !g_level_generator_vtable) {
+      g_level_generator_vtable = g_mono.mono_class_vtable(g_domain, g_level_generator_class);
+    }
+    if (g_level_generator_class && !g_level_generator_instance_field) {
+      g_level_generator_instance_field = g_mono.mono_class_get_field_from_name(
+        g_level_generator_class, "Instance");
+      if (g_level_generator_instance_field) {
+        AppendLog("Resolved LevelGenerator::Instance field");
+      }
+    }
+    if (g_level_generator_class && !g_level_generator_state_field) {
+      g_level_generator_state_field = g_mono.mono_class_get_field_from_name(
+        g_level_generator_class, "State");
+      if (g_level_generator_state_field) {
+        AppendLog("Resolved LevelGenerator::State field");
+      }
+    }
+    if (g_level_generator_class && !g_level_generator_generated_field) {
+      g_level_generator_generated_field = g_mono.mono_class_get_field_from_name(
+        g_level_generator_class, "Generated");
+      if (g_level_generator_generated_field) {
+        AppendLog("Resolved LevelGenerator::Generated field");
       }
     }
 
@@ -1566,6 +1623,102 @@ namespace {
         g_semi_func_class, config::kSemiFuncStatGetRunCurrencyMethod, 0);
       if (g_semi_func_stat_get_run_currency) {
         AppendLog("Resolved SemiFunc::StatGetRunCurrency");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_is_not_master_client) {
+      g_semi_func_is_not_master_client = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncIsNotMasterClientMethod, 0);
+      if (g_semi_func_is_not_master_client) {
+        AppendLog("Resolved SemiFunc::IsNotMasterClient");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_is_master_client) {
+      g_semi_func_is_master_client = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncIsMasterClientMethod, 0);
+      if (g_semi_func_is_master_client) {
+        AppendLog("Resolved SemiFunc::IsMasterClient");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_is_master_client_or_singleplayer) {
+      g_semi_func_is_master_client_or_singleplayer = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncIsMasterClientOrSingleplayerMethod, 0);
+      if (g_semi_func_is_master_client_or_singleplayer) {
+        AppendLog("Resolved SemiFunc::IsMasterClientOrSingleplayer");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_master_only_rpc) {
+      g_semi_func_master_only_rpc = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncMasterOnlyRPCMethod, 1);
+      if (g_semi_func_master_only_rpc) {
+        AppendLog("Resolved SemiFunc::MasterOnlyRPC");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_owner_only_rpc) {
+      g_semi_func_owner_only_rpc = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncOwnerOnlyRPCMethod, 2);
+      if (g_semi_func_owner_only_rpc) {
+        AppendLog("Resolved SemiFunc::OwnerOnlyRPC");
+      }
+    }
+    if (g_semi_func_class && !g_semi_func_master_and_owner_only_rpc) {
+      g_semi_func_master_and_owner_only_rpc = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, config::kSemiFuncMasterAndOwnerOnlyRPCMethod, 2);
+      if (g_semi_func_master_and_owner_only_rpc) {
+        AppendLog("Resolved SemiFunc::MasterAndOwnerOnlyRPC");
+      }
+    }
+    if (!g_photon_network_class) {
+      g_photon_network_class = FindClassAnyAssembly("Photon.Pun", "PhotonNetwork");
+      if (g_photon_network_class) {
+        AppendLog("Resolved PhotonNetwork class");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_get_is_master_client) {
+      g_photon_network_get_is_master_client =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_IsMasterClient", 0);
+      if (g_photon_network_get_is_master_client) {
+        AppendLog("Resolved PhotonNetwork::get_IsMasterClient");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_get_local_player) {
+      g_photon_network_get_local_player =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_LocalPlayer", 0);
+      if (g_photon_network_get_local_player) {
+        AppendLog("Resolved PhotonNetwork::get_LocalPlayer");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_get_master_client) {
+      g_photon_network_get_master_client =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_MasterClient", 0);
+      if (g_photon_network_get_master_client) {
+        AppendLog("Resolved PhotonNetwork::get_MasterClient");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_get_in_room) {
+      g_photon_network_get_in_room =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_InRoom", 0);
+      if (g_photon_network_get_in_room) {
+        AppendLog("Resolved PhotonNetwork::get_InRoom");
+      }
+    }
+    if (g_photon_network_class && !g_photon_network_get_level_loading_progress) {
+      g_photon_network_get_level_loading_progress =
+        g_mono.mono_class_get_method_from_name(g_photon_network_class, "get_LevelLoadingProgress", 0);
+      if (g_photon_network_get_level_loading_progress) {
+        AppendLog("Resolved PhotonNetwork::get_LevelLoadingProgress");
+      }
+    }
+    if (!g_photon_player_class) {
+      g_photon_player_class = FindClassAnyAssembly("Photon.Realtime", "Player");
+      if (g_photon_player_class) {
+        AppendLog("Resolved Photon.Realtime.Player class");
+      }
+    }
+    if (g_photon_player_class && !g_photon_player_get_actor_number) {
+      g_photon_player_get_actor_number =
+        g_mono.mono_class_get_method_from_name(g_photon_player_class, "get_ActorNumber", 0);
+      if (g_photon_player_get_actor_number) {
+        AppendLog("Resolved Photon.Realtime.Player::get_ActorNumber");
       }
     }
 
@@ -2184,7 +2337,6 @@ namespace {
             g_mono.mono_class_get_method_from_name(g_item_manager_class, name, argc);
           if (g_item_manager_get_all_items) {
             g_item_manager_get_all_items_argc = argc;
-            g_item_manager_get_all_items_name = name;
             std::ostringstream oss;
             oss << "Resolved ItemManager method: " << name << " argc=" << argc;
             AppendLog(oss.str());
@@ -2305,9 +2457,27 @@ namespace {
       g_item_attributes_value_field =
         g_mono.mono_class_get_field_from_name(g_item_attributes_class, "value");
     }
+    if (g_item_attributes_class && !g_item_attributes_item_field) {
+      g_item_attributes_item_field =
+        g_mono.mono_class_get_field_from_name(g_item_attributes_class, "item");
+    }
     if (g_item_attributes_class && !g_item_attributes_item_type_field) {
       g_item_attributes_item_type_field =
         g_mono.mono_class_get_field_from_name(g_item_attributes_class, "itemType");
+    }
+    if (g_item_attributes_class && !g_item_attributes_item_name_field) {
+      g_item_attributes_item_name_field =
+        g_mono.mono_class_get_field_from_name(g_item_attributes_class, "itemName");
+      if (g_item_attributes_item_name_field) {
+        AppendLog("Resolved ItemAttributes::itemName field");
+      }
+    }
+    if (g_item_attributes_class && !g_item_attributes_instance_name_field) {
+      g_item_attributes_instance_name_field =
+        g_mono.mono_class_get_field_from_name(g_item_attributes_class, "instanceName");
+      if (g_item_attributes_instance_name_field) {
+        AppendLog("Resolved ItemAttributes::instanceName field");
+      }
     }
     if (g_item_attributes_class && !g_item_attributes_type_obj && g_mono.mono_class_get_type &&
       g_mono.mono_type_get_object) {
@@ -2321,6 +2491,50 @@ namespace {
         g_mono.mono_class_get_field_from_name(g_item_volume_class, "itemAttributes");
       if (!g_item_volume_item_attributes_field) {
         AppendLogOnce("ItemVolume_itemAttributes_missing", "ItemVolume::itemAttributes field not found");
+      }
+    }
+    if (!g_item_class) {
+      g_item_class = g_mono.mono_class_from_name(g_image, "", "Item");
+      if (!g_item_class) {
+        g_item_class = FindClassAnyAssembly("", "Item");
+      }
+      if (g_item_class) {
+        AppendLog("Resolved Item class");
+      }
+    }
+    if (g_item_class && !g_item_item_name_field) {
+      g_item_item_name_field = g_mono.mono_class_get_field_from_name(g_item_class, "itemName");
+      if (g_item_item_name_field) {
+        AppendLog("Resolved Item::itemName field");
+      }
+    }
+    if (!g_valuable_object_class) {
+      g_valuable_object_class = g_mono.mono_class_from_name(
+        g_image, config::kValuableObjectNamespace, config::kValuableObjectClass);
+      if (!g_valuable_object_class) {
+        g_valuable_object_class = FindClassAnyAssembly(
+          config::kValuableObjectNamespace, config::kValuableObjectClass);
+      }
+      if (g_valuable_object_class) {
+        AppendLog("Resolved ValuableObject class");
+      }
+    }
+    if (g_valuable_object_class && !g_valuable_object_value_field) {
+      const char* value_fields[] = { "dollarValueCurrent", "dollarValueOriginal", "value" };
+      for (const char* n : value_fields) {
+        g_valuable_object_value_field = g_mono.mono_class_get_field_from_name(g_valuable_object_class, n);
+        if (g_valuable_object_value_field) {
+          AppendLog(std::string("Resolved ValuableObject value field as: ") + n);
+          break;
+        }
+      }
+    }
+    if (g_valuable_object_class && !g_valuable_object_type_obj &&
+      g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
+      MonoType* t = g_mono.mono_class_get_type(g_valuable_object_class);
+      if (t) {
+        g_valuable_object_type_obj =
+          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), t);
       }
     }
     if (!g_valuable_director_class) {
@@ -2495,8 +2709,28 @@ namespace {
         continue;
       }
 
+      MonoClass* player_class = g_mono.mono_object_get_class(player);
+      if (!player_class) {
+        continue;
+      }
+      if (g_player_avatar_class &&
+          player_class != g_player_avatar_class &&
+          !IsSubclassOf(player_class, g_player_avatar_class)) {
+        continue;
+      }
+
       bool is_local = false;
+      bool read_ok = true;
+#ifdef _MSC_VER
+      read_ok = FieldGetBoolSafeSeh(player, g_player_avatar_is_local_field, is_local);
+#else
       g_mono.mono_field_get_value(player, g_player_avatar_is_local_field, &is_local);
+#endif
+      if (!read_ok) {
+        AppendLogOnce("PlayerList_isLocal_read_fault",
+          "PlayerList scan: reading PlayerAvatar::isLocal triggered SEH; skipped entry");
+        continue;
+      }
       if (is_local) {
         AppendLogOnce("LocalPlayer_from_list", "Local player found via PlayerList");
         return player;
@@ -2963,6 +3197,24 @@ namespace {
     }
   }
 
+#ifdef _MSC_VER
+  // Keep SEH in a tiny helper without C++ temporaries to avoid C2712.
+  static bool FieldGetBoolSafeSeh(MonoObject* obj, MonoClassField* field, bool& out_value) {
+    out_value = false;
+    if (!obj || !field || !g_mono.mono_field_get_value) {
+      return false;
+    }
+    __try {
+      g_mono.mono_field_get_value(obj, field, &out_value);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = false;
+      return false;
+    }
+  }
+#endif
+
   bool TryGetHealth(MonoObject* player_avatar_obj, PlayerState& out_state) {
     if (!player_avatar_obj) {
       AppendLog("TryGetHealth: player_avatar_obj is null");
@@ -3105,21 +3357,12 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
 
   MonoObject* local_player = nullptr;
   bool via_list = false;
-  bool via_static_instance = false;
-  bool via_method = false;
 
-  // Prefer PlayerList traversal (most reliable).
-  local_player = FindLocalPlayerFromList();
-  if (local_player) {
-    via_list = true;
-  }
-
-  // Fallback: static instance field with multiple name candidates.
+  // Prefer static instance first: stable and cheap.
   if (!local_player && g_player_avatar_instance_field && g_player_avatar_vtable) {
     g_mono.mono_field_static_get_value(
       g_player_avatar_vtable, g_player_avatar_instance_field, &local_player);
     if (local_player) {
-      via_static_instance = true;
       AppendLogOnce("localplayer_static_resolved",
         "Local player resolved via PlayerAvatar static instance");
     }
@@ -3149,7 +3392,6 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
         "SemiFunc::PlayerAvatarLocal threw an exception");
     }
     else if (local_player) {
-      via_method = true;
       AppendLogOnce("localplayer_method_resolved",
         "Local player resolved via SemiFunc::PlayerAvatarLocal");
     }
@@ -3159,6 +3401,14 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
       "Skipping SemiFunc::PlayerAvatarLocal: method unresolved");
   }
 
+  // Last fallback: PlayerList traversal can be noisy/unstable in some sessions.
+  if (!local_player) {
+    local_player = FindLocalPlayerFromList();
+    if (local_player) {
+      via_list = true;
+    }
+  }
+
   if (!local_player) {
     AppendLogOnce("localplayer_failed", "Failed to resolve local player via all strategies");
     return false;
@@ -3166,7 +3416,16 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
 
   bool is_local = false;
   if (g_player_avatar_is_local_field) {
+#ifdef _MSC_VER
+    bool read_ok = FieldGetBoolSafeSeh(local_player, g_player_avatar_is_local_field, is_local);
+    if (!read_ok) {
+      AppendLogOnce("localplayer_isLocal_read_fault",
+        "MonoGetLocalPlayer: reading isLocal triggered SEH");
+      is_local = false;
+    }
+#else
     g_mono.mono_field_get_value(local_player, g_player_avatar_is_local_field, &is_local);
+#endif
   }
 
   AppendLogOnce("localplayer_found",
@@ -3178,8 +3437,30 @@ bool MonoGetLocalPlayerInternal(LocalPlayerInfo& out_info) {
   return true;
 }
 
+#ifdef _MSC_VER
+// Dedicated SEH wrapper to avoid C2712 in high-level functions.
+static bool MonoGetLocalPlayerInternalSafe(LocalPlayerInfo& out_info) {
+  __try {
+    return MonoGetLocalPlayerInternal(out_info);
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    out_info = {};
+    return false;
+  }
+}
+#endif
+
 bool MonoGetLocalPlayer(LocalPlayerInfo& out_info) {
+#ifdef _MSC_VER
+  bool ok = MonoGetLocalPlayerInternalSafe(out_info);
+  if (!ok) {
+    AppendLogOnce("MonoGetLocalPlayer_seh_guard",
+      "MonoGetLocalPlayer caught SEH and returned false (guard active)");
+  }
+  return ok;
+#else
   return MonoGetLocalPlayerInternal(out_info);
+#endif
 }
 
 bool MonoGetPlayerStateFromAvatar(void* player_avatar_obj, PlayerState& out_state) {
@@ -3368,14 +3649,262 @@ bool MonoSetJumpExtraDirect(int jump_count) {
 
 bool ReadRunCurrency(int& out_value);
 
+static MonoObject* GetPunManagerInstance() {
+  if (!g_pun_manager_instance_field || !g_pun_manager_vtable) {
+    return nullptr;
+  }
+  MonoObject* pun_instance = nullptr;
+  g_mono.mono_field_static_get_value(
+    g_pun_manager_vtable, g_pun_manager_instance_field, &pun_instance);
+  return pun_instance;
+}
+
+static int GetPhotonPlayerActorNumber(MonoObject* player_obj) {
+  if (!player_obj || !g_photon_player_get_actor_number ||
+      !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
+    return -1;
+  }
+  MonoObject* exc = nullptr;
+  MonoObject* boxed = g_mono.mono_runtime_invoke(
+    g_photon_player_get_actor_number, player_obj, nullptr, &exc);
+  if (exc || !boxed) {
+    return -1;
+  }
+  void* raw = g_mono.mono_object_unbox(boxed);
+  if (!raw) {
+    return -1;
+  }
+  return *static_cast<int*>(raw);
+}
+
+static bool InvokeStaticBoolMethod(MonoMethod* method, bool& out_value) {
+  out_value = false;
+  if (!method || !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
+    return false;
+  }
+  MonoObject* exc = nullptr;
+  MonoObject* boxed = g_mono.mono_runtime_invoke(method, nullptr, nullptr, &exc);
+  if (exc || !boxed) {
+    return false;
+  }
+  void* raw = g_mono.mono_object_unbox(boxed);
+  if (!raw) {
+    return false;
+  }
+  out_value = (*static_cast<uint8_t*>(raw) != 0);
+  return true;
+}
+
+static bool InvokeStaticFloatMethod(MonoMethod* method, float& out_value) {
+  out_value = 0.0f;
+  if (!method || !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
+    return false;
+  }
+  MonoObject* exc = nullptr;
+  MonoObject* boxed = g_mono.mono_runtime_invoke(method, nullptr, nullptr, &exc);
+  if (exc || !boxed) {
+    return false;
+  }
+  void* raw = g_mono.mono_object_unbox(boxed);
+  if (!raw) {
+    return false;
+  }
+  out_value = *static_cast<float*>(raw);
+  return true;
+}
+
+static MonoObject* GetStaticSingletonInstance(MonoVTable* vtable, MonoClassField* field) {
+  if (!vtable || !field || !g_mono.mono_field_static_get_value) {
+    return nullptr;
+  }
+  MonoObject* instance = nullptr;
+  g_mono.mono_field_static_get_value(vtable, field, &instance);
+  return instance;
+}
+
+static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& out_reason) {
+  out_transitioning = true;
+  out_reason = "managed_refs_unavailable";
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) {
+    return false;
+  }
+
+  bool in_room = true;
+  if (InvokeStaticBoolMethod(g_photon_network_get_in_room, in_room)) {
+    if (!in_room) {
+      out_transitioning = true;
+      out_reason = "PhotonNetwork.InRoom=false";
+      return true;
+    }
+  }
+
+  float load_progress = 0.0f;
+  if (InvokeStaticFloatMethod(g_photon_network_get_level_loading_progress, load_progress)) {
+    if (load_progress > 0.001f && load_progress < 0.999f) {
+      out_transitioning = true;
+      out_reason = "PhotonNetwork.LevelLoadingProgress";
+      return true;
+    }
+  }
+
+  MonoObject* run_manager =
+    GetStaticSingletonInstance(g_run_manager_vtable, g_run_manager_instance_field);
+  if (!run_manager) {
+    out_transitioning = true;
+    out_reason = "RunManager.instance=null";
+    return true;
+  }
+
+  int value = 0;
+  if (g_run_manager_restarting_field &&
+      ReadFieldNumber(run_manager, g_run_manager_restarting_field, value) && value != 0) {
+    out_transitioning = true;
+    out_reason = "RunManager.restarting";
+    return true;
+  }
+  if (g_run_manager_wait_to_change_scene_field &&
+      ReadFieldNumber(run_manager, g_run_manager_wait_to_change_scene_field, value) && value != 0) {
+    out_transitioning = true;
+    out_reason = "RunManager.waitToChangeScene";
+    return true;
+  }
+  if (g_run_manager_lobby_join_field &&
+      ReadFieldNumber(run_manager, g_run_manager_lobby_join_field, value) && value != 0) {
+    out_transitioning = true;
+    out_reason = "RunManager.lobbyJoin";
+    return true;
+  }
+
+  MonoObject* game_director =
+    GetStaticSingletonInstance(g_game_director_vtable, g_game_director_instance_field);
+  if (!game_director) {
+    out_transitioning = true;
+    out_reason = "GameDirector.instance=null";
+    return true;
+  }
+
+  constexpr int k_game_state_load = 0;
+  constexpr int k_game_state_end_wait = 5;
+  if (!g_game_director_current_state_field) {
+    out_transitioning = true;
+    out_reason = "GameDirector.currentState unresolved";
+    return true;
+  }
+  if (ReadFieldNumber(game_director, g_game_director_current_state_field, value)) {
+    if (value == k_game_state_load || value == k_game_state_end_wait) {
+      out_transitioning = true;
+      out_reason = "GameDirector.currentState=Load/EndWait";
+      return true;
+    }
+  }
+
+  MonoObject* level_generator =
+    GetStaticSingletonInstance(g_level_generator_vtable, g_level_generator_instance_field);
+  if (level_generator) {
+    if (g_level_generator_generated_field &&
+        ReadFieldNumber(level_generator, g_level_generator_generated_field, value) && value == 0) {
+      out_transitioning = true;
+      out_reason = "LevelGenerator.Generated=false";
+      return true;
+    }
+    constexpr int k_level_state_done = 14;
+    if (g_level_generator_state_field &&
+        ReadFieldNumber(level_generator, g_level_generator_state_field, value) &&
+        value != k_level_state_done) {
+      out_transitioning = true;
+      out_reason = "LevelGenerator.State!=Done";
+      return true;
+    }
+  }
+
+  out_transitioning = false;
+  out_reason = "stable";
+  return true;
+}
+
+static bool GetPhotonAuthoritySnapshot(bool& out_is_master_client,
+                                       bool& out_local_equals_master,
+                                       int& out_local_actor,
+                                       int& out_master_actor) {
+  out_is_master_client = false;
+  out_local_equals_master = false;
+  out_local_actor = -1;
+  out_master_actor = -1;
+  if (!g_mono.mono_runtime_invoke ||
+      !g_photon_network_get_local_player ||
+      !g_photon_network_get_master_client) {
+    return false;
+  }
+
+  MonoObject* exc = nullptr;
+  MonoObject* local_player = g_mono.mono_runtime_invoke(
+    g_photon_network_get_local_player, nullptr, nullptr, &exc);
+  if (exc) {
+    local_player = nullptr;
+  }
+
+  exc = nullptr;
+  MonoObject* master_player = g_mono.mono_runtime_invoke(
+    g_photon_network_get_master_client, nullptr, nullptr, &exc);
+  if (exc) {
+    master_player = nullptr;
+  }
+
+  out_local_equals_master = local_player && master_player && local_player == master_player;
+  out_local_actor = GetPhotonPlayerActorNumber(local_player);
+  out_master_actor = GetPhotonPlayerActorNumber(master_player);
+
+  if (g_photon_network_get_is_master_client && g_mono.mono_object_unbox) {
+    exc = nullptr;
+    MonoObject* boxed = g_mono.mono_runtime_invoke(
+      g_photon_network_get_is_master_client, nullptr, nullptr, &exc);
+    if (!exc && boxed) {
+      void* raw = g_mono.mono_object_unbox(boxed);
+      if (raw) {
+        out_is_master_client = (*static_cast<uint8_t*>(raw) != 0);
+      }
+    }
+  } else {
+    out_is_master_client = out_local_equals_master;
+  }
+
+  return true;
+}
+
+static void LogPhotonAuthoritySnapshot(const char* tag) {
+  bool is_master_client = false;
+  bool local_equals_master = false;
+  int local_actor = -1;
+  int master_actor = -1;
+  if (!GetPhotonAuthoritySnapshot(
+        is_master_client, local_equals_master, local_actor, master_actor)) {
+    AppendLog(std::string(tag) + ": Photon authority snapshot unavailable");
+    return;
+  }
+
+  std::ostringstream oss;
+  oss << tag
+      << ": Photon isMasterClient=" << (is_master_client ? "true" : "false")
+      << " localActor=" << local_actor
+      << " masterActor=" << master_actor
+      << " local==master=" << (local_equals_master ? "true" : "false");
+  AppendLog(oss.str());
+
+  if (!local_equals_master) {
+    std::ostringstream key;
+    key << "PhotonAuthorityMismatch_" << local_actor << "_" << master_actor;
+    AppendLogOnce(key.str(),
+      std::string(tag) +
+      ": local player is not the real master; remote authoritative state may ignore local writes.");
+  }
+}
+
 bool SetRunCurrencyViaPunManager(int amount) {
   if (!g_pun_set_run_stat_set || !g_pun_manager_instance_field || !g_pun_manager_vtable ||
     !g_mono.mono_string_new) {
     return false;
   }
-  MonoObject* pun_instance = nullptr;
-  g_mono.mono_field_static_get_value(g_pun_manager_vtable, g_pun_manager_instance_field,
-    &pun_instance);
+  MonoObject* pun_instance = GetPunManagerInstance();
   if (!pun_instance) {
     AppendLog("SetRunCurrencyViaPunManager: PunManager::instance is null");
     return false;
@@ -3395,6 +3924,63 @@ bool SetRunCurrencyViaPunManager(int amount) {
   }
   AppendLog("SetRunCurrencyViaPunManager: SetRunStatSet succeeded");
   return true;
+}
+
+bool MonoIsSessionTransitioning() {
+  bool transitioning = true;
+  std::string reason;
+  ComputeSessionTransitionState(transitioning, reason);
+
+  static bool s_last_transitioning = true;
+  static std::string s_last_reason;
+  if (s_last_transitioning != transitioning || s_last_reason != reason) {
+    std::ostringstream oss;
+    oss << "SessionTransitionGuard: " << (transitioning ? "busy" : "stable")
+        << " reason=" << reason;
+    AppendLog(oss.str());
+    s_last_transitioning = transitioning;
+    s_last_reason = reason;
+  }
+  return transitioning;
+}
+
+bool MonoSetSessionMaster(bool enable) {
+  if (enable && g_session_master_patch_active) {
+    return true;
+  }
+  if (!enable && !g_session_master_patch_active) {
+    return true;
+  }
+  if (!CacheManagedRefs()) {
+    AppendLog("MonoSetSessionMaster: CacheManagedRefs failed");
+    return false;
+  }
+  std::ostringstream request_log;
+  request_log << "MonoSetSessionMaster: request=" << (enable ? "enable" : "disable")
+              << " active=" << (g_session_master_patch_active ? "yes" : "no");
+  AppendLog(request_log.str());
+  LogPhotonAuthoritySnapshot("MonoSetSessionMaster(before)");
+  if (enable) {
+    if (!ApplySessionMasterPatches()) {
+      AppendLog("MonoSetSessionMaster: patch application failed");
+      RestoreSessionMasterPatches();
+      g_session_master_patch_active = false;
+      return false;
+    }
+    g_session_master_patch_active = true;
+    AppendLog("MonoSetSessionMaster: enabled");
+    LogPhotonAuthoritySnapshot("MonoSetSessionMaster(enabled)");
+    return true;
+  }
+  bool ok = RestoreSessionMasterPatches();
+  g_session_master_patch_active = false;
+  if (ok) {
+    AppendLog("MonoSetSessionMaster: disabled");
+  } else {
+    AppendLog("MonoSetSessionMaster: disable attempted but restore failed");
+  }
+  LogPhotonAuthoritySnapshot("MonoSetSessionMaster(disabled)");
+  return ok;
 }
 
 // RoundDirector helpers ----------------------------------------------------
@@ -4377,6 +4963,9 @@ bool MonoSetRunCurrency(int amount) {
     AppendLog("MonoSetRunCurrency: CacheManagedRefs failed");
     return false;
   }
+  if (g_session_master_patch_active) {
+    LogPhotonAuthoritySnapshot("MonoSetRunCurrency");
+  }
   if (!g_semi_func_stat_set_run_currency) {
     AppendLog("MonoSetRunCurrency: StatSetRunCurrency method unresolved");
   }
@@ -4475,12 +5064,20 @@ bool MonoUpgradeExtraJump(int count) {
   }
 
   void* args[2] = { steam_str, &count };
+  MonoObject* pun_instance = GetPunManagerInstance();
+  if (!pun_instance) {
+    AppendLog("MonoUpgradeExtraJump: PunManager::instance is null");
+    return false;
+  }
   MonoObject* exc = nullptr;
-  g_mono.mono_runtime_invoke(g_pun_upgrade_extra_jump, nullptr, args, &exc);
+  g_mono.mono_runtime_invoke(g_pun_upgrade_extra_jump, pun_instance, args, &exc);
   if (exc) {
     AppendLog("MonoUpgradeExtraJump: method threw exception");
     return false;
   }
+  std::ostringstream ok_log;
+  ok_log << "MonoUpgradeExtraJump: applied count=" << count;
+  AppendLog(ok_log.str());
   return true;
 }
 
@@ -4550,6 +5147,15 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
     AppendLog("MonoSetGrabStrength: CacheManagedRefs failed");
     return false;
   }
+  if (g_session_master_patch_active) {
+    LogPhotonAuthoritySnapshot("MonoSetGrabStrength");
+  }
+  {
+    std::ostringstream req;
+    req << "MonoSetGrabStrength: request grab=" << grab_strength
+        << " throw=" << throw_strength;
+    AppendLog(req.str());
+  }
   if (!g_pun_upgrade_grab_strength && !g_pun_upgrade_throw_strength) {
     static bool logged = false;
     if (!logged) {
@@ -4577,25 +5183,42 @@ bool MonoSetGrabStrength(int grab_strength, int throw_strength) {
   }
 
   bool ok = false;
+  MonoObject* pun_instance = GetPunManagerInstance();
+  if ((g_pun_upgrade_grab_strength || g_pun_upgrade_throw_strength) && !pun_instance) {
+    AppendLog("MonoSetGrabStrength: PunManager::instance is null");
+  }
   if (g_pun_upgrade_grab_strength) {
     void* args[2] = { steam_str, &grab_strength };
     MonoObject* exc = nullptr;
-    g_mono.mono_runtime_invoke(g_pun_upgrade_grab_strength, nullptr, args, &exc);
-    if (!exc) ok = true;
+    g_mono.mono_runtime_invoke(g_pun_upgrade_grab_strength, pun_instance, args, &exc);
+    if (exc) {
+      AppendLog("MonoSetGrabStrength: UpgradePlayerGrabStrength threw exception");
+    } else {
+      ok = true;
+    }
   }
   if (g_pun_upgrade_throw_strength) {
     void* args[2] = { steam_str, &throw_strength };
     MonoObject* exc = nullptr;
-    g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, nullptr, args, &exc);
-    if (!exc) ok = true;
+    g_mono.mono_runtime_invoke(g_pun_upgrade_throw_strength, pun_instance, args, &exc);
+    if (exc) {
+      AppendLog("MonoSetGrabStrength: UpgradePlayerThrowStrength threw exception");
+    } else {
+      ok = true;
+    }
   }
 // Non-ASCII comment normalized.
 // Non-ASCII comment normalized.
   float desired = 0.2f * static_cast<float>(grab_strength);
-  MonoSetGrabStrengthField(desired);
+  bool field_ok = MonoSetGrabStrengthField(desired);
 
   if (!ok) {
     AppendLog("MonoSetGrabStrength: RPC failed, applied local field fallback only");
+  } else {
+    AppendLog("MonoSetGrabStrength: PunManager upgrade invoke succeeded");
+  }
+  if (!field_ok) {
+    AppendLog("MonoSetGrabStrength: local field fallback failed");
   }
   return true;
 }
@@ -4640,6 +5263,9 @@ bool MonoSetGrabStrengthField(float strength) {
   }
 
   g_mono.mono_field_set_value(grabber, g_phys_grabber_strength_field, &strength);
+  std::ostringstream oss;
+  oss << "MonoSetGrabStrengthField: grabStrength=" << strength;
+  AppendLog(oss.str());
   return true;
 }
 
@@ -4681,6 +5307,9 @@ bool MonoSetGrabRange(float range) {
   }
 
   g_mono.mono_field_set_value(grabber, g_phys_grabber_range_field, &range);
+  std::ostringstream oss;
+  oss << "MonoSetGrabRange: grabRange=" << range;
+  AppendLog(oss.str());
   return true;
 }
 
@@ -4739,6 +5368,9 @@ bool MonoSetCartValue(int value) {
   if (!CacheManagedRefs()) {
     AppendLog("MonoSetCartValue: CacheManagedRefs failed");
     return false;
+  }
+  if (g_session_master_patch_active) {
+    LogPhotonAuthoritySnapshot("MonoSetCartValue");
   }
   if (!g_cart_apply_in_progress) {
     g_pending_cart_value = value;
@@ -5471,15 +6103,67 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
       };
 
-    // cache per-class value field to avoid repeated lookups
-    static std::unordered_map<MonoClass*, MonoClassField*> value_field_cache;
+    auto read_mono_string_field = [&](MonoObject* obj, MonoClassField* field) -> std::string {
+      if (!obj || !field) return {};
+      MonoObject* str_obj = nullptr;
+      g_mono.mono_field_get_value(obj, field, &str_obj);
+      if (!str_obj) return {};
+      return MonoStringToUtf8(str_obj);
+    };
+
+    auto apply_item_attributes = [&](MonoObject* attr_obj, PlayerState& st) {
+      if (!attr_obj) return;
+      if (g_item_attributes_value_field && !st.has_value) {
+        int v = 0;
+        g_mono.mono_field_get_value(attr_obj, g_item_attributes_value_field, &v);
+        st.value = v;
+        st.has_value = true;
+      }
+      if (g_item_attributes_item_type_field && !st.has_item_type) {
+        int t = -1;
+        g_mono.mono_field_get_value(attr_obj, g_item_attributes_item_type_field, &t);
+        st.item_type = t;
+        st.has_item_type = true;
+      }
+      std::string item_name = read_mono_string_field(attr_obj, g_item_attributes_item_name_field);
+      std::string instance_name = read_mono_string_field(attr_obj, g_item_attributes_instance_name_field);
+      std::string preferred;
+      if (!item_name.empty()) {
+        preferred = item_name;
+      } else if (!instance_name.empty()) {
+        preferred = instance_name;
+        size_t slash = preferred.find('/');
+        if (slash != std::string::npos) {
+          preferred = preferred.substr(0, slash);
+        }
+      } else if (g_item_attributes_item_field && g_item_item_name_field) {
+        MonoObject* item_obj = nullptr;
+        g_mono.mono_field_get_value(attr_obj, g_item_attributes_item_field, &item_obj);
+        preferred = read_mono_string_field(item_obj, g_item_item_name_field);
+      }
+      if (!preferred.empty()) {
+        st.name = preferred;
+        st.has_name = true;
+      }
+      st.category = PlayerState::Category::kValuable;
+    };
+
+    auto apply_valuable_object = [&](MonoObject* valuable_obj, PlayerState& st) {
+      if (!valuable_obj) return;
+      if (g_valuable_object_value_field && !st.has_value) {
+        float v = 0.0f;
+        g_mono.mono_field_get_value(valuable_obj, g_valuable_object_value_field, &v);
+        st.value = static_cast<int>(std::lround(v));
+        st.has_value = true;
+      }
+      st.category = PlayerState::Category::kValuable;
+    };
 
     auto populate_meta = [&](MonoObject* item_obj, PlayerState& st) {
       if (!item_obj) return;
       MonoObject* exc_go = nullptr;
       MonoObject* go_obj = g_component_get_game_object
-        ? g_mono.mono_runtime_invoke(g_component_get_game_object, item_obj,
-          nullptr, &exc_go)
+        ? g_mono.mono_runtime_invoke(g_component_get_game_object, item_obj, nullptr, &exc_go)
         : nullptr;
       if (!exc_go && go_obj && !IsUnityNull(go_obj)) {
         DisableFadeOnObject(go_obj);
@@ -5504,62 +6188,50 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
 
       MonoClass* cls = g_mono.mono_object_get_class(item_obj);
-      if (cls) {
-// Non-ASCII comment normalized.
-        if (g_item_volume_class && IsSubclassOf(cls, g_item_volume_class) &&
-          g_item_volume_item_attributes_field) {
-          MonoObject* attr_obj = nullptr;
-          g_mono.mono_field_get_value(item_obj, g_item_volume_item_attributes_field, &attr_obj);
-          if (attr_obj) {
-            if (g_item_attributes_value_field) {
-              int v = 0;
-              g_mono.mono_field_get_value(attr_obj, g_item_attributes_value_field, &v);
-              st.value = v;
-              st.has_value = true;
-              st.category = PlayerState::Category::kValuable;
-            }
-            if (g_item_attributes_item_type_field) {
-              int t = -1;
-              g_mono.mono_field_get_value(attr_obj, g_item_attributes_item_type_field, &t);
-              st.item_type = t;
-              st.has_item_type = true;
-            }
-          }
-        }
-// Non-ASCII comment normalized.
-        if ((!st.has_value || !st.has_item_type) && go_obj &&
-          g_game_object_get_component && g_item_attributes_type_obj) {
-          void* args_attr[1] = { g_item_attributes_type_obj };
-          MonoObject* attr_obj = SafeInvoke(g_game_object_get_component, go_obj, args_attr,
-            "GameObject.GetComponent(ItemAttributes)");
-          if (attr_obj) {
-            if (!st.has_value && g_item_attributes_value_field) {
-              int v = 0;
-              g_mono.mono_field_get_value(attr_obj, g_item_attributes_value_field, &v);
-              st.value = v;
-              st.has_value = true;
-              st.category = PlayerState::Category::kValuable;
-            }
-            if (!st.has_item_type && g_item_attributes_item_type_field) {
-              int t = -1;
-              g_mono.mono_field_get_value(attr_obj, g_item_attributes_item_type_field, &t);
-              st.item_type = t;
-              st.has_item_type = true;
-            }
-          }
-        }
+      if (!cls) return;
 
-        if (!st.has_value && g_phys_grab_object_class && IsSubclassOf(cls, g_phys_grab_object_class)) {
-          st.category = PlayerState::Category::kPhysGrab;
+      if (g_item_volume_class && IsSubclassOf(cls, g_item_volume_class) && g_item_volume_item_attributes_field) {
+        MonoObject* attr_obj = nullptr;
+        g_mono.mono_field_get_value(item_obj, g_item_volume_item_attributes_field, &attr_obj);
+        apply_item_attributes(attr_obj, st);
+      }
+
+      if (go_obj && g_game_object_get_component && g_item_attributes_type_obj &&
+        (!st.has_value || !st.has_item_type || !st.has_name)) {
+        void* args_attr[1] = { g_item_attributes_type_obj };
+        MonoObject* attr_obj = SafeInvoke(g_game_object_get_component, go_obj, args_attr,
+          "GameObject.GetComponent(ItemAttributes)");
+        if (!attr_obj && g_game_object_get_component_in_parent) {
+          attr_obj = SafeInvoke(g_game_object_get_component_in_parent, go_obj, args_attr,
+            "GameObject.GetComponentInParent(ItemAttributes)");
         }
-        else if (!st.has_value && g_item_volume_class && IsSubclassOf(cls, g_item_volume_class)) {
-          st.category = PlayerState::Category::kVolume;
-        }
-        else {
-          st.category = PlayerState::Category::kUnknown;
+        apply_item_attributes(attr_obj, st);
+      }
+
+      MonoObject* valuable_obj = nullptr;
+      if (g_valuable_object_class && IsSubclassOf(cls, g_valuable_object_class)) {
+        valuable_obj = item_obj;
+      } else if (go_obj && g_valuable_object_type_obj && g_game_object_get_component) {
+        void* args_val[1] = { g_valuable_object_type_obj };
+        valuable_obj = SafeInvoke(g_game_object_get_component, go_obj, args_val,
+          "GameObject.GetComponent(ValuableObject)");
+        if (!valuable_obj && g_game_object_get_component_in_parent) {
+          valuable_obj = SafeInvoke(g_game_object_get_component_in_parent, go_obj, args_val,
+            "GameObject.GetComponentInParent(ValuableObject)");
         }
       }
-      };
+      apply_valuable_object(valuable_obj, st);
+
+      if (st.has_value) {
+        st.category = PlayerState::Category::kValuable;
+      } else if (g_phys_grab_object_class && IsSubclassOf(cls, g_phys_grab_object_class)) {
+        st.category = PlayerState::Category::kPhysGrab;
+      } else if (g_item_volume_class && IsSubclassOf(cls, g_item_volume_class)) {
+        st.category = PlayerState::Category::kVolume;
+      } else {
+        st.category = PlayerState::Category::kUnknown;
+      }
+    };
 
     auto collect_from_overlap_sphere = [&]() -> bool {
       static bool logged_overlap_start = false;
@@ -6596,6 +7268,61 @@ static bool RestorePatchedCode(void* addr, const CodePatchBackup& backup) {
   DWORD tmp = 0;
   VirtualProtect(addr, backup.size, old_protect, &tmp);
   return true;
+}
+
+struct SessionMasterPatchTarget {
+  MonoMethod** method_ptr;
+  int forced_value;
+  const char* tag;
+};
+static const SessionMasterPatchTarget k_session_master_patch_targets[] = {
+  { &g_semi_func_is_not_master_client, 0, "SemiFunc::IsNotMasterClient" },
+  { &g_semi_func_is_master_client, 1, "SemiFunc::IsMasterClient" },
+  { &g_semi_func_is_master_client_or_singleplayer, 1, "SemiFunc::IsMasterClientOrSingleplayer" },
+  { &g_photon_network_get_is_master_client, 1, "PhotonNetwork::get_IsMasterClient" },
+  { &g_semi_func_master_only_rpc, 1, "SemiFunc::MasterOnlyRPC" },
+  { &g_semi_func_owner_only_rpc, 1, "SemiFunc::OwnerOnlyRPC" },
+  { &g_semi_func_master_and_owner_only_rpc, 1, "SemiFunc::MasterAndOwnerOnlyRPC" },
+};
+
+static bool ApplySessionMasterPatches() {
+  if (!g_mono.mono_compile_method) {
+    AppendLog("SessionMasterPatch: mono_compile_method unresolved");
+    return false;
+  }
+  bool patched = false;
+  for (const auto& target : k_session_master_patch_targets) {
+    if (!target.method_ptr || !*target.method_ptr) {
+      continue;
+    }
+    void* code = g_mono.mono_compile_method(*target.method_ptr);
+    if (!code || g_session_master_backups.find(code) != g_session_master_backups.end()) {
+      continue;
+    }
+    CodePatchBackup backup{};
+    if (!PatchCodeToReturnInt(code, target.forced_value, backup)) {
+      continue;
+    }
+    g_session_master_backups.emplace(code, backup);
+    patched = true;
+    std::ostringstream oss;
+    oss << "SessionMasterPatch: " << target.tag << " => " << target.forced_value;
+    AppendLog(oss.str());
+  }
+  return patched;
+}
+
+static bool RestoreSessionMasterPatches() {
+  bool any_restored = false;
+  for (auto it = g_session_master_backups.begin(); it != g_session_master_backups.end();) {
+    if (RestorePatchedCode(it->first, it->second)) {
+      any_restored = true;
+      it = g_session_master_backups.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return g_session_master_backups.empty() || any_restored;
 }
 
 static bool SetRoundUpdateBypass(bool enable) {

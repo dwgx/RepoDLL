@@ -11,6 +11,7 @@
 #include "imgui_internal.h"
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -46,6 +47,8 @@ void* g_resize_fn = nullptr;
 bool g_imgui_initialized = false;
 bool g_imgui_context_created = false;
 bool g_menu_open = true;
+std::atomic<int> g_menu_toggle_vk{VK_INSERT};
+std::atomic<bool> g_menu_key_capture_active{false};
 bool g_unhooked = false;
 
 struct Vec3 { float x, y, z; };
@@ -182,6 +185,21 @@ HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_coun
         }
       };
 
+      auto build_item_label = [&](const PlayerState& st) -> std::string {
+        std::string label;
+        if (st.has_name && !st.name.empty()) {
+          label = st.name;
+        } else {
+          label = "Item";
+        }
+        if (st.has_value) {
+          label += " [$" + std::to_string(st.value) + "]";
+        } else if (st.has_item_type) {
+          label += " [type " + std::to_string(st.item_type) + "]";
+        }
+        return label;
+      };
+
       auto depth_col = [&](float z) -> ImU32 {
         // z 是剪裁空间 w 分量后的深度，越大越远
         float fade = 1.0f - std::min(std::max(z, 0.0f), 1.0f);
@@ -216,9 +234,8 @@ HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_coun
           ImU32 col = depth_col(ndc_z);
           auto sz = compute_box(ndc_z, 32.0f, 20.0f);
           draw_corner_box(sp, sz.first, sz.second, col, 2.0f);
-          if (st.has_name) {
-            draw_label(sp, col, st.name.c_str());
-          }
+          std::string label = build_item_label(st);
+          draw_label(sp, col, label.c_str());
         }
       }
 
@@ -247,9 +264,24 @@ HRESULT __stdcall HookResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_coun
   }
 
 LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-  if (msg == WM_KEYUP && wparam == VK_INSERT) {
-    g_menu_open = !g_menu_open;
-    return 0;
+  if (msg == WM_KEYUP) {
+    const int vk = static_cast<int>(wparam & 0xFF);
+    if (g_menu_key_capture_active.load(std::memory_order_relaxed)) {
+      if (vk == VK_ESCAPE) {
+        LogMessage("Menu hotkey capture canceled (Esc)");
+      } else if (vk > 0 && vk <= 0xFF) {
+        g_menu_toggle_vk.store(vk, std::memory_order_relaxed);
+        std::ostringstream oss;
+        oss << "Menu hotkey updated: vk=" << vk;
+        LogMessage(oss.str());
+      }
+      g_menu_key_capture_active.store(false, std::memory_order_relaxed);
+      return 0;
+    }
+    if (vk == g_menu_toggle_vk.load(std::memory_order_relaxed)) {
+      g_menu_open = !g_menu_open;
+      return 0;
+    }
   }
   if (MonoIsShuttingDown()) {
     return CallWindowProc(g_original_wndproc, hwnd, msg, wparam, lparam);
@@ -616,4 +648,27 @@ void UnhookDx11() {
 
   g_original_present = nullptr;
   LogMessage("UnhookDx11: done");
+}
+
+int GetMenuToggleVirtualKey() {
+  return g_menu_toggle_vk.load(std::memory_order_relaxed);
+}
+
+void SetMenuToggleVirtualKey(int vk) {
+  if (vk <= 0 || vk > 0xFF) {
+    vk = VK_INSERT;
+  }
+  g_menu_toggle_vk.store(vk, std::memory_order_relaxed);
+  std::ostringstream oss;
+  oss << "Menu hotkey set: vk=" << vk;
+  LogMessage(oss.str());
+}
+
+void BeginMenuToggleKeyCapture() {
+  g_menu_key_capture_active.store(true, std::memory_order_relaxed);
+  LogMessage("Menu hotkey capture started");
+}
+
+bool IsMenuToggleKeyCaptureActive() {
+  return g_menu_key_capture_active.load(std::memory_order_relaxed);
 }

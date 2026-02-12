@@ -11,6 +11,12 @@ constexpr const char* kGameDirectorPlayerListField = "PlayerList";
 constexpr const char* kSemiFuncNamespace = "";
 constexpr const char* kSemiFuncClass = "SemiFunc";
 constexpr const char* kSemiFuncLocalMethod = "PlayerAvatarLocal";
+constexpr const char* kSemiFuncIsNotMasterClientMethod = "IsNotMasterClient";
+constexpr const char* kSemiFuncIsMasterClientMethod = "IsMasterClient";
+constexpr const char* kSemiFuncIsMasterClientOrSingleplayerMethod = "IsMasterClientOrSingleplayer";
+constexpr const char* kSemiFuncMasterOnlyRPCMethod = "MasterOnlyRPC";
+constexpr const char* kSemiFuncOwnerOnlyRPCMethod = "OwnerOnlyRPC";
+constexpr const char* kSemiFuncMasterAndOwnerOnlyRPCMethod = "MasterAndOwnerOnlyRPC";
 
 constexpr const char* kPlayerAvatarNamespace = "";
 constexpr const char* kPlayerAvatarClass = "PlayerAvatar";
@@ -18,7 +24,6 @@ constexpr const char* kPlayerAvatarIsLocalField = "isLocal";
 constexpr const char* kPlayerAvatarInstanceField = "instance";
 constexpr const char* kPlayerAvatarTransformField = "playerTransform";
 constexpr const char* kPlayerAvatarHealthField = "playerHealth";
-constexpr const char* kPlayerAvatarEnergyField = "playerEnergy";  // fallback, not used for stamina
 constexpr const char* kPlayerAvatarSteamIdField = "steamID";
 constexpr const char* kPlayerAvatarPhysGrabberField = "physGrabber";
 
@@ -74,13 +79,6 @@ constexpr const char* kUnityCameraGetTransformMethod = "get_transform";
 constexpr const char* kTransformLocalToWorldMatrixMethod = "get_localToWorldMatrix";
 constexpr const char* kTransformWorldToLocalMatrixMethod = "get_worldToLocalMatrix";
 
-// PlayerLocalCamera (if needed later)
-constexpr const char* kPlayerLocalCameraNamespace = "";
-constexpr const char* kPlayerLocalCameraClass = "PlayerLocalCamera";
-constexpr const char* kPlayerLocalCameraInstanceField = "instance";
-constexpr const char* kPlayerLocalCameraClientPositionField = "clientPosition";
-constexpr const char* kPlayerLocalCameraClientRotationField = "clientRotation";
-
 // Item system
 constexpr const char* kItemManagerNamespace = "";
 constexpr const char* kItemManagerClass = "ItemManager";
@@ -92,12 +90,6 @@ constexpr bool kFindObjectsInactive = true;
 
 constexpr const char* kValuableObjectNamespace = "";
 constexpr const char* kValuableObjectClass = "ValuableObject";
-
-// ItemTracker rendering
-constexpr const char* kItemTrackerNamespace = "";
-constexpr const char* kItemTrackerClass = "ItemTracker";
-constexpr const char* kItemTrackerDisplayField = "display";
-constexpr const char* kItemTrackerDisplayColorOverrideMethod = "DisplayColorOverride";
 
 // Currency / upgrades
 constexpr const char* kSemiFuncStatSetRunCurrencyMethod = "StatSetRunCurrency";
