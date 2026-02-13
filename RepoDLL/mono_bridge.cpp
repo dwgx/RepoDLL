@@ -174,6 +174,7 @@ namespace {
   static bool PatchCodeToReturnInt(void* addr, int forced, CodePatchBackup& backup);
   static bool RestorePatchedCode(void* addr, const CodePatchBackup& backup);
   static bool SetRoundUpdateBypass(bool enable);
+  static bool SetMagicBulletVisionBypass(bool enable);
   static bool ApplySessionMasterPatches();
   static bool RestoreSessionMasterPatches();
   static void ResetThirdPersonVisualState();
@@ -295,6 +296,7 @@ namespace {
   MonoClassField* g_item_manager_instance_field = nullptr;
   MonoClassField* g_item_manager_item_volumes_field = nullptr;
   MonoClass* g_phys_grab_object_class = nullptr;
+  MonoObject* g_phys_grab_object_type_obj = nullptr;
   MonoClassField* g_item_manager_spawned_items_field = nullptr;
   MonoMethod* g_item_manager_get_all_items = nullptr;
   int g_item_manager_get_all_items_argc = 0;
@@ -319,11 +321,37 @@ namespace {
   MonoObject* g_item_attributes_type_obj = nullptr;
   MonoClass* g_item_class = nullptr;
   MonoClassField* g_item_item_name_field = nullptr;
+  MonoClass* g_item_gun_class = nullptr;
+  MonoObject* g_item_gun_type_obj = nullptr;
+  MonoClassField* g_item_gun_shoot_time_field = nullptr;
+  MonoClassField* g_item_gun_shoot_cooldown_field = nullptr;
+  MonoClassField* g_item_gun_recoil_force_field = nullptr;
+  MonoClassField* g_item_gun_bullet_prefab_field = nullptr;
+  MonoClassField* g_item_gun_number_of_bullets_field = nullptr;
+  MonoClassField* g_item_gun_phys_grab_object_field = nullptr;
+  MonoClassField* g_item_gun_item_battery_field = nullptr;
+  MonoClass* g_item_battery_class = nullptr;
+  MonoObject* g_item_battery_type_obj = nullptr;
+  MonoClassField* g_item_battery_battery_life_field = nullptr;
+  MonoClassField* g_item_battery_battery_life_int_field = nullptr;
+  MonoClassField* g_item_battery_battery_bars_field = nullptr;
+  MonoClassField* g_item_battery_current_bars_field = nullptr;
+  MonoClassField* g_phys_grab_object_grabbed_local_field = nullptr;
 
   MonoClass* g_valuable_object_class = nullptr;
   MonoClassField* g_valuable_object_value_field = nullptr;
   MonoObject* g_valuable_object_type_obj = nullptr;
+  MonoClass* g_enemy_director_class = nullptr;
+  MonoVTable* g_enemy_director_vtable = nullptr;
+  MonoClassField* g_enemy_director_instance_field = nullptr;
+  MonoClassField* g_enemy_director_enemies_spawned_field = nullptr;
+  MonoClass* g_enemy_parent_class = nullptr;
+  MonoClassField* g_enemy_parent_enemy_field = nullptr;
+  MonoClassField* g_enemy_parent_spawned_field = nullptr;
+  MonoClass* g_enemy_class = nullptr;
+  MonoClassField* g_enemy_enemy_rigidbody_field = nullptr;
   MonoClass* g_enemy_rigidbody_class = nullptr;
+  MonoClassField* g_enemy_rigidbody_enemy_parent_field = nullptr;
   std::vector<uint32_t> g_enemy_cache;  // GCHandles
   std::mutex g_enemy_cache_mutex;
   uint64_t g_enemy_cache_last_refresh = 0;
@@ -372,6 +400,7 @@ namespace {
   MonoMethod* g_semi_func_master_only_rpc = nullptr;
   MonoMethod* g_semi_func_owner_only_rpc = nullptr;
   MonoMethod* g_semi_func_master_and_owner_only_rpc = nullptr;
+  MonoMethod* g_semi_func_layer_mask_get_vision_obstruct = nullptr;
   MonoClass* g_photon_network_class = nullptr;
   MonoMethod* g_photon_network_get_is_master_client = nullptr;
   MonoMethod* g_photon_network_get_local_player = nullptr;
@@ -460,6 +489,8 @@ namespace {
   MonoClass* g_phys_grabber_class = nullptr;
   MonoClassField* g_phys_grabber_range_field = nullptr;
   MonoClassField* g_phys_grabber_strength_field = nullptr;
+  MonoClassField* g_phys_grabber_grabbed_field = nullptr;
+  MonoClassField* g_phys_grabber_grabbed_object_transform_field = nullptr;
 
   // Extraction point
   MonoClass* g_extraction_point_class = nullptr;
@@ -533,6 +564,9 @@ namespace {
   void* g_round_update_patch_addr = nullptr;
   CodePatchBackup g_round_update_patch_backup{};
   bool g_round_update_patch_active = false;
+  void* g_magic_bullet_patch_addr = nullptr;
+  CodePatchBackup g_magic_bullet_patch_backup{};
+  bool g_magic_bullet_patch_active = false;
 
   void ClearEnemyCacheHandlesUnlocked() {
     if (!g_mono.mono_gchandle_free) {
@@ -616,6 +650,7 @@ namespace {
   std::atomic<bool> g_items_last_seh_fault{false};
   std::atomic<uint64_t> g_safeinvoke_last_seh_ms{0};
   std::atomic<uint32_t> g_safeinvoke_seh_count{0};
+  std::atomic<bool> g_enemy_findobjects_disabled{false};
   std::atomic<bool> g_third_person_visual_target_enabled{false};
   std::atomic<float> g_third_person_target_distance{2.8f};
   std::atomic<float> g_third_person_target_height{1.15f};
@@ -2055,6 +2090,13 @@ namespace {
         AppendLog("Resolved SemiFunc::MasterAndOwnerOnlyRPC");
       }
     }
+    if (g_semi_func_class && !g_semi_func_layer_mask_get_vision_obstruct) {
+      g_semi_func_layer_mask_get_vision_obstruct = g_mono.mono_class_get_method_from_name(
+        g_semi_func_class, "LayerMaskGetVisionObstruct", 0);
+      if (g_semi_func_layer_mask_get_vision_obstruct) {
+        AppendLog("Resolved SemiFunc::LayerMaskGetVisionObstruct");
+      }
+    }
     if (!g_photon_network_class) {
       g_photon_network_class = FindClassAnyAssembly("Photon.Pun", "PhotonNetwork");
       if (g_photon_network_class) {
@@ -2233,6 +2275,14 @@ namespace {
       if (g_phys_grabber_strength_field) {
         AppendLog("Resolved PhysGrabber::grabStrength field");
       }
+    }
+    if (g_phys_grabber_class && !g_phys_grabber_grabbed_field) {
+      g_phys_grabber_grabbed_field = g_mono.mono_class_get_field_from_name(
+        g_phys_grabber_class, "grabbed");
+    }
+    if (g_phys_grabber_class && !g_phys_grabber_grabbed_object_transform_field) {
+      g_phys_grabber_grabbed_object_transform_field = g_mono.mono_class_get_field_from_name(
+        g_phys_grabber_class, "grabbedObjectTransform");
     }
 
     // ExtractionPoint
@@ -2694,6 +2744,14 @@ namespace {
         AppendLogOnce("PhysGrabObject_class_missing", "Failed to resolve PhysGrabObject class");
       }
     }
+    if (g_phys_grab_object_class && !g_phys_grab_object_type_obj &&
+      g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
+      MonoType* t = g_mono.mono_class_get_type(g_phys_grab_object_class);
+      if (t) {
+        g_phys_grab_object_type_obj =
+          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), t);
+      }
+    }
     if (g_item_manager_class && !g_item_manager_spawned_items_field) {
       g_item_manager_spawned_items_field =
         g_mono.mono_class_get_field_from_name(g_item_manager_class, "spawnedItems");
@@ -2903,6 +2961,89 @@ namespace {
         AppendLog("Resolved Item::itemName field");
       }
     }
+    if (!g_item_gun_class) {
+      g_item_gun_class = g_mono.mono_class_from_name(g_image, "", "ItemGun");
+      if (!g_item_gun_class) {
+        g_item_gun_class = FindClassAnyAssembly("", "ItemGun");
+      }
+      if (g_item_gun_class) {
+        AppendLog("Resolved ItemGun class");
+      }
+    }
+    if (g_item_gun_class && !g_item_gun_shoot_time_field) {
+      g_item_gun_shoot_time_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "shootTime");
+    }
+    if (g_item_gun_class && !g_item_gun_shoot_cooldown_field) {
+      g_item_gun_shoot_cooldown_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "shootCooldown");
+    }
+    if (g_item_gun_class && !g_item_gun_recoil_force_field) {
+      g_item_gun_recoil_force_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "gunRecoilForce");
+    }
+    if (g_item_gun_class && !g_item_gun_bullet_prefab_field) {
+      g_item_gun_bullet_prefab_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "bulletPrefab");
+    }
+    if (g_item_gun_class && !g_item_gun_number_of_bullets_field) {
+      g_item_gun_number_of_bullets_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "numberOfBullets");
+    }
+    if (g_item_gun_class && !g_item_gun_phys_grab_object_field) {
+      g_item_gun_phys_grab_object_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "physGrabObject");
+    }
+    if (g_item_gun_class && !g_item_gun_item_battery_field) {
+      g_item_gun_item_battery_field =
+        g_mono.mono_class_get_field_from_name(g_item_gun_class, "itemBattery");
+    }
+    if (g_item_gun_class && !g_item_gun_type_obj &&
+      g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
+      MonoType* t = g_mono.mono_class_get_type(g_item_gun_class);
+      if (t) {
+        g_item_gun_type_obj =
+          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), t);
+      }
+    }
+
+    if (!g_item_battery_class) {
+      g_item_battery_class = g_mono.mono_class_from_name(g_image, "", "ItemBattery");
+      if (!g_item_battery_class) {
+        g_item_battery_class = FindClassAnyAssembly("", "ItemBattery");
+      }
+      if (g_item_battery_class) {
+        AppendLog("Resolved ItemBattery class");
+      }
+    }
+    if (g_item_battery_class && !g_item_battery_battery_life_field) {
+      g_item_battery_battery_life_field =
+        g_mono.mono_class_get_field_from_name(g_item_battery_class, "batteryLife");
+    }
+    if (g_item_battery_class && !g_item_battery_battery_life_int_field) {
+      g_item_battery_battery_life_int_field =
+        g_mono.mono_class_get_field_from_name(g_item_battery_class, "batteryLifeInt");
+    }
+    if (g_item_battery_class && !g_item_battery_battery_bars_field) {
+      g_item_battery_battery_bars_field =
+        g_mono.mono_class_get_field_from_name(g_item_battery_class, "batteryBars");
+    }
+    if (g_item_battery_class && !g_item_battery_current_bars_field) {
+      g_item_battery_current_bars_field =
+        g_mono.mono_class_get_field_from_name(g_item_battery_class, "currentBars");
+    }
+    if (g_item_battery_class && !g_item_battery_type_obj &&
+      g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
+      MonoType* t = g_mono.mono_class_get_type(g_item_battery_class);
+      if (t) {
+        g_item_battery_type_obj =
+          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), t);
+      }
+    }
+    if (g_phys_grab_object_class && !g_phys_grab_object_grabbed_local_field) {
+      g_phys_grab_object_grabbed_local_field =
+        g_mono.mono_class_get_field_from_name(g_phys_grab_object_class, "grabbedLocal");
+    }
     if (!g_valuable_object_class) {
       g_valuable_object_class = g_mono.mono_class_from_name(
         g_image, config::kValuableObjectNamespace, config::kValuableObjectClass);
@@ -3004,6 +3145,80 @@ namespace {
       }
     }
     // Enemies
+    if (!g_enemy_director_class) {
+      g_enemy_director_class = g_mono.mono_class_from_name(g_image, "", "EnemyDirector");
+      if (!g_enemy_director_class) {
+        g_enemy_director_class = FindClassAnyAssembly("", "EnemyDirector");
+      }
+      if (g_enemy_director_class) {
+        AppendLog("Resolved EnemyDirector class");
+      }
+    }
+    if (g_enemy_director_class && !g_enemy_director_vtable) {
+      g_enemy_director_vtable = g_mono.mono_class_vtable(g_domain, g_enemy_director_class);
+    }
+    if (g_enemy_director_class && !g_enemy_director_instance_field) {
+      g_enemy_director_instance_field =
+        g_mono.mono_class_get_field_from_name(g_enemy_director_class, "instance");
+      if (g_enemy_director_instance_field) {
+        AppendLog("Resolved EnemyDirector::instance field");
+      }
+    }
+    if (g_enemy_director_class && !g_enemy_director_enemies_spawned_field) {
+      g_enemy_director_enemies_spawned_field =
+        g_mono.mono_class_get_field_from_name(g_enemy_director_class, "enemiesSpawned");
+      if (g_enemy_director_enemies_spawned_field) {
+        AppendLog("Resolved EnemyDirector::enemiesSpawned field");
+      }
+    }
+    if (!g_enemy_parent_class) {
+      g_enemy_parent_class = g_mono.mono_class_from_name(g_image, "", "EnemyParent");
+      if (!g_enemy_parent_class) {
+        g_enemy_parent_class = FindClassAnyAssembly("", "EnemyParent");
+      }
+      if (g_enemy_parent_class) {
+        AppendLog("Resolved EnemyParent class");
+      }
+    }
+    if (g_enemy_parent_class && !g_enemy_parent_enemy_field) {
+      const char* names[] = { "Enemy", "enemy" };
+      for (const char* n : names) {
+        g_enemy_parent_enemy_field = g_mono.mono_class_get_field_from_name(g_enemy_parent_class, n);
+        if (g_enemy_parent_enemy_field) break;
+      }
+      if (g_enemy_parent_enemy_field) {
+        AppendLog("Resolved EnemyParent::Enemy field");
+      }
+    }
+    if (g_enemy_parent_class && !g_enemy_parent_spawned_field) {
+      const char* names[] = { "Spawned", "spawned" };
+      for (const char* n : names) {
+        g_enemy_parent_spawned_field = g_mono.mono_class_get_field_from_name(g_enemy_parent_class, n);
+        if (g_enemy_parent_spawned_field) break;
+      }
+      if (g_enemy_parent_spawned_field) {
+        AppendLog("Resolved EnemyParent::Spawned field");
+      }
+    }
+    if (!g_enemy_class) {
+      g_enemy_class = g_mono.mono_class_from_name(g_image, "", "Enemy");
+      if (!g_enemy_class) {
+        g_enemy_class = FindClassAnyAssembly("", "Enemy");
+      }
+      if (g_enemy_class) {
+        AppendLog("Resolved Enemy class");
+      }
+    }
+    if (g_enemy_class && !g_enemy_enemy_rigidbody_field) {
+      const char* names[] = { "Rigidbody", "rigidbody" };
+      for (const char* n : names) {
+        g_enemy_enemy_rigidbody_field = g_mono.mono_class_get_field_from_name(g_enemy_class, n);
+        if (g_enemy_enemy_rigidbody_field) break;
+      }
+      if (g_enemy_enemy_rigidbody_field) {
+        AppendLog("Resolved Enemy::Rigidbody field");
+      }
+    }
     if (!g_enemy_rigidbody_class) {
       g_enemy_rigidbody_class = g_mono.mono_class_from_name(
         g_image, "", "EnemyRigidbody");
@@ -3021,6 +3236,17 @@ namespace {
       }
       else {
         AppendLogOnce("EnemyRigidbody_class_missing", "Failed to resolve EnemyRigidbody class");
+      }
+    }
+    if (g_enemy_rigidbody_class && !g_enemy_rigidbody_enemy_parent_field) {
+      const char* names[] = { "enemyParent", "EnemyParent" };
+      for (const char* n : names) {
+        g_enemy_rigidbody_enemy_parent_field =
+          g_mono.mono_class_get_field_from_name(g_enemy_rigidbody_class, n);
+        if (g_enemy_rigidbody_enemy_parent_field) break;
+      }
+      if (g_enemy_rigidbody_enemy_parent_field) {
+        AppendLog("Resolved EnemyRigidbody::enemyParent field");
       }
     }
 
@@ -3607,15 +3833,55 @@ namespace {
   }
 
 // Non-ASCII comment normalized.
-  bool AddEnemyFromObject(MonoObject* enemy_obj, std::vector<PlayerState>& out_enemies) {
-    if (!enemy_obj) return false;
-    MonoObject* tr = SafeInvoke(g_component_get_transform, enemy_obj, nullptr, "EnemyRigidbody.get_transform");
+  static bool TryReadObjectField(MonoObject* obj, MonoClassField* field, MonoObject*& out_value) {
+    out_value = nullptr;
+    if (!obj || !field || !g_mono.mono_field_get_value) return false;
+#ifdef _MSC_VER
+    return FieldGetObjectSafeSeh(obj, field, out_value);
+#else
+    g_mono.mono_field_get_value(obj, field, &out_value);
+    return true;
+#endif
+  }
+
+  static bool TryReadBoolField(MonoObject* obj, MonoClassField* field, bool& out_value) {
+    out_value = false;
+    if (!obj || !field || !g_mono.mono_field_get_value) return false;
+#ifdef _MSC_VER
+    return FieldGetBoolSafeSeh(obj, field, out_value);
+#else
+    g_mono.mono_field_get_value(obj, field, &out_value);
+    return true;
+#endif
+  }
+
+  static MonoObject* ResolveEnemyDedupKey(MonoObject* enemy_rigidbody_obj, MonoObject* fallback_key) {
+    MonoObject* key = fallback_key ? fallback_key : enemy_rigidbody_obj;
+    if (enemy_rigidbody_obj && g_enemy_rigidbody_enemy_parent_field) {
+      MonoObject* parent_obj = nullptr;
+      if (TryReadObjectField(enemy_rigidbody_obj, g_enemy_rigidbody_enemy_parent_field, parent_obj) &&
+          parent_obj && !IsUnityNull(parent_obj)) {
+        key = parent_obj;
+      }
+    }
+    if (key && IsUnityNull(key)) {
+      key = nullptr;
+    }
+    return key;
+  }
+
+  static bool FillEnemyStateFromComponent(MonoObject* component_obj, PlayerState& out_state) {
+    if (!component_obj || IsUnityNull(component_obj) || !g_component_get_transform) return false;
+    MonoObject* tr = SafeInvoke(g_component_get_transform, component_obj, nullptr, "Enemy.Component.get_transform");
     if (!tr) return false;
+
     PlayerState st{};
     st.category = PlayerState::Category::kEnemy;
     if (!TryGetPositionFromTransform(tr, st, false)) return false;
+
     if (g_component_get_game_object) {
-      MonoObject* go = SafeInvoke(g_component_get_game_object, enemy_obj, nullptr, "EnemyRigidbody.get_gameObject");
+      MonoObject* go = SafeInvoke(g_component_get_game_object, component_obj, nullptr,
+                                  "Enemy.Component.get_gameObject");
       if (go && g_unity_object_get_name) {
         MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, go, nullptr, "GameObject.get_name");
         if (name_obj) {
@@ -3642,13 +3908,136 @@ namespace {
         }
       }
     }
-    out_enemies.push_back(st);
+
+    out_state = std::move(st);
     return true;
   }
 
+  static bool AddEnemyFromComponent(MonoObject* component_obj,
+                                    std::vector<PlayerState>& out_enemies,
+                                    std::unordered_set<MonoObject*>* seen_keys = nullptr,
+                                    MonoObject* forced_key = nullptr) {
+    if (!component_obj || IsUnityNull(component_obj)) return false;
+    MonoObject* dedup_key = forced_key ? forced_key : component_obj;
+    if (!dedup_key || IsUnityNull(dedup_key)) {
+      dedup_key = component_obj;
+    }
+    if (!dedup_key || IsUnityNull(dedup_key)) return false;
+    if (seen_keys && seen_keys->find(dedup_key) != seen_keys->end()) return false;
+
+    PlayerState st{};
+    if (!FillEnemyStateFromComponent(component_obj, st)) return false;
+    st.object = dedup_key;
+    st.has_object = true;
+    out_enemies.push_back(std::move(st));
+    if (seen_keys) {
+      seen_keys->insert(dedup_key);
+    }
+    return true;
+  }
+
+  bool AddEnemyFromObject(MonoObject* enemy_obj,
+                          std::vector<PlayerState>& out_enemies,
+                          std::unordered_set<MonoObject*>* seen_keys = nullptr,
+                          MonoObject* dedup_hint = nullptr) {
+    MonoObject* dedup_key = ResolveEnemyDedupKey(enemy_obj, dedup_hint);
+    return AddEnemyFromComponent(enemy_obj, out_enemies, seen_keys, dedup_key);
+  }
+
+  static MonoObject* GetEnemyDirectorInstance() {
+    if (!g_enemy_director_vtable || !g_enemy_director_instance_field) return nullptr;
+    MonoObject* director = nullptr;
+#ifdef _MSC_VER
+    if (!FieldStaticGetObjectSafeSeh(g_enemy_director_vtable, g_enemy_director_instance_field, director)) {
+      AppendLogOnce("EnemyDirector_instance_read_fault",
+                    "EnemyDirector::instance read triggered SEH");
+      return nullptr;
+    }
+#else
+    g_mono.mono_field_static_get_value(g_enemy_director_vtable, g_enemy_director_instance_field, &director);
+#endif
+    if (!director || IsUnityNull(director)) return nullptr;
+    return director;
+  }
+
+  static bool ScanEnemiesFromDirector(std::vector<PlayerState>& out_enemies,
+                                      std::unordered_set<MonoObject*>& seen_keys,
+                                      int max_count,
+                                      int* out_added_parent,
+                                      int* out_added_rigidbody) {
+    if (out_added_parent) *out_added_parent = 0;
+    if (out_added_rigidbody) *out_added_rigidbody = 0;
+    if (!g_enemy_director_enemies_spawned_field || !g_component_get_transform) return false;
+
+    MonoObject* director = GetEnemyDirectorInstance();
+    if (!director) return false;
+
+    MonoObject* list_obj = nullptr;
+    if (!TryReadObjectField(director, g_enemy_director_enemies_spawned_field, list_obj) ||
+        !list_obj || IsUnityNull(list_obj)) {
+      return false;
+    }
+
+    int added_parent = 0;
+    int added_rigidbody = 0;
+    int added_total = 0;
+    EnumerateListObjects(list_obj, [&](MonoObject* parent_obj) -> bool {
+      if (!parent_obj || IsUnityNull(parent_obj)) return false;
+      if (max_count > 0 && added_total >= max_count) return false;
+
+      if (g_enemy_parent_class) {
+        MonoClass* cls = g_mono.mono_object_get_class(parent_obj);
+        if (cls && cls != g_enemy_parent_class && !IsSubclassOf(cls, g_enemy_parent_class)) {
+          return false;
+        }
+      }
+
+      if (g_enemy_parent_spawned_field) {
+        bool spawned = true;
+        if (TryReadBoolField(parent_obj, g_enemy_parent_spawned_field, spawned) && !spawned) {
+          return false;
+        }
+      }
+
+      MonoObject* enemy_obj = nullptr;
+      if (g_enemy_parent_enemy_field) {
+        TryReadObjectField(parent_obj, g_enemy_parent_enemy_field, enemy_obj);
+      }
+
+      if (enemy_obj && !IsUnityNull(enemy_obj) && g_enemy_enemy_rigidbody_field) {
+        MonoObject* rb_obj = nullptr;
+        if (TryReadObjectField(enemy_obj, g_enemy_enemy_rigidbody_field, rb_obj) &&
+            rb_obj && !IsUnityNull(rb_obj) &&
+            AddEnemyFromObject(rb_obj, out_enemies, &seen_keys, parent_obj)) {
+          ++added_rigidbody;
+          ++added_total;
+          return true;
+        }
+      }
+
+      if (enemy_obj && !IsUnityNull(enemy_obj) &&
+          AddEnemyFromComponent(enemy_obj, out_enemies, &seen_keys, parent_obj)) {
+        ++added_parent;
+        ++added_total;
+        return true;
+      }
+
+      if (AddEnemyFromComponent(parent_obj, out_enemies, &seen_keys, parent_obj)) {
+        ++added_parent;
+        ++added_total;
+        return true;
+      }
+      return false;
+    });
+
+    if (out_added_parent) *out_added_parent = added_parent;
+    if (out_added_rigidbody) *out_added_rigidbody = added_rigidbody;
+    return added_total > 0;
+  }
+
   static void OnEnemyFindObjectsSeh(const char* tag) {
-    g_enemy_esp_disabled = true;
     g_enemy_cache_disabled = true;
+    g_enemy_findobjects_disabled.store(true, std::memory_order_relaxed);
     g_enemies_ready.store(false, std::memory_order_relaxed);
     {
       // Do not free GC handles inside a fault-recovery path; just drop local references.
@@ -3656,21 +4045,19 @@ namespace {
       g_enemy_cache.clear();
     }
 
-    const uint64_t now_ms = GetTickCount64();
     const int crash_count = g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    const uint64_t backoff_ms =
-      (crash_count >= 3) ? 60000ull : ((crash_count == 2) ? 30000ull : 10000ull);
-    g_enemies_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
-
     std::ostringstream oss;
-    oss << "Enemy scan paused after SafeInvoke SEH"
+    oss << "Enemy FindObjects path disabled after SafeInvoke SEH"
         << " tag=" << (tag ? tag : "<null>")
-        << " cooldown=" << (backoff_ms / 1000) << "s"
-        << " crash_count=" << crash_count;
+        << " crash_count=" << crash_count
+        << " (Director list path remains active)";
     AppendLog(oss.str());
   }
 
-  bool ScanEnemiesDirect(std::vector<PlayerState>& out_enemies, int max_count) {
+  bool ScanEnemiesDirect(std::vector<PlayerState>& out_enemies,
+                         std::unordered_set<MonoObject*>* seen_keys,
+                         int max_count) {
+    if (g_enemy_findobjects_disabled.load(std::memory_order_relaxed)) return false;
     if (!g_enemy_rigidbody_class) return false;
     const bool can_find = g_object_find_objects_of_type ||
       (k_enable_enemy_find_include_inactive && g_object_find_objects_of_type_include_inactive);
@@ -3719,7 +4106,7 @@ namespace {
     for (int i = 0; i < limit; ++i) {
       MonoObject* enemy_obj = GetArrayElementSafe(arr, i);
       if (!enemy_obj || IsUnityNull(enemy_obj)) continue;
-      if (AddEnemyFromObject(enemy_obj, out_enemies) &&
+      if (AddEnemyFromObject(enemy_obj, out_enemies, seen_keys) &&
           static_cast<int>(out_enemies.size() - before) >= max_count) {
         break;
       }
@@ -3729,7 +4116,7 @@ namespace {
 
 // Non-ASCII comment normalized.
   bool RefreshEnemyCache() {
-    if (g_enemy_cache_disabled) return false;
+    if (g_enemy_cache_disabled || g_enemy_findobjects_disabled.load(std::memory_order_relaxed)) return false;
     static uint64_t last_enemy_empty_ms = 0;
     uint64_t now_ms = GetTickCount64();
     if (!g_enemies_ready.load(std::memory_order_relaxed) && now_ms - last_enemy_empty_ms < 2000) {
@@ -4257,6 +4644,13 @@ bool MonoBeginShutdown() {
     g_round_update_patch_active = false;
     g_round_update_patch_addr = nullptr;
     g_round_update_patch_backup = {};
+  }
+  if (g_magic_bullet_patch_active && g_magic_bullet_patch_addr &&
+      g_magic_bullet_patch_backup.size > 0) {
+    RestorePatchedCode(g_magic_bullet_patch_addr, g_magic_bullet_patch_backup);
+    g_magic_bullet_patch_active = false;
+    g_magic_bullet_patch_addr = nullptr;
+    g_magic_bullet_patch_backup = {};
   }
   ClearEnemyCacheHandles();
   return true;
@@ -8247,6 +8641,11 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       MonoObject* go_obj = g_component_get_game_object
         ? SafeInvoke(g_component_get_game_object, item_obj, nullptr, "Component.get_gameObject")
         : nullptr;
+      MonoObject* stable_obj = (go_obj && !IsUnityNull(go_obj)) ? go_obj : item_obj;
+      if (stable_obj && !IsUnityNull(stable_obj)) {
+        st.object = stable_obj;
+        st.has_object = true;
+      }
       if (go_obj && !IsUnityNull(go_obj)) {
         DisableFadeOnObject(go_obj);
         if (g_game_object_get_layer) {
@@ -9110,6 +9509,7 @@ bool MonoManualRefreshItems(std::vector<PlayerState>& out_items) {
 void MonoResetEnemiesDisabled() {
   g_enemy_esp_disabled = false;
   g_enemy_cache_disabled = false;
+  g_enemy_findobjects_disabled.store(false, std::memory_order_relaxed);
   g_enemies_ready.store(false, std::memory_order_relaxed);
   g_enemies_crash_count.store(0, std::memory_order_relaxed);
   g_enemies_retry_after_ms.store(0, std::memory_order_relaxed);
@@ -9124,21 +9524,14 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     if (g_shutting_down) return false;
     const uint64_t now_ms = GetTickCount64();
     if (g_enemy_esp_disabled) {
-      const int crash_count = g_enemies_crash_count.load(std::memory_order_relaxed);
       const uint64_t retry_after = g_enemies_retry_after_ms.load(std::memory_order_relaxed);
-      if (crash_count >= 3) {
-        return false;
+      if (retry_after != 0 && now_ms >= retry_after) {
+        AppendLogOnce("MonoListEnemies_retry_blocked",
+          "MonoListEnemies: enemy scan remains disabled after SEH; use manual reset to resume");
       }
-      if (now_ms < retry_after) {
-        return false;
-      }
-      g_enemy_esp_disabled = false;
-      g_enemy_cache_disabled = false;
-      AppendLogOnce("MonoListEnemies_retry_enabled",
-        "MonoListEnemies: retry window reached, re-enabling enemy scan");
+      return false;
     }
 
-    out_enemies.clear();
     if (!CacheManagedRefs()) {
       AppendLog("MonoListEnemies: CacheManagedRefs failed");
       return false;
@@ -9161,16 +9554,25 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       AppendLogOnce("MonoListEnemies_skip_noround", "MonoListEnemies: RoundDirector not ready; skip scan");
       return false;
     }
-    if (!g_enemy_rigidbody_class) {
-      AppendLogOnce("MonoListEnemies_no_class", "MonoListEnemies: EnemyRigidbody class unresolved");
-      return false;
-    }
     if (!g_component_get_transform || !g_component_get_game_object || !g_game_object_get_component) {
       AppendLogOnce("MonoListEnemies_no_method", "MonoListEnemies: transform/gameObject/GetComponent unresolved");
       return false;
     }
 
-    uint64_t now = now_ms;
+    std::vector<PlayerState> next_enemies;
+    next_enemies.reserve(64);
+    std::unordered_set<MonoObject*> seen_enemy_keys;
+    const int max_enemies = 512;
+
+    int added_from_director_parent = 0;
+    int added_from_director_rigidbody = 0;
+    int added_from_cache = 0;
+    int added_from_cache_refill = 0;
+    int added_from_direct_scan = 0;
+
+    ScanEnemiesFromDirector(next_enemies, seen_enemy_keys, max_enemies,
+                            &added_from_director_parent, &added_from_director_rigidbody);
+
     EnemyCachePruneDead();
 
     std::vector<uint32_t> cache_snapshot;
@@ -9179,55 +9581,70 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       cache_snapshot = g_enemy_cache;
     }
 
-    int cached_added = 0;
     for (uint32_t h : cache_snapshot) {
       MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
-      if (enemy_obj && AddEnemyFromObject(enemy_obj, out_enemies)) {
-        ++cached_added;
-        if (cached_added >= 512) break;
+      if (enemy_obj && AddEnemyFromObject(enemy_obj, next_enemies, &seen_enemy_keys)) {
+        ++added_from_cache;
+        if (static_cast<int>(next_enemies.size()) >= max_enemies) break;
       }
-    }
-    if (cached_added > 0) {
-      AppendLogOnce("MonoListEnemies_cache", "MonoListEnemies: populated from cached EnemyRigidbody list");
-      return true;
     }
 
-    if (!g_enemy_cache_disabled) {
+    const bool findobjects_disabled = g_enemy_findobjects_disabled.load(std::memory_order_relaxed);
+    if (next_enemies.empty() && !findobjects_disabled && !g_enemy_cache_disabled) {
       if (RefreshEnemyCacheSafe()) {
         EnemyCachePruneDead();
-        std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
-        cache_snapshot = g_enemy_cache;
+        {
+          std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+          cache_snapshot = g_enemy_cache;
+        }
+        for (uint32_t h : cache_snapshot) {
+          MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
+          if (enemy_obj && AddEnemyFromObject(enemy_obj, next_enemies, &seen_enemy_keys)) {
+            ++added_from_cache_refill;
+            if (static_cast<int>(next_enemies.size()) >= max_enemies) break;
+          }
+        }
       }
     }
-    else {
-      AppendLogOnce("MonoListEnemies_cache_disabled", "MonoListEnemies: enemy cache disabled or refresh failed");
+    if (next_enemies.empty() && !findobjects_disabled && g_enemy_cache_disabled) {
+      AppendLogOnce("MonoListEnemies_cache_disabled",
+                    "MonoListEnemies: enemy cache disabled after previous FindObjects fault");
     }
     if (g_enemy_esp_disabled) {
       return false;
     }
 
-    for (uint32_t h : cache_snapshot) {
-      MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
-      if (enemy_obj && AddEnemyFromObject(enemy_obj, out_enemies)) {
-        ++cached_added;
-        if (cached_added >= 512) break;
-      }
-    }
-    if (cached_added > 0) {
-      AppendLogOnce("MonoListEnemies_cache_refill", "MonoListEnemies: cache refilled via FindObjectsOfType");
-      return true;
-    }
-
     static uint64_t s_last_direct_enemy_scan_ms = 0;
-    if (now - s_last_direct_enemy_scan_ms >= 800) {
-      s_last_direct_enemy_scan_ms = now;
-      if (ScanEnemiesDirect(out_enemies, 512)) {
-        AppendLogOnce("MonoListEnemies_direct_scan", "MonoListEnemies: populated via direct FindObjectsOfType scan");
-        return true;
+    if (next_enemies.empty() && !findobjects_disabled &&
+        now_ms - s_last_direct_enemy_scan_ms >= 1500) {
+      s_last_direct_enemy_scan_ms = now_ms;
+      const size_t before = next_enemies.size();
+      if (ScanEnemiesDirect(next_enemies, &seen_enemy_keys, max_enemies)) {
+        added_from_direct_scan =
+          static_cast<int>(next_enemies.size() - before);
       }
     }
 
-    AppendLogOnce("MonoListEnemies_skip_overlap", "MonoListEnemies: cache empty, skip global scan");
+    if (findobjects_disabled) {
+      AppendLogOnce("MonoListEnemies_findobjects_disabled",
+                    "MonoListEnemies: FindObjects fallback disabled; using EnemyDirector list only");
+    }
+
+    static uint64_t s_last_enemy_stats_log_ms = 0;
+    if (now_ms - s_last_enemy_stats_log_ms > 2000) {
+      std::ostringstream oss;
+      oss << "MonoListEnemies: total=" << static_cast<int>(next_enemies.size())
+          << " director_parent=" << added_from_director_parent
+          << " director_rb=" << added_from_director_rigidbody
+          << " cache=" << added_from_cache
+          << " cache_refill=" << added_from_cache_refill
+          << " direct=" << added_from_direct_scan
+          << " find_disabled=" << (findobjects_disabled ? 1 : 0);
+      AppendLog(oss.str());
+      s_last_enemy_stats_log_ms = now_ms;
+    }
+
+    out_enemies.swap(next_enemies);
     return true;
   }
   catch (...) {
@@ -9640,7 +10057,428 @@ static bool SetRoundUpdateBypass(bool enable) {
   AppendLogOnce("RoundUpdate_patch_disabled", "RoundDirector::Update patch restored");
   return ok;
 }
+
+static bool IsClassOrSubclass(MonoClass* klass, MonoClass* parent) {
+  if (!klass || !parent) return false;
+  return klass == parent || IsSubclassOf(klass, parent);
+}
+
+static MonoObject* ResolveGameObjectFromObject(MonoObject* obj, const char* tag) {
+  if (!obj || IsUnityNull(obj)) return nullptr;
+  if (g_mono.mono_object_get_class && g_game_object_class) {
+    MonoClass* cls = g_mono.mono_object_get_class(obj);
+    if (cls && IsClassOrSubclass(cls, g_game_object_class)) {
+      return obj;
+    }
+  }
+  if (g_component_get_game_object) {
+    MonoObject* go = SafeInvoke(
+      g_component_get_game_object, obj, nullptr, tag ? tag : "WeaponMod.Component.get_gameObject");
+    if (go && !IsUnityNull(go)) {
+      return go;
+    }
+  }
+  return nullptr;
+}
+
+static MonoObject* ResolveComponentByType(MonoObject* game_obj, MonoObject* type_obj, const char* tag) {
+  if (!game_obj || IsUnityNull(game_obj) || !type_obj || !g_game_object_get_component) {
+    return nullptr;
+  }
+  void* args[1] = { type_obj };
+  MonoObject* comp = SafeInvoke(
+    g_game_object_get_component, game_obj, args, tag ? tag : "WeaponMod.GameObject.GetComponent");
+  if ((!comp || IsUnityNull(comp)) && g_game_object_get_component_in_parent) {
+    comp = SafeInvoke(
+      g_game_object_get_component_in_parent,
+      game_obj,
+      args,
+      "WeaponMod.GameObject.GetComponentInParent");
+  }
+  if (!comp || IsUnityNull(comp)) {
+    return nullptr;
+  }
+  return comp;
+}
+
+static bool SetFloatFieldValue(MonoObject* obj, MonoClassField* field, float value) {
+  if (!obj || !field || !g_mono.mono_field_set_value) {
+    return false;
+  }
+#ifdef _MSC_VER
+  return FieldSetFloatSafeSeh(obj, field, value);
+#else
+  g_mono.mono_field_set_value(obj, field, &value);
+  return true;
+#endif
+}
+
+static bool EnsureWeaponModRefsReady() {
+  if (!EnsureThreadAttached()) {
+    return false;
+  }
+  const bool refs_ready =
+    g_item_gun_class && g_item_gun_type_obj && g_mono.mono_field_get_value;
+  if (refs_ready) {
+    return true;
+  }
+  static uint64_t s_last_retry_ms = 0;
+  const uint64_t now_ms = GetTickCount64();
+  if (now_ms - s_last_retry_ms < 500) {
+    return false;
+  }
+  s_last_retry_ms = now_ms;
+  return CacheManagedRefs();
+}
+
+static bool IsBulletReadyItemGun(MonoObject* gun_obj) {
+  if (!gun_obj || IsUnityNull(gun_obj) || !g_item_gun_class) {
+    return false;
+  }
+  MonoClass* cls = g_mono.mono_object_get_class ? g_mono.mono_object_get_class(gun_obj) : nullptr;
+  if (!cls || !IsClassOrSubclass(cls, g_item_gun_class)) {
+    return false;
+  }
+
+  if (g_item_gun_bullet_prefab_field) {
+    MonoObject* bullet_prefab = nullptr;
+#ifdef _MSC_VER
+    if (!FieldGetObjectSafeSeh(gun_obj, g_item_gun_bullet_prefab_field, bullet_prefab)) {
+      bullet_prefab = nullptr;
+    }
+#else
+    g_mono.mono_field_get_value(gun_obj, g_item_gun_bullet_prefab_field, &bullet_prefab);
+#endif
+    if (!bullet_prefab || IsUnityNull(bullet_prefab)) {
+      return false;
+    }
+  }
+
+  if (g_item_gun_number_of_bullets_field) {
+    int bullet_count = 0;
+    if (ReadFieldNumber(gun_obj, g_item_gun_number_of_bullets_field, bullet_count) && bullet_count <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static MonoObject* ResolveItemGunFromScannedObject(MonoObject* scanned_obj, MonoObject*& out_game_obj) {
+  out_game_obj = nullptr;
+  if (!scanned_obj || IsUnityNull(scanned_obj) || !g_item_gun_class) {
+    return nullptr;
+  }
+  MonoClass* scanned_class =
+    g_mono.mono_object_get_class ? g_mono.mono_object_get_class(scanned_obj) : nullptr;
+  if (scanned_class && IsClassOrSubclass(scanned_class, g_item_gun_class)) {
+    out_game_obj = ResolveGameObjectFromObject(scanned_obj, "WeaponMod.ItemGun.get_gameObject");
+    return scanned_obj;
+  }
+  MonoObject* game_obj =
+    ResolveGameObjectFromObject(scanned_obj, "WeaponMod.Scanned.get_gameObject");
+  if (!game_obj) {
+    return nullptr;
+  }
+  out_game_obj = game_obj;
+  return ResolveComponentByType(game_obj, g_item_gun_type_obj, "WeaponMod.GetComponent(ItemGun)");
+}
+
+static MonoObject* ResolveItemBatteryFromGun(MonoObject* gun_obj, MonoObject* gun_game_obj) {
+  MonoObject* battery = nullptr;
+  if (gun_obj && g_item_gun_item_battery_field) {
+#ifdef _MSC_VER
+    FieldGetObjectSafeSeh(gun_obj, g_item_gun_item_battery_field, battery);
+#else
+    g_mono.mono_field_get_value(gun_obj, g_item_gun_item_battery_field, &battery);
+#endif
+  }
+  if ((!battery || IsUnityNull(battery)) && gun_game_obj) {
+    battery = ResolveComponentByType(
+      gun_game_obj, g_item_battery_type_obj, "WeaponMod.GetComponent(ItemBattery)");
+  }
+  if (!battery || IsUnityNull(battery)) {
+    return nullptr;
+  }
+  return battery;
+}
+
+static bool SetBatteryToFull(MonoObject* battery_obj) {
+  if (!battery_obj || IsUnityNull(battery_obj)) {
+    return false;
+  }
+  bool wrote = false;
+  int bars = 6;
+  if (g_item_battery_battery_bars_field) {
+    int read_bars = bars;
+    if (ReadFieldNumber(battery_obj, g_item_battery_battery_bars_field, read_bars) && read_bars > 0) {
+      bars = read_bars;
+    }
+  }
+  if (bars < 1) bars = 1;
+  if (bars > 24) bars = 24;
+  if (g_item_battery_battery_life_field) {
+    wrote = SetFloatFieldValue(battery_obj, g_item_battery_battery_life_field, 100.0f) || wrote;
+  }
+  if (g_item_battery_battery_life_int_field) {
+    wrote = WriteFieldNumber(battery_obj, g_item_battery_battery_life_int_field, bars) || wrote;
+  }
+  if (g_item_battery_current_bars_field) {
+    wrote = WriteFieldNumber(battery_obj, g_item_battery_current_bars_field, bars) || wrote;
+  }
+  return wrote;
+}
+
+static bool SetMagicBulletVisionBypass(bool enable) {
+  if (!enable) {
+    if (!g_magic_bullet_patch_active) {
+      return true;
+    }
+    bool ok = true;
+    if (g_magic_bullet_patch_addr && g_magic_bullet_patch_backup.size > 0) {
+      ok = RestorePatchedCode(g_magic_bullet_patch_addr, g_magic_bullet_patch_backup);
+    }
+    g_magic_bullet_patch_addr = nullptr;
+    g_magic_bullet_patch_backup = {};
+    g_magic_bullet_patch_active = false;
+    if (ok) {
+      AppendLogOnce("MagicBullet_patch_disabled", "Magic bullet patch restored");
+    }
+    return ok;
+  }
+
+  if (g_magic_bullet_patch_active && g_magic_bullet_patch_addr) {
+    return true;
+  }
+  if (!EnsureWeaponModRefsReady()) {
+    return false;
+  }
+  if (!g_semi_func_layer_mask_get_vision_obstruct || !g_mono.mono_compile_method) {
+    AppendLogOnce("MagicBullet_patch_missing_method",
+      "Magic bullet patch unavailable: SemiFunc::LayerMaskGetVisionObstruct unresolved");
+    return false;
+  }
+
+  void* addr = g_mono.mono_compile_method(g_semi_func_layer_mask_get_vision_obstruct);
+  if (!addr) {
+    AppendLogOnce("MagicBullet_patch_no_code",
+      "Magic bullet patch unavailable: mono_compile_method returned null");
+    return false;
+  }
+
+  if (g_magic_bullet_patch_active && g_magic_bullet_patch_addr == addr) {
+    return true;
+  }
+
+  if (g_magic_bullet_patch_active && g_magic_bullet_patch_addr &&
+    g_magic_bullet_patch_backup.size > 0) {
+    RestorePatchedCode(g_magic_bullet_patch_addr, g_magic_bullet_patch_backup);
+    g_magic_bullet_patch_addr = nullptr;
+    g_magic_bullet_patch_backup = {};
+    g_magic_bullet_patch_active = false;
+  }
+
+  CodePatchBackup backup{};
+  if (!PatchCodeToReturnInt(addr, 0, backup)) {
+    AppendLogOnce("MagicBullet_patch_apply_fail", "Failed to patch LayerMaskGetVisionObstruct");
+    return false;
+  }
+  g_magic_bullet_patch_addr = addr;
+  g_magic_bullet_patch_backup = backup;
+  g_magic_bullet_patch_active = true;
+  AppendLogOnce("MagicBullet_patch_enabled",
+    "Magic bullet patch enabled: LayerMaskGetVisionObstruct() returns 0");
+  return true;
+}
 }  // namespace
+
+bool MonoApplyWeaponMods(const std::vector<WeaponModEntry>& entries,
+                         int& out_applied_count,
+                         int& out_magic_active_count) {
+  out_applied_count = 0;
+  out_magic_active_count = 0;
+
+  if (g_shutting_down) {
+    SetMagicBulletVisionBypass(false);
+    return false;
+  }
+  if (entries.empty()) {
+    SetMagicBulletVisionBypass(false);
+    return true;
+  }
+  if (!EnsureWeaponModRefsReady()) {
+    SetMagicBulletVisionBypass(false);
+    return false;
+  }
+
+  SessionRuntimeGate gate{};
+  if (!MonoGetSessionRuntimeGate(gate) || !gate.ok ||
+    (gate.allow_mask & kSessionAllowScanItems) == 0) {
+    SetMagicBulletVisionBypass(false);
+    return false;
+  }
+
+  bool want_magic_bullet = false;
+  std::unordered_set<MonoObject*> seen_guns;
+  for (const auto& entry : entries) {
+    if (!entry.enabled || !entry.scanned_object) {
+      continue;
+    }
+    if (!entry.rapid_fire && !entry.magic_bullet && !entry.infinite_ammo && !entry.no_recoil) {
+      continue;
+    }
+    MonoObject* game_obj = nullptr;
+    MonoObject* gun_obj =
+      ResolveItemGunFromScannedObject(static_cast<MonoObject*>(entry.scanned_object), game_obj);
+    if (!IsBulletReadyItemGun(gun_obj)) {
+      continue;
+    }
+    if (!seen_guns.insert(gun_obj).second) {
+      continue;
+    }
+
+    bool applied_any = false;
+    if (entry.rapid_fire) {
+      const float cooldown = std::clamp(entry.rapid_fire_cooldown, 0.001f, 0.2f);
+      if (g_item_gun_shoot_cooldown_field) {
+        applied_any = SetFloatFieldValue(gun_obj, g_item_gun_shoot_cooldown_field, cooldown) || applied_any;
+      }
+      if (g_item_gun_shoot_time_field) {
+        applied_any = SetFloatFieldValue(gun_obj, g_item_gun_shoot_time_field, cooldown) || applied_any;
+      }
+    }
+    if (entry.no_recoil && g_item_gun_recoil_force_field) {
+      applied_any = SetFloatFieldValue(gun_obj, g_item_gun_recoil_force_field, 0.0f) || applied_any;
+    }
+    if (entry.infinite_ammo) {
+      MonoObject* battery_obj = ResolveItemBatteryFromGun(gun_obj, game_obj);
+      if (battery_obj) {
+        applied_any = SetBatteryToFull(battery_obj) || applied_any;
+      }
+    }
+    if (entry.magic_bullet) {
+      want_magic_bullet = true;
+      ++out_magic_active_count;
+      applied_any = true;
+    }
+
+    if (applied_any) {
+      ++out_applied_count;
+    }
+  }
+
+  SetMagicBulletVisionBypass(want_magic_bullet);
+  return true;
+}
+
+void MonoResetWeaponMods() {
+  SetMagicBulletVisionBypass(false);
+}
+
+bool MonoResolveBulletWeaponObject(void* scanned_object, void*& out_weapon_object) {
+  out_weapon_object = nullptr;
+  if (!scanned_object || g_shutting_down) {
+    return false;
+  }
+  if (!EnsureWeaponModRefsReady()) {
+    return false;
+  }
+  MonoObject* game_obj = nullptr;
+  MonoObject* gun_obj =
+    ResolveItemGunFromScannedObject(static_cast<MonoObject*>(scanned_object), game_obj);
+  if (!IsBulletReadyItemGun(gun_obj)) {
+    return false;
+  }
+  out_weapon_object = gun_obj;
+  return true;
+}
+
+bool MonoIsBulletWeaponObject(void* scanned_object) {
+  void* out_weapon_object = nullptr;
+  return MonoResolveBulletWeaponObject(scanned_object, out_weapon_object);
+}
+
+bool MonoGetLocalHeldBulletWeaponObject(void*& out_scanned_object) {
+  out_scanned_object = nullptr;
+  if (g_shutting_down) {
+    return false;
+  }
+  if (!EnsureWeaponModRefsReady()) {
+    return false;
+  }
+  if (!g_player_avatar_physgrabber_field || !g_phys_grabber_grabbed_object_transform_field ||
+      !g_component_get_game_object) {
+    return false;
+  }
+
+  LocalPlayerInfo info{};
+  if (!MonoGetLocalPlayer(info) || !info.object) {
+    return false;
+  }
+
+  MonoObject* phys_grabber_obj = nullptr;
+#ifdef _MSC_VER
+  if (!FieldGetObjectSafeSeh(static_cast<MonoObject*>(info.object),
+                             g_player_avatar_physgrabber_field,
+                             phys_grabber_obj)) {
+    phys_grabber_obj = nullptr;
+  }
+#else
+  g_mono.mono_field_get_value(static_cast<MonoObject*>(info.object),
+                              g_player_avatar_physgrabber_field,
+                              &phys_grabber_obj);
+#endif
+  if (!phys_grabber_obj || IsUnityNull(phys_grabber_obj)) {
+    return true;
+  }
+
+  if (g_phys_grabber_grabbed_field) {
+    bool grabbed = false;
+#ifdef _MSC_VER
+    if (!FieldGetBoolSafeSeh(phys_grabber_obj, g_phys_grabber_grabbed_field, grabbed)) {
+      grabbed = false;
+    }
+#else
+    g_mono.mono_field_get_value(phys_grabber_obj, g_phys_grabber_grabbed_field, &grabbed);
+#endif
+    if (!grabbed) {
+      return true;
+    }
+  }
+
+  MonoObject* grabbed_transform = nullptr;
+#ifdef _MSC_VER
+  if (!FieldGetObjectSafeSeh(phys_grabber_obj,
+                             g_phys_grabber_grabbed_object_transform_field,
+                             grabbed_transform)) {
+    grabbed_transform = nullptr;
+  }
+#else
+  g_mono.mono_field_get_value(phys_grabber_obj,
+                              g_phys_grabber_grabbed_object_transform_field,
+                              &grabbed_transform);
+#endif
+  if (!grabbed_transform || IsUnityNull(grabbed_transform)) {
+    return true;
+  }
+
+  MonoObject* grabbed_game_obj = SafeInvoke(
+    g_component_get_game_object,
+    grabbed_transform,
+    nullptr,
+    "PhysGrabber.grabbedObjectTransform.get_gameObject");
+  if (!grabbed_game_obj || IsUnityNull(grabbed_game_obj)) {
+    return true;
+  }
+
+  MonoObject* game_obj = nullptr;
+  MonoObject* gun_obj = ResolveItemGunFromScannedObject(grabbed_game_obj, game_obj);
+  if (!IsBulletReadyItemGun(gun_obj)) {
+    return true;
+  }
+
+  out_scanned_object = gun_obj;
+  return true;
+}
 
 bool MonoScanMethods(const char* keyword, std::vector<std::string>& out_results) {
   out_results.clear();

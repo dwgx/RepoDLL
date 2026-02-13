@@ -9,6 +9,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cfloat>
+#include <cstdint>
+#include <unordered_map>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -34,7 +36,17 @@ struct FieldLocks {
   bool stamina = false;
 };
 
+struct WeaponUiConfig {
+  bool enabled = false;
+  bool rapid_fire = false;
+  bool magic_bullet = false;
+  bool infinite_ammo = false;
+  bool no_recoil = false;
+  float rapid_fire_cooldown = 0.02f;
+};
+
 std::vector<PlayerState> g_cached_items;
+std::vector<PlayerState> g_cached_weapons;
 std::vector<PlayerState> g_cached_enemies;
 Matrix4x4 g_cached_view{};
 Matrix4x4 g_cached_proj{};
@@ -257,7 +269,7 @@ void RenderOverlay(bool* menu_open) {
   static bool lock_stamina = false;
   static bool inputs_synced = false;
   static bool auto_refresh = false;  // 默认关闭，需用户开启
-  static bool auto_refresh_items = false;
+  static bool auto_refresh_items = false;  // 保留设置兼容，不再驱动自动轮询
   static bool auto_refresh_enemies = false;
   static std::vector<PlayerState> squad_states;
   static uint64_t last_squad_update = 0;
@@ -296,10 +308,22 @@ void RenderOverlay(bool* menu_open) {
   static int current_currency = 0;
   static bool has_currency = false;
   static uint64_t last_user_edit = 0;
-  static uint64_t last_items_update = 0;
   static uint64_t last_enemies_update = 0;
   static bool no_fall_enabled = false;
   static bool include_local_squad = true;
+  static std::unordered_map<void*, WeaponUiConfig> weapon_mod_configs;
+  static std::unordered_map<void*, void*> weapon_identity_cache;
+  static int weapon_selected_index = -1;
+  static void* weapon_selected_object = nullptr;
+  static void* current_weapon_object = nullptr;
+  static int weapon_mod_applied_count = 0;
+  static int weapon_mod_magic_active_count = 0;
+  static bool weapon_mod_last_ok = false;
+  static bool weapon_cache_dirty = true;
+  static uint64_t item_snapshot_hash1 = 0;
+  static uint64_t item_snapshot_hash2 = 0;
+  static size_t item_snapshot_count = 0;
+  static bool item_snapshot_ready = false;
   static RoundState cached_round_state{};
   static bool has_round_state = false;
   static RoundProgressState cached_round_progress{};
@@ -348,7 +372,6 @@ void RenderOverlay(bool* menu_open) {
     }
     if (saved.load_on_start) {
       auto_refresh = saved.auto_refresh;
-      auto_refresh_items = saved.auto_refresh_items;
       auto_refresh_enemies = saved.auto_refresh_enemies;
       g_item_esp_enabled = saved.item_esp;
       g_enemy_esp_enabled = saved.enemy_esp;
@@ -420,8 +443,18 @@ void RenderOverlay(bool* menu_open) {
     has_currency = false;
     inputs_synced = false;
     g_cached_items.clear();
+    g_cached_weapons.clear();
     g_cached_enemies.clear();
+    weapon_identity_cache.clear();
     g_cached_mats_valid = false;
+    weapon_selected_index = -1;
+    weapon_selected_object = nullptr;
+    current_weapon_object = nullptr;
+    weapon_cache_dirty = true;
+    item_snapshot_ready = false;
+    item_snapshot_hash1 = 0;
+    item_snapshot_hash2 = 0;
+    item_snapshot_count = 0;
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -505,12 +538,36 @@ void RenderOverlay(bool* menu_open) {
     last_level_info_update = now;
   }
 
-  auto refresh_items = [&]() {
+  auto build_item_snapshot = [&](const std::vector<PlayerState>& items,
+                                 uint64_t& out_h1,
+                                 uint64_t& out_h2,
+                                 size_t& out_count) {
+    std::vector<uintptr_t> objects;
+    objects.reserve(items.size());
+    for (const auto& st : items) {
+      if (st.has_object && st.object) {
+        objects.push_back(reinterpret_cast<uintptr_t>(st.object));
+      }
+    }
+    std::sort(objects.begin(), objects.end());
+    out_count = objects.size();
+    uint64_t h1 = 1469598103934665603ull;
+    uint64_t h2 = 1099511628211ull;
+    for (uintptr_t p : objects) {
+      h1 ^= static_cast<uint64_t>(p) + 0x9E3779B97F4A7C15ull + (h1 << 6) + (h1 >> 2);
+      h1 *= 1099511628211ull;
+      h2 += (static_cast<uint64_t>(p) * 11400714819323198485ull);
+      h2 ^= (h2 >> 29);
+    }
+    out_h1 = h1;
+    out_h2 = h2;
+  };
+  auto refresh_items = [&](bool manual_refresh = false) {
     if (!mono_ready) return;
     if (session_master_transitioning) return;
     if (!allow_scan_items) return;
     if (scan_pause_pending) return;
-    if (g_items_disabled) return;
+    if (g_items_disabled && !manual_refresh) return;
     SetCrashStage("RenderOverlay:MonoGetLocalPlayer(refresh_items)");
     last_ok = MonoGetLocalPlayer(last_info);
     if (!last_ok) return;
@@ -521,8 +578,30 @@ void RenderOverlay(bool* menu_open) {
     }
     last_update = now;
     SetCrashStage("RenderOverlay:MonoListItems");
-    MonoListItemsSafe(g_cached_items);
-    last_items_update = now;
+    std::vector<PlayerState> new_items;
+    const bool listed = manual_refresh
+      ? MonoManualRefreshItems(new_items)
+      : MonoListItemsSafe(new_items);
+    if (!listed) {
+      return;
+    }
+    g_cached_items.swap(new_items);
+    uint64_t new_h1 = 0;
+    uint64_t new_h2 = 0;
+    size_t new_count = 0;
+    build_item_snapshot(g_cached_items, new_h1, new_h2, new_count);
+    const bool items_changed =
+      !item_snapshot_ready ||
+      new_count != item_snapshot_count ||
+      new_h1 != item_snapshot_hash1 ||
+      new_h2 != item_snapshot_hash2;
+    item_snapshot_hash1 = new_h1;
+    item_snapshot_hash2 = new_h2;
+    item_snapshot_count = new_count;
+    item_snapshot_ready = true;
+    if (items_changed) {
+      weapon_cache_dirty = true;
+    }
   };
   auto refresh_enemies = [&]() {
     if (!mono_ready) return;
@@ -540,7 +619,10 @@ void RenderOverlay(bool* menu_open) {
     }
     last_update = now;
     SetCrashStage("RenderOverlay:MonoListEnemies");
-    MonoListEnemiesSafe(g_cached_enemies);
+    std::vector<PlayerState> next_enemies;
+    if (MonoListEnemiesSafe(next_enemies)) {
+      g_cached_enemies.swap(next_enemies);
+    }
     last_enemies_update = now;
   };
   auto pause_scans_for_mutation = [&]() {
@@ -581,6 +663,129 @@ void RenderOverlay(bool* menu_open) {
     normalize_squad_selection();
     last_squad_update = now;
   };
+  auto normalize_weapon_selection = [&]() {
+    if (g_cached_weapons.empty()) {
+      weapon_selected_index = -1;
+      weapon_selected_object = nullptr;
+      return;
+    }
+    if (weapon_selected_object) {
+      for (size_t i = 0; i < g_cached_weapons.size(); ++i) {
+        if (g_cached_weapons[i].has_object && g_cached_weapons[i].object == weapon_selected_object) {
+          weapon_selected_index = static_cast<int>(i);
+          return;
+        }
+      }
+    }
+    if (weapon_selected_index >= 0 &&
+        weapon_selected_index < static_cast<int>(g_cached_weapons.size())) {
+      weapon_selected_object = g_cached_weapons[weapon_selected_index].has_object
+        ? g_cached_weapons[weapon_selected_index].object
+        : nullptr;
+      return;
+    }
+    weapon_selected_index = -1;
+    weapon_selected_object = nullptr;
+    for (size_t i = 0; i < g_cached_weapons.size(); ++i) {
+      if (g_cached_weapons[i].has_object) {
+        weapon_selected_index = static_cast<int>(i);
+        weapon_selected_object = g_cached_weapons[i].object;
+        break;
+      }
+    }
+  };
+  auto rebuild_weapon_cache = [&]() {
+    g_cached_weapons.clear();
+    std::unordered_map<void*, bool> weapon_lookup;
+    std::unordered_map<void*, bool> present_lookup;
+    for (const auto& st : g_cached_items) {
+      if (!st.has_object || !st.object) continue;
+      present_lookup[st.object] = true;
+      void* weapon_obj = nullptr;
+      auto id_it = weapon_identity_cache.find(st.object);
+      if (id_it != weapon_identity_cache.end()) {
+        weapon_obj = id_it->second;
+      } else {
+        void* resolved = nullptr;
+        if (MonoResolveBulletWeaponObject(st.object, resolved) && resolved) {
+          weapon_obj = resolved;
+        }
+        weapon_identity_cache[st.object] = weapon_obj;
+      }
+      if (!weapon_obj) continue;
+      if (weapon_lookup.find(weapon_obj) != weapon_lookup.end()) continue;
+      weapon_lookup[weapon_obj] = true;
+      PlayerState weapon_state = st;
+      weapon_state.object = weapon_obj;
+      weapon_state.has_object = true;
+      g_cached_weapons.push_back(weapon_state);
+    }
+    for (auto it = weapon_identity_cache.begin(); it != weapon_identity_cache.end();) {
+      if (present_lookup.find(it->first) == present_lookup.end()) {
+        it = weapon_identity_cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = weapon_mod_configs.begin(); it != weapon_mod_configs.end();) {
+      if (weapon_lookup.find(it->first) == weapon_lookup.end()) {
+        it = weapon_mod_configs.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    normalize_weapon_selection();
+  };
+  auto poll_current_weapon = [&]() {
+    void* new_weapon_object = nullptr;
+    if (mono_ready && !session_master_transitioning && allow_scan_items) {
+      MonoGetLocalHeldBulletWeaponObject(new_weapon_object);
+    }
+    if (new_weapon_object != current_weapon_object) {
+      current_weapon_object = new_weapon_object;
+      weapon_cache_dirty = true;
+    }
+  };
+  auto apply_weapon_mods = [&]() {
+    std::vector<WeaponModEntry> entries;
+    entries.reserve(weapon_mod_configs.size());
+    std::unordered_map<void*, bool> scanned_lookup;
+    for (const auto& st : g_cached_weapons) {
+      if (st.has_object && st.object) {
+        scanned_lookup[st.object] = true;
+      }
+    }
+    for (const auto& kv : weapon_mod_configs) {
+      if (!kv.first) continue;
+      if (scanned_lookup.find(kv.first) == scanned_lookup.end()) continue;
+      const WeaponUiConfig& cfg = kv.second;
+      if (!cfg.enabled) continue;
+      if (!cfg.rapid_fire && !cfg.magic_bullet && !cfg.infinite_ammo && !cfg.no_recoil) continue;
+      WeaponModEntry entry{};
+      entry.scanned_object = kv.first;
+      entry.enabled = true;
+      entry.rapid_fire = cfg.rapid_fire;
+      entry.magic_bullet = cfg.magic_bullet;
+      entry.infinite_ammo = cfg.infinite_ammo;
+      entry.no_recoil = cfg.no_recoil;
+      entry.rapid_fire_cooldown = cfg.rapid_fire_cooldown;
+      entries.push_back(entry);
+    }
+    int applied_count = 0;
+    int magic_active_count = 0;
+    weapon_mod_last_ok = MonoApplyWeaponMods(entries, applied_count, magic_active_count);
+    weapon_mod_applied_count = applied_count;
+    weapon_mod_magic_active_count = magic_active_count;
+  };
+  auto get_weapon_name = [&](void* weapon_obj) -> const char* {
+    if (!weapon_obj) return "<none>";
+    for (const auto& st : g_cached_weapons) {
+      if (st.has_object && st.object == weapon_obj) {
+        return st.has_name ? st.name.c_str() : "<weapon>";
+      }
+    }
+    return "<unknown>";
+  };
   auto refresh_logs = [&]() {
     MonoGetLogs(log_lines, debug_logs);
     last_log_update = now;
@@ -598,11 +803,8 @@ void RenderOverlay(bool* menu_open) {
       g_last_matrix_update = now;
     }
   };
-  // 高频刷新：约 120ms，降低加载期抖动与崩溃风险
-  if (mono_ready && auto_refresh_items && now - last_items_update > 120) {
-    refresh_items();
-  }
-  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 180) {
+  // 物品列表不再自动巡检；仅手动刷新 + 会话切换重置
+  if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 1000) {
     refresh_enemies();
   }
   if (mono_ready && safe_to_refresh && now - last_squad_update > 500) {
@@ -611,6 +813,28 @@ void RenderOverlay(bool* menu_open) {
   if (mono_ready && allow_read_player && now - g_last_matrix_update > 33) {
     refresh_matrices();
   }
+  if (mono_ready && !session_master_transitioning) {
+    poll_current_weapon();
+  } else if (!mono_ready || session_master_transitioning) {
+    if (current_weapon_object != nullptr) {
+      current_weapon_object = nullptr;
+      weapon_cache_dirty = true;
+    }
+  }
+  if (weapon_cache_dirty) {
+    rebuild_weapon_cache();
+    weapon_cache_dirty = false;
+  }
+  normalize_weapon_selection();
+  if (mono_ready && !session_master_transitioning) {
+    apply_weapon_mods();
+  } else {
+    MonoResetWeaponMods();
+    weapon_mod_last_ok = false;
+    weapon_mod_applied_count = 0;
+    weapon_mod_magic_active_count = 0;
+  }
+  const char* current_weapon_name = get_weapon_name(current_weapon_object);
 
   if (mono_ready && allow_mutate_round) {
     if (round_lock_enabled) {
@@ -739,7 +963,8 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndGroup();
 
           SectionLabel("编辑 / 应用");
-          ImGui::BeginDisabled(!allow_mutate_player);
+          const bool can_local_position = allow_read_player && !session_master_transitioning;
+          const bool can_local_mutate = allow_mutate_player;
           if (ImGui::BeginTable("edit_table", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 2.0f);
@@ -749,7 +974,7 @@ void RenderOverlay(bool* menu_open) {
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("位置");
             ImGui::TableSetColumnIndex(1);
-            bool disable_pos = locks.position || !last_state.has_position;
+            bool disable_pos = locks.position || !last_state.has_position || !can_local_position;
             ImGui::Checkbox("锁定位置", &locks.position);
             ImGui::BeginDisabled(disable_pos);
             if (ImGui::InputFloat3("##position", edits.pos, "%.3f",
@@ -764,6 +989,7 @@ void RenderOverlay(bool* menu_open) {
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("生命 / 最大生命");
             ImGui::TableSetColumnIndex(1);
+            ImGui::BeginDisabled(!can_local_mutate);
             bool hp_apply = false;
             if (ImGui::InputInt("##health", &edits.health, 0, 0,
               ImGuiInputTextFlags_EnterReturnsTrue) ||
@@ -780,12 +1006,14 @@ void RenderOverlay(bool* menu_open) {
             }
             ImGui::SameLine();
             ImGui::Checkbox("锁定生命", &lock_health);
+            ImGui::EndDisabled();
 
             // 体力
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("体力 / 最大体力");
             ImGui::TableSetColumnIndex(1);
+            ImGui::BeginDisabled(!can_local_mutate);
             bool sta_apply = false;
             if (ImGui::InputFloat("##stamina", &edits.stamina, 0.1f, 1.0f, "%.2f",
               ImGuiInputTextFlags_EnterReturnsTrue) ||
@@ -802,10 +1030,13 @@ void RenderOverlay(bool* menu_open) {
             }
             ImGui::SameLine();
             ImGui::Checkbox("锁定体力", &lock_stamina);
+            ImGui::EndDisabled();
 
             ImGui::EndTable();
           }
-          ImGui::EndDisabled();
+          if (!can_local_position) {
+            ImGui::TextDisabled("本地坐标传送受限: %s", gate_reason_text.c_str());
+          }
 
           SectionLabel("功能修改");
           ImGui::BeginDisabled(!allow_mutate_player);
@@ -1072,9 +1303,7 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::SameLine();
           ImGui::BeginDisabled(!allow_scan_items);
-          ImGui::Checkbox("自动刷新", &auto_refresh_items);
-          ImGui::SameLine();
-          if (ImGui::Button("刷新物品")) refresh_items();
+          if (ImGui::Button("刷新物品")) refresh_items(true);
           ImGui::EndDisabled();
           ImGui::EndGroup();
           if (!allow_scan_items) {
@@ -1088,8 +1317,7 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::BeginDisabled(!allow_scan_items);
           if (ImGui::Button("安全刷新一次")) {
-            MonoManualRefreshItems(g_cached_items);
-            last_items_update = now;
+            refresh_items(true);
           }
           ImGui::SameLine();
           if (ImGui::Button("重置物品禁用")) {
@@ -1136,7 +1364,8 @@ void RenderOverlay(bool* menu_open) {
               }
             };
 
-            for (const auto& st : g_cached_items) {
+            for (size_t i = 0; i < g_cached_items.size(); ++i) {
+              const auto& st = g_cached_items[i];
               ImGui::TableNextRow();
               ImGui::TableSetColumnIndex(0);
               ImGui::TextUnformatted(st.has_name ? st.name.c_str() : "<unknown>");
@@ -1181,6 +1410,140 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndTabItem();
         }
 
+        // 武器改造页
+        if (ImGui::BeginTabItem("武器")) {
+          ImGui::BeginDisabled(!allow_scan_items);
+          if (ImGui::Button("刷新武器来源(物品扫描)")) {
+            refresh_items(true);
+          }
+          ImGui::EndDisabled();
+          ImGui::SameLine();
+          ImGui::TextDisabled("已识别可发弹武器: %d", static_cast<int>(g_cached_weapons.size()));
+          ImGui::TextDisabled("改造状态: %s | 已应用: %d | 穿墙激活: %d",
+            weapon_mod_last_ok ? "运行中" : "未运行",
+            weapon_mod_applied_count,
+            weapon_mod_magic_active_count);
+          ImGui::TextDisabled("当前手持武器: %s | obj=%p", current_weapon_name, current_weapon_object);
+          ImGui::TextDisabled("筛选规则: 仅 ItemGun 且 bulletPrefab 有效、numberOfBullets > 0");
+          ImGui::TextDisabled("重建触发: 物品对象集合变化 / 当前手持武器对象变化");
+
+          ImGuiTableFlags weapon_flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY;
+          ImVec2 weapon_table_size = ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y * 0.45f);
+          if (ImGui::BeginTable("weapon_table_view", 5, weapon_flags, weapon_table_size)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("武器");
+            ImGui::TableSetupColumn("距离");
+            ImGui::TableSetupColumn("Layer");
+            ImGui::TableSetupColumn("价值");
+            ImGui::TableSetupColumn("坐标");
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < g_cached_weapons.size(); ++i) {
+              const auto& st = g_cached_weapons[i];
+              ImGui::TableNextRow();
+
+              ImGui::TableSetColumnIndex(0);
+              std::string display_name = st.has_name ? st.name : "<weapon>";
+              const bool selected = st.has_object && weapon_selected_object == st.object;
+              ImGui::PushID(static_cast<int>(i));
+              if (ImGui::Selectable(display_name.c_str(), selected,
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap)) {
+                weapon_selected_index = static_cast<int>(i);
+                weapon_selected_object = st.has_object ? st.object : nullptr;
+              }
+              ImGui::PopID();
+
+              ImGui::TableSetColumnIndex(1);
+              if (last_state.has_position && st.has_position) {
+                float dx = st.x - last_state.x;
+                float dy = st.y - last_state.y;
+                float dz = st.z - last_state.z;
+                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                ImGui::Text("%.1fm", dist);
+              } else {
+                ImGui::TextDisabled("-");
+              }
+
+              ImGui::TableSetColumnIndex(2);
+              if (st.has_layer) ImGui::Text("%d", st.layer); else ImGui::TextDisabled("-");
+
+              ImGui::TableSetColumnIndex(3);
+              if (st.has_value) ImGui::Text("$%d", st.value);
+              else ImGui::TextDisabled("-");
+
+              ImGui::TableSetColumnIndex(4);
+              if (st.has_position) {
+                ImGui::Text("%.2f, %.2f, %.2f", st.x, st.y, st.z);
+              } else {
+                ImGui::TextDisabled("无坐标");
+              }
+            }
+            ImGui::EndTable();
+          }
+
+          normalize_weapon_selection();
+          const PlayerState* selected_weapon_state = nullptr;
+          if (weapon_selected_index >= 0 &&
+            weapon_selected_index < static_cast<int>(g_cached_weapons.size())) {
+            selected_weapon_state = &g_cached_weapons[weapon_selected_index];
+          }
+
+          SectionLabel("枪械功能改造");
+          if (selected_weapon_state && selected_weapon_state->has_object) {
+            void* selected_obj = selected_weapon_state->object;
+            auto cfg_it = weapon_mod_configs.find(selected_obj);
+            WeaponUiConfig cfg = (cfg_it != weapon_mod_configs.end()) ? cfg_it->second : WeaponUiConfig{};
+            const char* selected_name =
+              selected_weapon_state->has_name ? selected_weapon_state->name.c_str() : "<weapon>";
+            ImGui::Text("当前武器: %s", selected_name);
+            ImGui::SameLine();
+            ImGui::TextDisabled("obj=%p", selected_obj);
+            bool cfg_changed = false;
+            cfg_changed = ImGui::Checkbox("启用该武器改造", &cfg.enabled) || cfg_changed;
+            ImGui::BeginDisabled(!cfg.enabled);
+            cfg_changed = ImGui::Checkbox("速射", &cfg.rapid_fire) || cfg_changed;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(170.0f);
+            cfg_changed = ImGui::SliderFloat("速射间隔(s)", &cfg.rapid_fire_cooldown, 0.001f, 0.2f, "%.3f") || cfg_changed;
+            cfg_changed = ImGui::Checkbox("魔法子弹", &cfg.magic_bullet) || cfg_changed;
+            ImGui::SameLine();
+            cfg_changed = ImGui::Checkbox("无限子弹", &cfg.infinite_ammo) || cfg_changed;
+            ImGui::SameLine();
+            cfg_changed = ImGui::Checkbox("无后座力", &cfg.no_recoil) || cfg_changed;
+            ImGui::EndDisabled();
+            if (cfg_changed) {
+              const bool should_store =
+                cfg.enabled || cfg.rapid_fire || cfg.magic_bullet || cfg.infinite_ammo || cfg.no_recoil;
+              if (should_store) {
+                weapon_mod_configs[selected_obj] = cfg;
+              }
+              else {
+                weapon_mod_configs.erase(selected_obj);
+              }
+            }
+            if (ImGui::Button("移除当前武器配置")) {
+              weapon_mod_configs.erase(selected_obj);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("清空全部武器配置")) {
+              weapon_mod_configs.clear();
+            }
+          }
+          else {
+            ImGui::TextDisabled("先在上方武器表里选中一把武器。");
+          }
+
+          int configured_count = 0;
+          for (const auto& kv : weapon_mod_configs) {
+            const WeaponUiConfig& cfg = kv.second;
+            if (cfg.enabled && (cfg.rapid_fire || cfg.magic_bullet || cfg.infinite_ammo || cfg.no_recoil)) {
+              ++configured_count;
+            }
+          }
+          ImGui::TextDisabled("已启用配置武器: %d", configured_count);
+          ImGui::EndTabItem();
+        }
+
         // 队友/复活
         if (ImGui::BeginTabItem("队友")) {
           ImGui::BeginDisabled(!allow_read_player);
@@ -1208,7 +1571,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::SameLine();
           ImGui::TextDisabled("队友数: %d", static_cast<int>(squad_states.size()));
           ImGui::SameLine();
-          ImGui::TextDisabled("你是房主: %s | 可写队友: %s",
+          ImGui::TextDisabled("你是房主: %s | 房主可写队友: %s",
             is_real_master ? "是" : "否",
             (is_real_master && allow_mutate_player) ? "是" : "否");
 
@@ -1230,7 +1593,8 @@ void RenderOverlay(bool* menu_open) {
             if (selected_state->has_object) {
               void* selected_obj = selected_state->object;
               bool squad_need_refresh = false;
-              const bool can_manage_squad = is_real_master && allow_mutate_player;
+              const bool can_manage_squad =
+                allow_mutate_player && (is_real_master || selected_state->is_local);
               ImGui::SetNextItemWidth(120.0f);
               ImGui::InputInt("目标生命##squad_hp", &squad_target_health, 1, 20);
               ImGui::SameLine();
@@ -1275,7 +1639,7 @@ void RenderOverlay(bool* menu_open) {
               ImGui::SetNextItemWidth(260.0f);
               ImGui::InputFloat3("拉取偏移##squad_pull_offset", squad_pull_offset, "%.2f");
               if (!can_manage_squad) {
-                ImGui::TextDisabled("非房主时仅可查看，传送/拉取/改队友状态不可用");
+                ImGui::TextDisabled("非房主且非本地目标时，仅可查看。");
               }
               if (squad_need_refresh) {
                 refresh_squad();
@@ -1376,8 +1740,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::SameLine();
           ImGui::BeginDisabled(!allow_scan_items);
           if (ImGui::Button("手动刷新物品")) {
-            MonoManualRefreshItems(g_cached_items);
-            last_items_update = now;
+            refresh_items(true);
           }
           ImGui::EndDisabled();
           ImGui::SameLine();
@@ -1541,8 +1904,6 @@ void RenderOverlay(bool* menu_open) {
           ImGui::SameLine();
           ImGui::Checkbox("默认防摔倒", &no_fall_enabled);
           ImGui::Checkbox("默认自动刷新玩家状态", &auto_refresh);
-          ImGui::SameLine();
-          ImGui::Checkbox("默认自动刷新物品", &auto_refresh_items);
           ImGui::SameLine();
           ImGui::Checkbox("默认自动刷新敌人", &auto_refresh_enemies);
           ImGui::InputFloat("默认速度倍率", &speed_mult, 0.1f, 0.5f, "%.2f");

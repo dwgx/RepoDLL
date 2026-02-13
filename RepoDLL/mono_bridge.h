@@ -44,6 +44,16 @@ struct PlayerState {
   } category = kUnknown;
 };
 
+struct WeaponModEntry {
+  void* scanned_object = nullptr;
+  bool enabled = false;
+  bool rapid_fire = false;
+  bool magic_bullet = false;
+  bool infinite_ammo = false;
+  bool no_recoil = false;
+  float rapid_fire_cooldown = 0.02f;
+};
+
 struct Matrix4x4 {
   float m[16]{};
 };
@@ -121,6 +131,13 @@ bool MonoSetCartValueSafe(int value);
 bool MonoSetGrabRange(float range);
 bool MonoSetGrabStrengthField(float strength);
 bool MonoSetThirdPerson(bool enabled, float distance, float height, float shoulder, float smooth);
+bool MonoApplyWeaponMods(const std::vector<WeaponModEntry>& entries,
+                         int& out_applied_count,
+                         int& out_magic_active_count);
+void MonoResetWeaponMods();
+bool MonoIsBulletWeaponObject(void* scanned_object);
+bool MonoResolveBulletWeaponObject(void* scanned_object, void*& out_weapon_object);
+bool MonoGetLocalHeldBulletWeaponObject(void*& out_scanned_object);
 
 // Round/haul helpers (关卡收集阶段)
 struct RoundState {
