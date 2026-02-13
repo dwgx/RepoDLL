@@ -49,6 +49,9 @@ bool g_imgui_context_created = false;
 bool g_menu_open = true;
 std::atomic<int> g_menu_toggle_vk{VK_INSERT};
 std::atomic<bool> g_menu_key_capture_active{false};
+std::atomic<int> g_third_person_toggle_vk{VK_F6};
+std::atomic<bool> g_third_person_key_capture_active{false};
+std::atomic<bool> g_third_person_enabled{false};
 bool g_unhooked = false;
 
 struct Vec3 { float x, y, z; };
@@ -278,8 +281,26 @@ LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
       g_menu_key_capture_active.store(false, std::memory_order_relaxed);
       return 0;
     }
+    if (g_third_person_key_capture_active.load(std::memory_order_relaxed)) {
+      if (vk == VK_ESCAPE) {
+        LogMessage("Third-person hotkey capture canceled (Esc)");
+      } else if (vk > 0 && vk <= 0xFF) {
+        g_third_person_toggle_vk.store(vk, std::memory_order_relaxed);
+        std::ostringstream oss;
+        oss << "Third-person hotkey updated: vk=" << vk;
+        LogMessage(oss.str());
+      }
+      g_third_person_key_capture_active.store(false, std::memory_order_relaxed);
+      return 0;
+    }
     if (vk == g_menu_toggle_vk.load(std::memory_order_relaxed)) {
       g_menu_open = !g_menu_open;
+      return 0;
+    }
+    if (vk == g_third_person_toggle_vk.load(std::memory_order_relaxed)) {
+      const bool next = !g_third_person_enabled.load(std::memory_order_relaxed);
+      g_third_person_enabled.store(next, std::memory_order_relaxed);
+      LogMessage(std::string("Third-person toggled: ") + (next ? "ON" : "OFF"));
       return 0;
     }
   }
@@ -604,6 +625,9 @@ bool HookDx11() {
 void UnhookDx11() {
   if (g_unhooked) return;
   g_unhooked = true;
+  g_menu_key_capture_active.store(false, std::memory_order_relaxed);
+  g_third_person_key_capture_active.store(false, std::memory_order_relaxed);
+  g_third_person_enabled.store(false, std::memory_order_relaxed);
 
   LogMessage("UnhookDx11: begin");
 
@@ -671,4 +695,40 @@ void BeginMenuToggleKeyCapture() {
 
 bool IsMenuToggleKeyCaptureActive() {
   return g_menu_key_capture_active.load(std::memory_order_relaxed);
+}
+
+int GetThirdPersonToggleVirtualKey() {
+  return g_third_person_toggle_vk.load(std::memory_order_relaxed);
+}
+
+void SetThirdPersonToggleVirtualKey(int vk) {
+  if (vk <= 0 || vk > 0xFF) {
+    vk = VK_F6;
+  }
+  g_third_person_toggle_vk.store(vk, std::memory_order_relaxed);
+  std::ostringstream oss;
+  oss << "Third-person hotkey set: vk=" << vk;
+  LogMessage(oss.str());
+}
+
+void BeginThirdPersonToggleKeyCapture() {
+  g_third_person_key_capture_active.store(true, std::memory_order_relaxed);
+  LogMessage("Third-person hotkey capture started");
+}
+
+bool IsThirdPersonToggleKeyCaptureActive() {
+  return g_third_person_key_capture_active.load(std::memory_order_relaxed);
+}
+
+bool GetThirdPersonEnabled() {
+  return g_third_person_enabled.load(std::memory_order_relaxed);
+}
+
+void SetThirdPersonEnabled(bool enabled) {
+  const bool current = g_third_person_enabled.load(std::memory_order_relaxed);
+  if (current == enabled) {
+    return;
+  }
+  g_third_person_enabled.store(enabled, std::memory_order_relaxed);
+  LogMessage(std::string("Third-person set: ") + (enabled ? "ON" : "OFF"));
 }

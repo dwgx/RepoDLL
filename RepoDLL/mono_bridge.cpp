@@ -38,6 +38,12 @@ bool g_item_esp_enabled = false;
 int g_item_esp_cap = 65;
 int g_enemy_esp_cap = 8;
 bool g_session_master_patch_active = false;
+static bool ApplyThirdPersonLocalVisualsInternal(bool enabled);
+static bool ApplyThirdPersonCameraOffsetInternal(bool enabled,
+                                                 float distance,
+                                                 float height,
+                                                 float shoulder,
+                                                 float smooth);
 
 namespace {
   using MonoDomain = void;
@@ -99,9 +105,54 @@ namespace {
     void* vector[1];
   };
 
-  // Helper: validate managed array before dereference
+  constexpr size_t kMaxReasonableManagedArrayLength = 1u << 20;  // 1,048,576
+
+  // Helper: validate managed array before dereference.
   inline bool IsValidArray(const MonoArray* arr) {
-    return arr && arr->vector && arr->max_length > 0;
+    if (!arr) return false;
+#ifdef _MSC_VER
+    __try {
+      const size_t len = arr->max_length;
+      return arr->vector != nullptr && len > 0 && len <= kMaxReasonableManagedArrayLength;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+#else
+    return arr->vector && arr->max_length > 0 && arr->max_length <= kMaxReasonableManagedArrayLength;
+#endif
+  }
+
+  inline int GetArrayLengthSafe(const MonoArray* arr) {
+    if (!IsValidArray(arr)) return 0;
+#ifdef _MSC_VER
+    __try {
+      const size_t len = arr->max_length;
+      return len > static_cast<size_t>(0x7fffffff) ? 0x7fffffff : static_cast<int>(len);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return 0;
+    }
+#else
+    const size_t len = arr->max_length;
+    return len > static_cast<size_t>(0x7fffffff) ? 0x7fffffff : static_cast<int>(len);
+#endif
+  }
+
+  inline MonoObject* GetArrayElementSafe(const MonoArray* arr, int index) {
+    if (!IsValidArray(arr) || index < 0) return nullptr;
+    const int len = GetArrayLengthSafe(arr);
+    if (index >= len) return nullptr;
+#ifdef _MSC_VER
+    __try {
+      return reinterpret_cast<MonoObject*>(arr->vector[index]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return nullptr;
+    }
+#else
+    return reinterpret_cast<MonoObject*>(arr->vector[index]);
+#endif
   }
 
   // Forward declaration for SafeInvoke (defined later).
@@ -113,6 +164,8 @@ namespace {
   static void EnemyCachePruneDead();
   static void __stdcall EnemyAwakeHook(MonoObject* self);
   static void InstallEnemyAwakeHook();
+  static void __stdcall PlayerAvatarVisualsUpdateHook(MonoObject* self);
+  static void InstallPlayerAvatarVisualsUpdateHook();
   static void __stdcall RoundDirectorUpdateHook(MonoObject* self);
   static void InstallRoundDirectorUpdateHook();
   static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value);
@@ -123,12 +176,23 @@ namespace {
   static bool SetRoundUpdateBypass(bool enable);
   static bool ApplySessionMasterPatches();
   static bool RestoreSessionMasterPatches();
+  static void ResetThirdPersonVisualState();
 #ifdef _MSC_VER
   static bool FieldGetBoolSafeSeh(MonoObject* obj, MonoClassField* field, bool& out_value);
   static bool FieldGetObjectSafeSeh(MonoObject* obj, MonoClassField* field, MonoObject*& out_value);
   static bool FieldStaticGetObjectSafeSeh(MonoVTable* vtable, MonoClassField* field, MonoObject*& out_value);
   static bool FieldGetVector3SafeSeh(MonoObject* obj, MonoClassField* field,
                                      float& out_x, float& out_y, float& out_z);
+  static bool FieldGetFloatSafeSeh(MonoObject* obj, MonoClassField* field, float& out_value);
+  static bool FieldSetVector3SafeSeh(MonoObject* obj, MonoClassField* field,
+                                     float x, float y, float z);
+  static bool FieldSetFloatSafeSeh(MonoObject* obj, MonoClassField* field, float value);
+  static bool UnboxBoolSafeSeh(MonoObject* boxed, bool& out_value);
+  static bool UnboxInt32SafeSeh(MonoObject* boxed, int& out_value);
+  static bool UnboxVector3SafeSeh(MonoObject* boxed, float& out_x, float& out_y, float& out_z);
+  static bool GcHandleNewSafeSeh(MonoObject* obj, uint32_t& out_handle);
+  static bool CopyCameraMatricesSafeSeh(MonoObject* proj_obj, MonoObject* view_obj,
+                                        Matrix4x4& out_projection, Matrix4x4& out_view);
 #endif
 
   MonoApi g_mono;
@@ -153,6 +217,10 @@ namespace {
   MonoClassField* g_player_avatar_physgrabber_field = nullptr;
   MonoClassField* g_player_avatar_client_position_field = nullptr;
   MonoClassField* g_player_avatar_client_position_current_field = nullptr;
+  MonoClassField* g_player_avatar_visuals_field = nullptr;
+  MonoClass* g_player_avatar_visuals_class = nullptr;
+  MonoClassField* g_player_avatar_visuals_mesh_parent_field = nullptr;
+  MonoClassField* g_player_avatar_visuals_animator_field = nullptr;
 
   MonoClass* g_player_health_class = nullptr;
   MonoClassField* g_player_health_value_field = nullptr;
@@ -176,6 +244,11 @@ namespace {
   MonoMethod* g_unity_camera_get_projection_matrix = nullptr;
   MonoMethod* g_unity_camera_get_world_to_camera_matrix = nullptr;
   MonoMethod* g_unity_camera_get_transform = nullptr;
+  MonoClass* g_camera_position_class = nullptr;
+  MonoVTable* g_camera_position_vtable = nullptr;
+  MonoClassField* g_camera_position_instance_field = nullptr;
+  MonoClassField* g_camera_position_player_offset_field = nullptr;
+  MonoClassField* g_camera_position_position_smooth_field = nullptr;
   MonoClass* g_component_class = nullptr;
   MonoMethod* g_component_get_transform = nullptr;
   MonoMethod* g_component_get_game_object = nullptr;
@@ -184,6 +257,8 @@ namespace {
   MonoMethod* g_game_object_get_component = nullptr;
   MonoMethod* g_game_object_get_component_in_parent = nullptr;
   MonoMethod* g_game_object_get_layer = nullptr;
+  MonoMethod* g_game_object_get_active_self = nullptr;
+  MonoMethod* g_game_object_set_active = nullptr;
 
   MonoClass* g_unity_object_class = nullptr;
   MonoMethod* g_unity_object_get_name = nullptr;
@@ -192,6 +267,9 @@ namespace {
   MonoClass* g_transform_class = nullptr;
   MonoMethod* g_transform_get_local_to_world = nullptr;
   MonoMethod* g_transform_get_world_to_local = nullptr;
+  MonoClass* g_behaviour_class = nullptr;
+  MonoMethod* g_behaviour_get_enabled = nullptr;
+  MonoMethod* g_behaviour_set_enabled = nullptr;
 
   MonoClass* g_physics_class = nullptr;
   MonoMethod* g_physics_overlap_sphere = nullptr;
@@ -247,6 +325,11 @@ namespace {
   using EnemyAwakeFn = void(*)(MonoObject*);
   EnemyAwakeFn g_enemy_awake_orig = nullptr;
   bool g_enemy_awake_hooked = false;
+  MonoMethod* g_player_avatar_visuals_update_method = nullptr;
+  MonoMethod* g_player_avatar_visuals_animation_logic_method = nullptr;
+  using PlayerAvatarVisualsUpdateFn = void(*)(MonoObject*);
+  PlayerAvatarVisualsUpdateFn g_player_avatar_visuals_update_orig = nullptr;
+  bool g_player_avatar_visuals_update_hooked = false;
   MonoMethod* g_round_director_update_method = nullptr;
   using RoundDirectorUpdateFn = void(*)(MonoObject*);
   RoundDirectorUpdateFn g_round_director_update_orig = nullptr;
@@ -299,6 +382,11 @@ namespace {
   MonoClassField* g_run_manager_restarting_field = nullptr;
   MonoClassField* g_run_manager_wait_to_change_scene_field = nullptr;
   MonoClassField* g_run_manager_lobby_join_field = nullptr;
+  MonoClassField* g_run_manager_level_current_field = nullptr;
+  MonoClassField* g_run_manager_level_previous_field = nullptr;
+  MonoClass* g_level_class = nullptr;
+  MonoClassField* g_level_narrative_name_field = nullptr;
+  MonoClassField* g_level_resource_path_field = nullptr;
   MonoClass* g_level_generator_class = nullptr;
   MonoVTable* g_level_generator_vtable = nullptr;
   MonoClassField* g_level_generator_instance_field = nullptr;
@@ -383,6 +471,21 @@ namespace {
   int g_pending_cart_value = 0;
   bool g_pending_cart_active = false;
   bool g_cart_apply_in_progress = false;
+  MonoObject* g_third_person_bound_camera_position = nullptr;
+  float g_third_person_original_offset[3] = { 0.0f, 0.0f, 0.0f };
+  float g_third_person_original_smooth = 2.0f;
+  bool g_third_person_original_cached = false;
+  bool g_third_person_applied = false;
+  float g_third_person_last_offset[3] = { 0.0f, 0.0f, 0.0f };
+  float g_third_person_last_smooth = 2.0f;
+  uint64_t g_third_person_last_missing_log_ms = 0;
+  MonoObject* g_third_person_bound_mesh_parent = nullptr;
+  MonoObject* g_third_person_bound_animator = nullptr;
+  bool g_third_person_original_mesh_parent_active = false;
+  bool g_third_person_original_mesh_parent_cached = false;
+  bool g_third_person_original_animator_enabled = false;
+  bool g_third_person_original_animator_cached = false;
+  bool g_third_person_visuals_applied = false;
 
   // Shutdown guard
   bool g_shutting_down = false;
@@ -396,6 +499,16 @@ namespace {
   constexpr bool k_enable_session_master_patch = false;
   // Disabled: RPC-based grab upgrades can affect multiplayer ownership/state unexpectedly.
   constexpr bool k_enable_grab_rpc_upgrades = false;
+  // Third-person local model visibility support.
+  // We keep local-visual toggles enabled, but apply them on a Unity main-thread hook
+  // (PlayerAvatarVisuals::Update). Direct Present-thread writes remain disabled.
+  constexpr bool k_enable_third_person_local_visuals = true;
+  constexpr bool k_enable_third_person_visuals_from_present = false;
+  constexpr bool k_enable_third_person_visuals_update_hook = true;
+  // Disabled by default: aggressive populate calls can race with shop/scene object rebuild and crash.
+  constexpr bool k_enable_aggressive_item_population = false;
+  // Disabled by default: extra global sweeps are expensive and less stable on scene transitions.
+  constexpr bool k_enable_item_global_sweeps = false;
   struct CodePatchBackup {
     std::array<uint8_t, 16> bytes{};
     size_t size{ 0 };
@@ -481,6 +594,18 @@ namespace {
   std::atomic<bool> g_items_ready{false};
   std::atomic<bool> g_enemies_ready{false};
   std::atomic<uint64_t> g_items_last_crash_ms{0};
+  std::atomic<uint64_t> g_items_retry_after_ms{0};
+  std::atomic<uint64_t> g_enemies_retry_after_ms{0};
+  std::atomic<int> g_items_crash_count{0};
+  std::atomic<int> g_enemies_crash_count{0};
+  std::atomic<bool> g_items_last_seh_fault{false};
+  std::atomic<uint64_t> g_safeinvoke_last_seh_ms{0};
+  std::atomic<uint32_t> g_safeinvoke_seh_count{0};
+  std::atomic<bool> g_third_person_visual_target_enabled{false};
+  std::atomic<float> g_third_person_target_distance{2.8f};
+  std::atomic<float> g_third_person_target_height{1.15f};
+  std::atomic<float> g_third_person_target_shoulder{0.35f};
+  std::atomic<float> g_third_person_target_smooth{2.0f};
 
   std::string NowString() {
     auto now = std::chrono::system_clock::now();
@@ -1128,6 +1253,49 @@ namespace {
         AppendLog("Resolved PlayerAvatar::clientPositionCurrent field");
       }
     }
+    if (g_player_avatar_class && !g_player_avatar_visuals_field) {
+      g_player_avatar_visuals_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_class, config::kPlayerAvatarVisualsField);
+      if (!g_player_avatar_visuals_field) {
+        AppendLog("Failed to resolve PlayerAvatar::playerAvatarVisuals field");
+      }
+      else {
+        AppendLog("Resolved PlayerAvatar::playerAvatarVisuals field");
+      }
+    }
+    if (!g_player_avatar_visuals_class) {
+      g_player_avatar_visuals_class = g_mono.mono_class_from_name(
+        g_image, "", config::kPlayerAvatarVisualsClass);
+      if (!g_player_avatar_visuals_class) {
+        g_player_avatar_visuals_class = FindClassAnyAssembly("", config::kPlayerAvatarVisualsClass);
+      }
+      if (g_player_avatar_visuals_class) {
+        AppendLog("Resolved PlayerAvatarVisuals class");
+      }
+    }
+    if (g_player_avatar_visuals_class && !g_player_avatar_visuals_mesh_parent_field) {
+      g_player_avatar_visuals_mesh_parent_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_visuals_class, config::kPlayerAvatarVisualsMeshParentField);
+      if (!g_player_avatar_visuals_mesh_parent_field) {
+        AppendLog("Failed to resolve PlayerAvatarVisuals::meshParent field");
+      }
+      else {
+        AppendLog("Resolved PlayerAvatarVisuals::meshParent field");
+      }
+    }
+    if (g_player_avatar_visuals_class && !g_player_avatar_visuals_animator_field) {
+      g_player_avatar_visuals_animator_field = g_mono.mono_class_get_field_from_name(
+        g_player_avatar_visuals_class, config::kPlayerAvatarVisualsAnimatorField);
+      if (!g_player_avatar_visuals_animator_field) {
+        AppendLog("Failed to resolve PlayerAvatarVisuals::animator field");
+      }
+      else {
+        AppendLog("Resolved PlayerAvatarVisuals::animator field");
+      }
+    }
+    if (g_player_avatar_visuals_class && !g_player_avatar_visuals_update_hooked) {
+      InstallPlayerAvatarVisualsUpdateHook();
+    }
 
     if (!g_player_health_class) {
       g_player_health_class = g_mono.mono_class_from_name(
@@ -1291,6 +1459,44 @@ namespace {
         AppendLog("Resolved RunManager::lobbyJoin field");
       }
     }
+    if (g_run_manager_class && !g_run_manager_level_current_field) {
+      g_run_manager_level_current_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "levelCurrent");
+      if (g_run_manager_level_current_field) {
+        AppendLog("Resolved RunManager::levelCurrent field");
+      }
+    }
+    if (g_run_manager_class && !g_run_manager_level_previous_field) {
+      g_run_manager_level_previous_field = g_mono.mono_class_get_field_from_name(
+        g_run_manager_class, "levelPrevious");
+      if (g_run_manager_level_previous_field) {
+        AppendLog("Resolved RunManager::levelPrevious field");
+      }
+    }
+
+    if (!g_level_class) {
+      g_level_class = g_mono.mono_class_from_name(g_image, "", "Level");
+      if (!g_level_class) {
+        g_level_class = FindClassAnyAssembly("", "Level");
+      }
+      if (g_level_class) {
+        AppendLog("Resolved Level class");
+      }
+    }
+    if (g_level_class && !g_level_narrative_name_field) {
+      g_level_narrative_name_field = g_mono.mono_class_get_field_from_name(
+        g_level_class, "NarrativeName");
+      if (g_level_narrative_name_field) {
+        AppendLog("Resolved Level::NarrativeName field");
+      }
+    }
+    if (g_level_class && !g_level_resource_path_field) {
+      g_level_resource_path_field = g_mono.mono_class_get_field_from_name(
+        g_level_class, "ResourcePath");
+      if (g_level_resource_path_field) {
+        AppendLog("Resolved Level::ResourcePath field");
+      }
+    }
 
     if (!g_level_generator_class) {
       g_level_generator_class = g_mono.mono_class_from_name(g_image, "", "LevelGenerator");
@@ -1387,6 +1593,40 @@ namespace {
         AppendLogOnce("Camera_get_transform_fail", "Failed to resolve Camera::get_transform method");
       }
     }
+    if (!g_camera_position_class && g_image) {
+      g_camera_position_class = g_mono.mono_class_from_name(
+        g_image, "", config::kCameraPositionClass);
+      if (!g_camera_position_class) {
+        g_camera_position_class = FindClassAnyAssembly("", config::kCameraPositionClass);
+      }
+      if (g_camera_position_class) {
+        AppendLog("Resolved CameraPosition class");
+      }
+    }
+    if (g_camera_position_class && !g_camera_position_vtable) {
+      g_camera_position_vtable = g_mono.mono_class_vtable(g_domain, g_camera_position_class);
+    }
+    if (g_camera_position_class && !g_camera_position_instance_field) {
+      g_camera_position_instance_field = g_mono.mono_class_get_field_from_name(
+        g_camera_position_class, config::kCameraPositionInstanceField);
+      if (g_camera_position_instance_field) {
+        AppendLog("Resolved CameraPosition::instance field");
+      }
+    }
+    if (g_camera_position_class && !g_camera_position_player_offset_field) {
+      g_camera_position_player_offset_field = g_mono.mono_class_get_field_from_name(
+        g_camera_position_class, config::kCameraPositionPlayerOffsetField);
+      if (g_camera_position_player_offset_field) {
+        AppendLog("Resolved CameraPosition::playerOffset field");
+      }
+    }
+    if (g_camera_position_class && !g_camera_position_position_smooth_field) {
+      g_camera_position_position_smooth_field = g_mono.mono_class_get_field_from_name(
+        g_camera_position_class, config::kCameraPositionSmoothField);
+      if (g_camera_position_position_smooth_field) {
+        AppendLog("Resolved CameraPosition::positionSmooth field");
+      }
+    }
 
     if (!g_component_class) {
       if (g_unity_image) {
@@ -1479,6 +1719,28 @@ namespace {
         AppendLogOnce("GameObject_get_layer_fail", "Failed to resolve GameObject::get_layer method");
       }
     }
+    if (g_game_object_class && !g_game_object_get_active_self) {
+      g_game_object_get_active_self =
+        g_mono.mono_class_get_method_from_name(g_game_object_class, "get_activeSelf", 0);
+      if (g_game_object_get_active_self) {
+        AppendLogOnce("GameObject_get_activeSelf_ok",
+          "Successfully resolved GameObject::get_activeSelf method");
+      }
+      else {
+        AppendLogOnce("GameObject_get_activeSelf_fail",
+          "Failed to resolve GameObject::get_activeSelf method");
+      }
+    }
+    if (g_game_object_class && !g_game_object_set_active) {
+      g_game_object_set_active =
+        g_mono.mono_class_get_method_from_name(g_game_object_class, "SetActive", 1);
+      if (g_game_object_set_active) {
+        AppendLogOnce("GameObject_set_active_ok", "Successfully resolved GameObject::SetActive method");
+      }
+      else {
+        AppendLogOnce("GameObject_set_active_fail", "Failed to resolve GameObject::SetActive method");
+      }
+    }
     if (!g_unity_object_class) {
       if (g_unity_image) {
         g_unity_object_class =
@@ -1554,6 +1816,47 @@ namespace {
       }
       else {
         AppendLog("Failed to resolve Transform::get_worldToLocalMatrix method");
+      }
+    }
+    if (!g_behaviour_class) {
+      if (g_unity_image) {
+        g_behaviour_class = g_mono.mono_class_from_name(g_unity_image, "UnityEngine", "Behaviour");
+      }
+      if (!g_behaviour_class && g_image) {
+        g_behaviour_class = g_mono.mono_class_from_name(g_image, "UnityEngine", "Behaviour");
+      }
+      if (!g_behaviour_class) {
+        g_behaviour_class = FindClassAnyAssembly("UnityEngine", "Behaviour");
+      }
+      if (g_behaviour_class) {
+        AppendLogOnce("Behaviour_class_ok", "Successfully resolved UnityEngine.Behaviour class");
+      }
+      else {
+        AppendLogOnce("Behaviour_class_fail", "Failed to resolve UnityEngine.Behaviour class");
+      }
+    }
+    if (g_behaviour_class && !g_behaviour_get_enabled) {
+      g_behaviour_get_enabled =
+        g_mono.mono_class_get_method_from_name(g_behaviour_class, "get_enabled", 0);
+      if (g_behaviour_get_enabled) {
+        AppendLogOnce("Behaviour_get_enabled_ok",
+          "Successfully resolved Behaviour::get_enabled method");
+      }
+      else {
+        AppendLogOnce("Behaviour_get_enabled_fail",
+          "Failed to resolve Behaviour::get_enabled method");
+      }
+    }
+    if (g_behaviour_class && !g_behaviour_set_enabled) {
+      g_behaviour_set_enabled =
+        g_mono.mono_class_get_method_from_name(g_behaviour_class, "set_enabled", 1);
+      if (g_behaviour_set_enabled) {
+        AppendLogOnce("Behaviour_set_enabled_ok",
+          "Successfully resolved Behaviour::set_enabled method");
+      }
+      else {
+        AppendLogOnce("Behaviour_set_enabled_fail",
+          "Failed to resolve Behaviour::set_enabled method");
       }
     }
 
@@ -2749,7 +3052,7 @@ namespace {
     }
 
     // Defensive bounds: clamp to prevent bad metadata from walking junk.
-    int max_length = static_cast<int>(items->max_length);
+    int max_length = GetArrayLengthSafe(items);
     int limit = size;
     if (max_length <= 0) {
       AppendLogOnce("PlayerList_maxlen_invalid", "PlayerList items max_length invalid (<=0)");
@@ -2765,7 +3068,7 @@ namespace {
     }
 
     for (int i = 0; i < limit; ++i) {
-      MonoObject* player = reinterpret_cast<MonoObject*>(items->vector[i]);
+      MonoObject* player = GetArrayElementSafe(items, i);
       if (!player) {
         continue;
       }
@@ -2821,15 +3124,25 @@ namespace {
       return false;
     }
 
-    MonoObject* exception = nullptr;
-    MonoObject* position_obj =
-      g_mono.mono_runtime_invoke(get_position, transform_obj, nullptr, &exception);
-    if (exception || !position_obj) {
+    MonoObject* position_obj = SafeInvoke(get_position, transform_obj, nullptr, "Transform.get_position");
+    if (!position_obj) {
       if (log_fail) AppendLog("TryGetPositionFromTransform: mono_runtime_invoke failed or returned null");
       return false;
     }
 
     if (g_mono.mono_object_unbox) {
+#ifdef _MSC_VER
+      float x = 0.0f;
+      float y = 0.0f;
+      float z = 0.0f;
+      if (UnboxVector3SafeSeh(position_obj, x, y, z)) {
+        out_state.x = x;
+        out_state.y = y;
+        out_state.z = z;
+        out_state.has_position = true;
+        return true;
+      }
+#else
       void* data = g_mono.mono_object_unbox(position_obj);
       if (data) {
         float tmp[3] = {};
@@ -2840,6 +3153,7 @@ namespace {
         out_state.has_position = true;
         return true;
       }
+#endif
     }
 
     MonoClass* vec_class = g_mono.mono_object_get_class(position_obj);
@@ -2969,7 +3283,20 @@ namespace {
     void* args[2] = { obj, nullptr };
     MonoObject* ret = SafeInvoke(g_unity_object_op_eq, nullptr, args, "Object.op_Equality");
     if (!ret || !g_mono.mono_object_unbox) return false;
-    return *static_cast<bool*>(g_mono.mono_object_unbox(ret));
+#ifdef _MSC_VER
+    __try {
+      void* raw = g_mono.mono_object_unbox(ret);
+      if (!raw) return false;
+      return (*static_cast<uint8_t*>(raw) != 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+#else
+    void* raw = g_mono.mono_object_unbox(ret);
+    if (!raw) return false;
+    return (*static_cast<uint8_t*>(raw) != 0);
+#endif
   }
 
   inline bool CaseContains(const std::string& hay, const std::string& needle) {
@@ -3047,6 +3374,90 @@ namespace {
     }
     g_enemy_awake_hooked = true;
     AppendLogOnce("EnemyAwake_hook_ok", "Installed hook for EnemyRigidbody::Awake");
+  }
+
+  void __stdcall PlayerAvatarVisualsUpdateHook(MonoObject* self) {
+    bool is_local_visual = false;
+    bool desired_enabled = false;
+    if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_update_hook &&
+        !g_shutting_down && self && g_player_avatar_vtable &&
+        g_player_avatar_instance_field && g_player_avatar_visuals_field) {
+      MonoObject* local_player = nullptr;
+#ifdef _MSC_VER
+      if (FieldStaticGetObjectSafeSeh(
+            g_player_avatar_vtable, g_player_avatar_instance_field, local_player)) {
+#else
+      g_mono.mono_field_static_get_value(
+        g_player_avatar_vtable, g_player_avatar_instance_field, &local_player);
+      if (local_player) {
+#else
+      if (local_player) {
+#endif
+        if (!IsUnityNull(local_player)) {
+          MonoObject* local_visuals = nullptr;
+#ifdef _MSC_VER
+          if (FieldGetObjectSafeSeh(local_player, g_player_avatar_visuals_field, local_visuals)) {
+#else
+          g_mono.mono_field_get_value(local_player, g_player_avatar_visuals_field, &local_visuals);
+          if (local_visuals) {
+#endif
+            if (local_visuals && !IsUnityNull(local_visuals) && local_visuals == self) {
+              is_local_visual = true;
+              desired_enabled =
+                g_third_person_visual_target_enabled.load(std::memory_order_relaxed);
+              ::ApplyThirdPersonLocalVisualsInternal(desired_enabled);
+            }
+          }
+        }
+      }
+    }
+
+    if (g_player_avatar_visuals_update_orig) {
+      g_player_avatar_visuals_update_orig(self);
+    }
+    if (is_local_visual) {
+      ::ApplyThirdPersonLocalVisualsInternal(desired_enabled);
+    }
+  }
+
+  void InstallPlayerAvatarVisualsUpdateHook() {
+    if (!k_enable_third_person_visuals_update_hook || g_player_avatar_visuals_update_hooked ||
+        !g_player_avatar_visuals_class || !g_mono.mono_class_get_method_from_name) {
+      return;
+    }
+    if (!EnsureMinHookReady()) return;
+    if (!g_player_avatar_visuals_update_method) {
+      g_player_avatar_visuals_update_method =
+        g_mono.mono_class_get_method_from_name(g_player_avatar_visuals_class, "Update", 0);
+      if (!g_player_avatar_visuals_update_method) {
+        AppendLogOnce("PlayerAvatarVisualsUpdate_notfound",
+          "PlayerAvatarVisuals::Update not found; third-person visual hook skipped");
+        return;
+      }
+    }
+    void* native_ptr =
+      g_mono.mono_compile_method ? g_mono.mono_compile_method(g_player_avatar_visuals_update_method)
+                                 : nullptr;
+    if (!native_ptr) {
+      AppendLogOnce("PlayerAvatarVisualsUpdate_compile_fail",
+        "mono_compile_method failed for PlayerAvatarVisuals::Update");
+      return;
+    }
+    if (MH_CreateHook(native_ptr, reinterpret_cast<LPVOID>(PlayerAvatarVisualsUpdateHook),
+                      reinterpret_cast<LPVOID*>(&g_player_avatar_visuals_update_orig)) != MH_OK) {
+      AppendLogOnce("PlayerAvatarVisualsUpdate_create_fail",
+        "MH_CreateHook failed for PlayerAvatarVisuals::Update");
+      return;
+    }
+    if (MH_EnableHook(native_ptr) != MH_OK) {
+      AppendLogOnce("PlayerAvatarVisualsUpdate_enable_fail",
+        "MH_EnableHook failed for PlayerAvatarVisuals::Update");
+      MH_RemoveHook(native_ptr);
+      return;
+    }
+    g_player_avatar_visuals_update_hooked = true;
+    AppendLogOnce("PlayerAvatarVisualsUpdate_hook_ok",
+      "Installed hook for PlayerAvatarVisuals::Update (main-thread third-person visuals)");
   }
 
   void __stdcall RoundDirectorUpdateHook(MonoObject* self) {
@@ -3145,8 +3556,19 @@ namespace {
       if (go && g_game_object_get_layer) {
         MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, go, nullptr, "GameObject.get_layer");
         if (layer_obj && g_mono.mono_object_unbox) {
-          st.layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-          st.has_layer = true;
+#ifdef _MSC_VER
+          int layer = 0;
+          if (UnboxInt32SafeSeh(layer_obj, layer)) {
+            st.layer = layer;
+            st.has_layer = true;
+          }
+#else
+          void* raw = g_mono.mono_object_unbox(layer_obj);
+          if (raw) {
+            st.layer = *static_cast<int*>(raw);
+            st.has_layer = true;
+          }
+#endif
         }
       }
     }
@@ -3183,13 +3605,13 @@ namespace {
     MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
     if (!IsValidArray(arr)) return false;
 
-    int limit = static_cast<int>(arr->max_length);
+    int limit = GetArrayLengthSafe(arr);
     if (limit > max_count) limit = max_count;
     if (limit > 1024) limit = 1024;
 
     const size_t before = out_enemies.size();
     for (int i = 0; i < limit; ++i) {
-      MonoObject* enemy_obj = reinterpret_cast<MonoObject*>(arr->vector[i]);
+      MonoObject* enemy_obj = GetArrayElementSafe(arr, i);
       if (!enemy_obj || IsUnityNull(enemy_obj)) continue;
       if (AddEnemyFromObject(enemy_obj, out_enemies) &&
           static_cast<int>(out_enemies.size() - before) >= max_count) {
@@ -3207,6 +3629,12 @@ namespace {
     if (!g_enemies_ready.load(std::memory_order_relaxed) && now_ms - last_enemy_empty_ms < 2000) {
       return false;  // Non-ASCII comment normalized.
     }
+    RoundState rs{};
+    if (!MonoGetRoundState(rs) || !rs.ok) {
+      last_enemy_empty_ms = now_ms;
+      return false;
+    }
+
 // Non-ASCII comment normalized.
     PlayerState lp{};
     if (!MonoGetLocalPlayerState(lp) || !lp.has_position) {
@@ -3260,15 +3688,20 @@ namespace {
       return false;
     }
 
-    int lim = static_cast<int>(arr->max_length);
+    int lim = GetArrayLengthSafe(arr);
     if (lim > 2048) lim = 2048;
     std::vector<uint32_t> tmp;
     tmp.reserve(lim);
     for (int i = 0; i < lim; ++i) {
-      MonoObject* enemy_obj = reinterpret_cast<MonoObject*>(arr->vector[i]);
+      MonoObject* enemy_obj = GetArrayElementSafe(arr, i);
       if (!enemy_obj) continue;
       if (!g_mono.mono_gchandle_new) continue;
+#ifdef _MSC_VER
+      uint32_t h = 0;
+      GcHandleNewSafeSeh(enemy_obj, h);
+#else
       uint32_t h = g_mono.mono_gchandle_new(enemy_obj, 0);
+#endif
       if (h) tmp.push_back(h);
     }
     size_t cached_sz = 0;
@@ -3294,6 +3727,7 @@ namespace {
     }
     __except (LogCrash("RefreshEnemyCacheSafe", GetExceptionCode(), GetExceptionInformation())) {
       g_enemy_cache_disabled = true;
+      g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
   }
@@ -3301,9 +3735,51 @@ namespace {
   static bool RefreshEnemyCacheSafe() { return RefreshEnemyCache(); }
 #endif
 
-  // Safe invoke helper to guard mono_runtime_invoke with C++ exceptions only.
+#ifdef _MSC_VER
+  __declspec(noinline) static bool __stdcall SafeInvokeSehThunk(
+    MonoMethod* method, MonoObject* obj, void** args, MonoObject** out_ret, MonoObject** out_exc) {
+    if (out_ret) *out_ret = nullptr;
+    if (out_exc) *out_exc = nullptr;
+    __try {
+      MonoObject* exc = nullptr;
+      MonoObject* ret = g_mono.mono_runtime_invoke(method, obj, args, &exc);
+      if (out_ret) *out_ret = ret;
+      if (out_exc) *out_exc = exc;
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      if (out_ret) *out_ret = nullptr;
+      if (out_exc) *out_exc = nullptr;
+      return false;
+    }
+  }
+#endif
+
+  // Safe invoke helper to guard mono_runtime_invoke from managed exceptions and native faults.
   static MonoObject* SafeInvoke(MonoMethod* method, MonoObject* obj, void** args, const char* tag) {
     if (!method || !g_mono.mono_runtime_invoke) return nullptr;
+#ifdef _MSC_VER
+    MonoObject* ret = nullptr;
+    MonoObject* exc = nullptr;
+    if (!SafeInvokeSehThunk(method, obj, args, &ret, &exc)) {
+      const uint64_t now_ms = GetTickCount64();
+      g_safeinvoke_last_seh_ms.store(now_ms, std::memory_order_relaxed);
+      const uint32_t seh_count = g_safeinvoke_seh_count.fetch_add(1, std::memory_order_relaxed) + 1;
+      std::ostringstream oss;
+      oss << "SafeInvoke caught SEH exception"
+          << " tag=" << (tag ? tag : "<null>")
+          << " count=" << seh_count;
+      std::string key = "SafeInvokeSeh";
+      if (tag && *tag) {
+        key += "_";
+        key += tag;
+      }
+      AppendLogOnce(key, oss.str());
+      return nullptr;
+    }
+    if (exc) return nullptr;
+    return ret;
+#else
     try {
       MonoObject* exc = nullptr;
       MonoObject* ret = g_mono.mono_runtime_invoke(method, obj, args, &exc);
@@ -3314,6 +3790,7 @@ namespace {
       AppendLogOnce(tag ? tag : "SafeInvoke", "SafeInvoke caught exception");
       return nullptr;
     }
+#endif
   }
 
 #ifdef _MSC_VER
@@ -3382,6 +3859,144 @@ namespace {
     out_y = raw[1];
     out_z = raw[2];
     return true;
+  }
+
+  static bool FieldGetFloatSafeSeh(MonoObject* obj, MonoClassField* field, float& out_value) {
+    out_value = 0.0f;
+    if (!obj || !field || !g_mono.mono_field_get_value) {
+      return false;
+    }
+    __try {
+      g_mono.mono_field_get_value(obj, field, &out_value);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = 0.0f;
+      return false;
+    }
+  }
+
+  static bool FieldSetVector3SafeSeh(MonoObject* obj, MonoClassField* field,
+                                     float x, float y, float z) {
+    if (!obj || !field || !g_mono.mono_field_set_value) {
+      return false;
+    }
+    float raw[3] = { x, y, z };
+    __try {
+      g_mono.mono_field_set_value(obj, field, raw);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+  }
+
+  static bool FieldSetFloatSafeSeh(MonoObject* obj, MonoClassField* field, float value) {
+    if (!obj || !field || !g_mono.mono_field_set_value) {
+      return false;
+    }
+    float raw = value;
+    __try {
+      g_mono.mono_field_set_value(obj, field, &raw);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+  }
+
+  static bool UnboxBoolSafeSeh(MonoObject* boxed, bool& out_value) {
+    out_value = false;
+    if (!boxed || !g_mono.mono_object_unbox) {
+      return false;
+    }
+    __try {
+      void* raw = g_mono.mono_object_unbox(boxed);
+      if (!raw) return false;
+      out_value = (*static_cast<uint8_t*>(raw) != 0);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = false;
+      return false;
+    }
+  }
+
+  static bool UnboxInt32SafeSeh(MonoObject* boxed, int& out_value) {
+    out_value = 0;
+    if (!boxed || !g_mono.mono_object_unbox) {
+      return false;
+    }
+    __try {
+      void* raw = g_mono.mono_object_unbox(boxed);
+      if (!raw) return false;
+      out_value = *static_cast<int*>(raw);
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_value = 0;
+      return false;
+    }
+  }
+
+  static bool UnboxVector3SafeSeh(MonoObject* boxed, float& out_x, float& out_y, float& out_z) {
+    out_x = 0.0f;
+    out_y = 0.0f;
+    out_z = 0.0f;
+    if (!boxed || !g_mono.mono_object_unbox) {
+      return false;
+    }
+    __try {
+      void* raw = g_mono.mono_object_unbox(boxed);
+      if (!raw) return false;
+      float tmp[3] = {};
+      std::memcpy(tmp, raw, sizeof(tmp));
+      out_x = tmp[0];
+      out_y = tmp[1];
+      out_z = tmp[2];
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_x = 0.0f;
+      out_y = 0.0f;
+      out_z = 0.0f;
+      return false;
+    }
+  }
+
+  static bool GcHandleNewSafeSeh(MonoObject* obj, uint32_t& out_handle) {
+    out_handle = 0;
+    if (!obj || !g_mono.mono_gchandle_new) {
+      return false;
+    }
+    __try {
+      out_handle = g_mono.mono_gchandle_new(obj, 0);
+      return out_handle != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      out_handle = 0;
+      return false;
+    }
+  }
+
+  static bool CopyCameraMatricesSafeSeh(MonoObject* proj_obj, MonoObject* view_obj,
+                                        Matrix4x4& out_projection, Matrix4x4& out_view) {
+    if (!proj_obj || !view_obj || !g_mono.mono_object_unbox) {
+      return false;
+    }
+    __try {
+      void* proj_data = g_mono.mono_object_unbox(proj_obj);
+      void* view_data = g_mono.mono_object_unbox(view_obj);
+      if (!proj_data || !view_data) {
+        return false;
+      }
+      std::memcpy(out_projection.m, proj_data, sizeof(out_projection.m));
+      std::memcpy(out_view.m, view_data, sizeof(out_view.m));
+      return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
   }
 #endif
 
@@ -3504,6 +4119,11 @@ bool MonoBeginShutdown() {
   g_shutting_down = true;
   g_pending_cart_active = false;
   g_cart_apply_in_progress = false;
+  g_third_person_visual_target_enabled.store(false, std::memory_order_relaxed);
+  g_third_person_bound_camera_position = nullptr;
+  g_third_person_original_cached = false;
+  g_third_person_applied = false;
+  ResetThirdPersonVisualState();
   if (g_session_master_patch_active) {
     RestoreSessionMasterPatches();
     g_session_master_patch_active = false;
@@ -3997,17 +4617,25 @@ static int GetPhotonPlayerActorNumber(MonoObject* player_obj) {
       !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
     return -1;
   }
-  MonoObject* exc = nullptr;
-  MonoObject* boxed = g_mono.mono_runtime_invoke(
-    g_photon_player_get_actor_number, player_obj, nullptr, &exc);
-  if (exc || !boxed) {
+  MonoObject* boxed = SafeInvoke(g_photon_player_get_actor_number, player_obj, nullptr,
+                                 "PhotonPlayer.get_ActorNumber");
+  if (!boxed) {
     return -1;
   }
+#ifdef _MSC_VER
+  __try {
+    void* raw = g_mono.mono_object_unbox(boxed);
+    if (!raw) return -1;
+    return *static_cast<int*>(raw);
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    return -1;
+  }
+#else
   void* raw = g_mono.mono_object_unbox(boxed);
-  if (!raw) {
-    return -1;
-  }
+  if (!raw) return -1;
   return *static_cast<int*>(raw);
+#endif
 }
 
 static bool InvokeStaticBoolMethod(MonoMethod* method, bool& out_value) {
@@ -4015,17 +4643,27 @@ static bool InvokeStaticBoolMethod(MonoMethod* method, bool& out_value) {
   if (!method || !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
     return false;
   }
-  MonoObject* exc = nullptr;
-  MonoObject* boxed = g_mono.mono_runtime_invoke(method, nullptr, nullptr, &exc);
-  if (exc || !boxed) {
+  MonoObject* boxed = SafeInvoke(method, nullptr, nullptr, "InvokeStaticBoolMethod");
+  if (!boxed) {
     return false;
   }
+#ifdef _MSC_VER
+  __try {
+    void* raw = g_mono.mono_object_unbox(boxed);
+    if (!raw) return false;
+    out_value = (*static_cast<uint8_t*>(raw) != 0);
+    return true;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    out_value = false;
+    return false;
+  }
+#else
   void* raw = g_mono.mono_object_unbox(boxed);
-  if (!raw) {
-    return false;
-  }
+  if (!raw) return false;
   out_value = (*static_cast<uint8_t*>(raw) != 0);
   return true;
+#endif
 }
 
 static bool InvokeStaticFloatMethod(MonoMethod* method, float& out_value) {
@@ -4033,17 +4671,27 @@ static bool InvokeStaticFloatMethod(MonoMethod* method, float& out_value) {
   if (!method || !g_mono.mono_runtime_invoke || !g_mono.mono_object_unbox) {
     return false;
   }
-  MonoObject* exc = nullptr;
-  MonoObject* boxed = g_mono.mono_runtime_invoke(method, nullptr, nullptr, &exc);
-  if (exc || !boxed) {
+  MonoObject* boxed = SafeInvoke(method, nullptr, nullptr, "InvokeStaticFloatMethod");
+  if (!boxed) {
     return false;
   }
+#ifdef _MSC_VER
+  __try {
+    void* raw = g_mono.mono_object_unbox(boxed);
+    if (!raw) return false;
+    out_value = *static_cast<float*>(raw);
+    return true;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    out_value = 0.0f;
+    return false;
+  }
+#else
   void* raw = g_mono.mono_object_unbox(boxed);
-  if (!raw) {
-    return false;
-  }
+  if (!raw) return false;
   out_value = *static_cast<float*>(raw);
   return true;
+#endif
 }
 
 static MonoObject* GetStaticSingletonInstance(MonoVTable* vtable, MonoClassField* field) {
@@ -4061,6 +4709,53 @@ static MonoObject* GetStaticSingletonInstance(MonoVTable* vtable, MonoClassField
   return instance;
 }
 
+static std::string ReadStringFieldObject(MonoObject* obj, MonoClassField* field) {
+  if (!obj || !field || !g_mono.mono_field_get_value) {
+    return {};
+  }
+  MonoObject* str_obj = nullptr;
+#ifdef _MSC_VER
+  if (!FieldGetObjectSafeSeh(obj, field, str_obj)) {
+    return {};
+  }
+#else
+  g_mono.mono_field_get_value(obj, field, &str_obj);
+#endif
+  return MonoStringToUtf8(str_obj);
+}
+
+static std::string ReadLevelDisplayName(MonoObject* level_obj) {
+  if (!level_obj || !g_mono.mono_class_get_field_from_name) {
+    return {};
+  }
+
+  MonoClass* level_cls = nullptr;
+  if (g_mono.mono_object_get_class) {
+    level_cls = g_mono.mono_object_get_class(level_obj);
+  }
+  if (!level_cls) {
+    level_cls = g_level_class;
+  }
+  if (!level_cls) {
+    return {};
+  }
+
+  if (!g_level_narrative_name_field) {
+    g_level_narrative_name_field =
+      g_mono.mono_class_get_field_from_name(level_cls, "NarrativeName");
+  }
+  if (!g_level_resource_path_field) {
+    g_level_resource_path_field =
+      g_mono.mono_class_get_field_from_name(level_cls, "ResourcePath");
+  }
+
+  std::string name = ReadStringFieldObject(level_obj, g_level_narrative_name_field);
+  if (!name.empty()) {
+    return name;
+  }
+  return ReadStringFieldObject(level_obj, g_level_resource_path_field);
+}
+
 static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& out_reason) {
   out_transitioning = true;
   out_reason = "managed_refs_unavailable";
@@ -4073,9 +4768,19 @@ static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& 
   if (InvokeStaticBoolMethod(g_photon_network_get_in_room, in_room)) {
     in_room_known = true;
     if (!in_room) {
-      out_transitioning = true;
-      out_reason = "PhotonNetwork.InRoom=false";
-      return true;
+      // Singleplayer/offline runs are valid gameplay states with no Photon room.
+      // Do not treat them as permanent "session transitioning".
+      bool master_or_single = false;
+      if (InvokeStaticBoolMethod(g_semi_func_is_master_client_or_singleplayer, master_or_single) &&
+          master_or_single) {
+        AppendLogOnce("SessionTransitionGuard_singleplayer_ok",
+          "SessionTransitionGuard: InRoom=false but SemiFunc::IsMasterClientOrSingleplayer=true; treating as stable gameplay state");
+        in_room_known = false;
+      } else {
+        out_transitioning = true;
+        out_reason = "PhotonNetwork.InRoom=false";
+        return true;
+      }
     }
   }
 
@@ -4143,6 +4848,92 @@ static bool ComputeSessionTransitionState(bool& out_transitioning, std::string& 
     out_reason = "stable";
   }
   out_transitioning = false;
+  return true;
+}
+
+bool MonoGetSessionRuntimeGate(SessionRuntimeGate& out_gate) {
+  out_gate = SessionRuntimeGate{};
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) {
+    out_gate.reason = "managed_refs_unavailable";
+    return false;
+  }
+
+  bool transitioning = true;
+  std::string reason;
+  ComputeSessionTransitionState(transitioning, reason);
+  out_gate.transitioning = transitioning;
+  out_gate.reason = reason;
+
+  bool in_room = false;
+  if (InvokeStaticBoolMethod(g_photon_network_get_in_room, in_room)) {
+    out_gate.in_room_known = true;
+    out_gate.in_room = in_room;
+  }
+
+  int value = 0;
+  bool game_state_known = false;
+  MonoObject* game_director =
+    GetStaticSingletonInstance(g_game_director_vtable, g_game_director_instance_field);
+  if (game_director && g_game_director_current_state_field &&
+      ReadFieldNumber(game_director, g_game_director_current_state_field, value)) {
+    out_gate.game_state = value;
+    game_state_known = true;
+  }
+
+  bool level_generated_known = false;
+  MonoObject* level_generator =
+    GetStaticSingletonInstance(g_level_generator_vtable, g_level_generator_instance_field);
+  if (level_generator && g_level_generator_generated_field &&
+      ReadFieldNumber(level_generator, g_level_generator_generated_field, value)) {
+    out_gate.level_generated = (value != 0);
+    level_generated_known = true;
+  }
+
+  LocalPlayerInfo local_info{};
+  out_gate.has_local_player = MonoGetLocalPlayer(local_info);
+  if (out_gate.has_local_player && !transitioning) {
+    PlayerState local_state{};
+    out_gate.has_local_position =
+      (MonoGetLocalPlayerState(local_state) && local_state.has_position);
+  }
+
+  uint32_t allow = 0;
+  if (!transitioning && out_gate.has_local_player) {
+    allow |= kSessionAllowReadPlayer;
+    allow |= kSessionAllowMutatePlayer;
+  }
+
+  const bool game_state_scan_ok =
+    !game_state_known || (out_gate.game_state != 0 && out_gate.game_state != 5);
+  const bool level_generated_ok = !level_generated_known || out_gate.level_generated;
+
+  if (!transitioning && out_gate.has_local_player && out_gate.has_local_position &&
+      level_generated_ok && game_state_scan_ok) {
+    allow |= kSessionAllowScanItems;
+    allow |= kSessionAllowScanEnemies;
+    allow |= kSessionAllowMutateRound;
+  }
+
+  if (!transitioning && out_gate.has_local_player && level_generated_ok) {
+    allow |= kSessionAllowMutateEconomy;
+  }
+
+  if (!transitioning) {
+    if (!out_gate.has_local_player) {
+      out_gate.reason = "LocalPlayerUnavailable";
+    } else if (!out_gate.has_local_position) {
+      out_gate.reason = "LocalPlayerPositionUnavailable";
+    } else if (!level_generated_ok) {
+      out_gate.reason = "LevelGenerator.Generated=false";
+    } else if (!game_state_scan_ok) {
+      out_gate.reason = "GameDirector.currentState=Load/EndWait";
+    } else if (reason.empty() || reason.rfind("stable", 0) == 0) {
+      out_gate.reason = "stable";
+    }
+  }
+
+  out_gate.allow_mask = allow;
+  out_gate.ok = true;
   return true;
 }
 
@@ -4326,10 +5117,62 @@ bool MonoIsSessionTransitioning() {
   return transitioning;
 }
 
+bool MonoGetRunLevelInfo(RunLevelInfo& out_info) {
+  out_info = RunLevelInfo{};
+  if (!EnsureThreadAttached() || !CacheManagedRefs()) {
+    return false;
+  }
+
+  std::string transition_reason;
+  bool transitioning = true;
+  ComputeSessionTransitionState(transitioning, transition_reason);
+  out_info.transitioning = transitioning;
+
+  MonoObject* run_manager =
+    GetStaticSingletonInstance(g_run_manager_vtable, g_run_manager_instance_field);
+  if (!run_manager) {
+    out_info.ok = !transition_reason.empty();
+    return out_info.ok;
+  }
+
+  MonoObject* current_level = nullptr;
+  MonoObject* previous_level = nullptr;
+#ifdef _MSC_VER
+  if (g_run_manager_level_current_field) {
+    FieldGetObjectSafeSeh(run_manager, g_run_manager_level_current_field, current_level);
+  }
+  if (g_run_manager_level_previous_field) {
+    FieldGetObjectSafeSeh(run_manager, g_run_manager_level_previous_field, previous_level);
+  }
+#else
+  if (g_run_manager_level_current_field && g_mono.mono_field_get_value) {
+    g_mono.mono_field_get_value(run_manager, g_run_manager_level_current_field, &current_level);
+  }
+  if (g_run_manager_level_previous_field && g_mono.mono_field_get_value) {
+    g_mono.mono_field_get_value(run_manager, g_run_manager_level_previous_field, &previous_level);
+  }
+#endif
+
+  out_info.current_level = ReadLevelDisplayName(current_level);
+  out_info.previous_level = ReadLevelDisplayName(previous_level);
+  out_info.ok = true;
+  return true;
+}
+
 bool MonoIsRealMasterClient() {
   if (!EnsureThreadAttached() || !CacheManagedRefs()) {
     return false;
   }
+
+  // Treat singleplayer/offline as authoritative for local controls in UI.
+  bool master_or_single = false;
+  if (InvokeStaticBoolMethod(g_semi_func_is_master_client_or_singleplayer, master_or_single) &&
+      master_or_single) {
+    AppendLogOnce("MonoIsRealMasterClient_singleplayer_fallback",
+      "MonoIsRealMasterClient: using SemiFunc::IsMasterClientOrSingleplayer=true fallback");
+    return true;
+  }
+
   bool is_master_client = false;
   bool local_equals_master = false;
   int local_actor = -1;
@@ -4431,8 +5274,8 @@ static MonoObject* GetRoundDirectorInstance() {
       MonoObject* arr_obj = SafeInvoke(g_object_find_objects_of_type, nullptr, args,
         "FindObjectsOfType(RoundDirector)");
       MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
-      if (arr && arr->max_length > 0) {
-        inst = static_cast<MonoObject*>(arr->vector[0]);
+      if (GetArrayLengthSafe(arr) > 0) {
+        inst = GetArrayElementSafe(arr, 0);
       }
     }
   }
@@ -4462,7 +5305,7 @@ static MonoArray* FindObjectsOfTypeArray(MonoClass* klass, const char* tag) {
       return nullptr;
     }
     MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
-    if (!arr || arr->max_length == 0) {
+    if (GetArrayLengthSafe(arr) == 0) {
       return nullptr;
     }
     return arr;
@@ -4666,36 +5509,270 @@ static bool WriteFieldNumber(MonoObject* obj, MonoClassField* field, int value) 
 
 static bool TryInvokeNoArgs(MonoMethod* method, MonoObject* target) {
   if (!method || !target || !g_mono.mono_runtime_invoke) return false;
+#ifdef _MSC_VER
+  MonoObject* ret = nullptr;
   MonoObject* exc = nullptr;
-  g_mono.mono_runtime_invoke(method, target, nullptr, &exc);
+  if (!SafeInvokeSehThunk(method, target, nullptr, &ret, &exc)) {
+    AppendLogOnce("TryInvokeNoArgs_seh", "TryInvokeNoArgs: mono_runtime_invoke triggered SEH");
+    return false;
+  }
   return exc == nullptr;
+#else
+  try {
+    MonoObject* exc = nullptr;
+    g_mono.mono_runtime_invoke(method, target, nullptr, &exc);
+    return exc == nullptr;
+  }
+  catch (...) {
+    return false;
+  }
+#endif
 }
 
 static bool TryInvokeOneNumberArg(MonoMethod* method, MonoObject* target, int v) {
   if (!method || !target || !g_mono.mono_runtime_invoke) return false;
-  MonoObject* exc = nullptr;
   void* args[1] = { &v };
-  g_mono.mono_runtime_invoke(method, target, args, &exc);
+#ifdef _MSC_VER
+  MonoObject* ret = nullptr;
+  MonoObject* exc = nullptr;
+  if (!SafeInvokeSehThunk(method, target, args, &ret, &exc)) {
+    AppendLogOnce("TryInvokeOneNumberArg_seh", "TryInvokeOneNumberArg: mono_runtime_invoke triggered SEH");
+    return false;
+  }
   if (!exc) return true;
   float fv = static_cast<float>(v);
+  ret = nullptr;
   exc = nullptr;
   args[0] = &fv;
-  g_mono.mono_runtime_invoke(method, target, args, &exc);
+  if (!SafeInvokeSehThunk(method, target, args, &ret, &exc)) {
+    return false;
+  }
   return exc == nullptr;
+#else
+  try {
+    MonoObject* exc = nullptr;
+    g_mono.mono_runtime_invoke(method, target, args, &exc);
+    if (!exc) return true;
+    float fv = static_cast<float>(v);
+    exc = nullptr;
+    args[0] = &fv;
+    g_mono.mono_runtime_invoke(method, target, args, &exc);
+    return exc == nullptr;
+  } catch (...) {
+    return false;
+  }
+#endif
 }
 
 static bool TryInvokeTwoNumberArgs(MonoMethod* method, MonoObject* target, int a, int b) {
   if (!method || !target || !g_mono.mono_runtime_invoke) return false;
-  MonoObject* exc = nullptr;
   void* args_i[2] = { &a, &b };
-  g_mono.mono_runtime_invoke(method, target, args_i, &exc);
+#ifdef _MSC_VER
+  MonoObject* ret = nullptr;
+  MonoObject* exc = nullptr;
+  if (!SafeInvokeSehThunk(method, target, args_i, &ret, &exc)) {
+    AppendLogOnce("TryInvokeTwoNumberArgs_seh", "TryInvokeTwoNumberArgs: mono_runtime_invoke triggered SEH");
+    return false;
+  }
   if (!exc) return true;
   float fa = static_cast<float>(a);
   float fb = static_cast<float>(b);
+  ret = nullptr;
   exc = nullptr;
   void* args_f[2] = { &fa, &fb };
-  g_mono.mono_runtime_invoke(method, target, args_f, &exc);
+  if (!SafeInvokeSehThunk(method, target, args_f, &ret, &exc)) {
+    return false;
+  }
   return exc == nullptr;
+#else
+  try {
+    MonoObject* exc = nullptr;
+    g_mono.mono_runtime_invoke(method, target, args_i, &exc);
+    if (!exc) return true;
+    float fa = static_cast<float>(a);
+    float fb = static_cast<float>(b);
+    exc = nullptr;
+    void* args_f[2] = { &fa, &fb };
+    g_mono.mono_runtime_invoke(method, target, args_f, &exc);
+    return exc == nullptr;
+  } catch (...) {
+    return false;
+  }
+#endif
+}
+
+static bool TryInvokeOneBoolArg(MonoMethod* method, MonoObject* target, bool value) {
+  if (!method || !target || !g_mono.mono_runtime_invoke) return false;
+  bool arg = value;
+  void* args[1] = { &arg };
+#ifdef _MSC_VER
+  MonoObject* ret = nullptr;
+  MonoObject* exc = nullptr;
+  if (!SafeInvokeSehThunk(method, target, args, &ret, &exc)) {
+    AppendLogOnce("TryInvokeOneBoolArg_seh", "TryInvokeOneBoolArg: mono_runtime_invoke triggered SEH");
+    return false;
+  }
+  return exc == nullptr;
+#else
+  try {
+    MonoObject* exc = nullptr;
+    g_mono.mono_runtime_invoke(method, target, args, &exc);
+    return exc == nullptr;
+  } catch (...) {
+    return false;
+  }
+#endif
+}
+
+static bool TryInvokeBoolGetter(MonoMethod* method, MonoObject* target, bool& out_value) {
+  out_value = false;
+  if (!method || !target || !g_mono.mono_object_unbox) {
+    return false;
+  }
+  MonoObject* boxed = SafeInvoke(method, target, nullptr, "BoolGetter");
+  if (!boxed) {
+    return false;
+  }
+#ifdef _MSC_VER
+  return UnboxBoolSafeSeh(boxed, out_value);
+#else
+  void* raw = g_mono.mono_object_unbox(boxed);
+  if (!raw) return false;
+  out_value = (*static_cast<uint8_t*>(raw) != 0);
+  return true;
+#endif
+}
+
+namespace {
+static void ResetThirdPersonVisualState() {
+  g_third_person_bound_mesh_parent = nullptr;
+  g_third_person_bound_animator = nullptr;
+  g_third_person_original_mesh_parent_active = false;
+  g_third_person_original_mesh_parent_cached = false;
+  g_third_person_original_animator_enabled = false;
+  g_third_person_original_animator_cached = false;
+  g_third_person_visuals_applied = false;
+}
+}  // namespace
+
+static bool ApplyThirdPersonLocalVisualsInternal(bool enabled) {
+  if (!g_player_avatar_visuals_field || !g_player_avatar_visuals_mesh_parent_field ||
+      !g_game_object_set_active || !g_mono.mono_field_get_value) {
+    return false;
+  }
+
+  LocalPlayerInfo local_info{};
+  if (!MonoGetLocalPlayer(local_info) || !local_info.object) {
+    return false;
+  }
+  MonoObject* local_player = static_cast<MonoObject*>(local_info.object);
+  if (IsUnityNull(local_player)) {
+    return false;
+  }
+
+  MonoObject* visuals = nullptr;
+#ifdef _MSC_VER
+  if (!FieldGetObjectSafeSeh(local_player, g_player_avatar_visuals_field, visuals)) {
+    return false;
+  }
+#else
+  g_mono.mono_field_get_value(local_player, g_player_avatar_visuals_field, &visuals);
+#endif
+  if (!visuals || IsUnityNull(visuals)) {
+    return false;
+  }
+
+  MonoObject* mesh_parent = nullptr;
+#ifdef _MSC_VER
+  if (!FieldGetObjectSafeSeh(visuals, g_player_avatar_visuals_mesh_parent_field, mesh_parent)) {
+    return false;
+  }
+#else
+  g_mono.mono_field_get_value(visuals, g_player_avatar_visuals_mesh_parent_field, &mesh_parent);
+#endif
+  if (!mesh_parent || IsUnityNull(mesh_parent)) {
+    return false;
+  }
+
+  MonoObject* animator = nullptr;
+  if (g_player_avatar_visuals_animator_field) {
+#ifdef _MSC_VER
+    if (!FieldGetObjectSafeSeh(visuals, g_player_avatar_visuals_animator_field, animator)) {
+      animator = nullptr;
+    }
+#else
+    g_mono.mono_field_get_value(visuals, g_player_avatar_visuals_animator_field, &animator);
+#endif
+    if (animator && IsUnityNull(animator)) {
+      animator = nullptr;
+    }
+  }
+
+  const bool visuals_changed =
+    (mesh_parent != g_third_person_bound_mesh_parent) ||
+    (animator != g_third_person_bound_animator);
+  if (visuals_changed) {
+    g_third_person_bound_mesh_parent = mesh_parent;
+    g_third_person_bound_animator = animator;
+    g_third_person_original_mesh_parent_cached = false;
+    g_third_person_original_animator_cached = false;
+    g_third_person_visuals_applied = false;
+  }
+
+  if (!g_third_person_original_mesh_parent_cached) {
+    bool active_self = false;
+    if (g_game_object_get_active_self &&
+        TryInvokeBoolGetter(g_game_object_get_active_self, mesh_parent, active_self)) {
+      g_third_person_original_mesh_parent_active = active_self;
+    }
+    else {
+      g_third_person_original_mesh_parent_active = false;
+    }
+    g_third_person_original_mesh_parent_cached = true;
+  }
+
+  if (!g_third_person_original_animator_cached) {
+    bool anim_enabled = false;
+    if (animator && g_behaviour_get_enabled &&
+        TryInvokeBoolGetter(g_behaviour_get_enabled, animator, anim_enabled)) {
+      g_third_person_original_animator_enabled = anim_enabled;
+    }
+    else {
+      g_third_person_original_animator_enabled = false;
+    }
+    g_third_person_original_animator_cached = true;
+  }
+
+  if (!enabled) {
+    if (!g_third_person_visuals_applied) {
+      return true;
+    }
+    const bool restore_mesh =
+      g_third_person_original_mesh_parent_cached ? g_third_person_original_mesh_parent_active : false;
+    TryInvokeOneBoolArg(g_game_object_set_active, mesh_parent, restore_mesh);
+    if (animator && g_behaviour_set_enabled) {
+      const bool restore_anim =
+        g_third_person_original_animator_cached ? g_third_person_original_animator_enabled : false;
+      TryInvokeOneBoolArg(g_behaviour_set_enabled, animator, restore_anim);
+    }
+    g_third_person_visuals_applied = false;
+    AppendLog("MonoSetThirdPerson: restored local model visibility");
+    return true;
+  }
+
+  if (g_third_person_visuals_applied && !visuals_changed) {
+    return true;
+  }
+
+  const bool mesh_ok = TryInvokeOneBoolArg(g_game_object_set_active, mesh_parent, true);
+  bool animator_ok = true;
+  if (animator && g_behaviour_set_enabled) {
+    animator_ok = TryInvokeOneBoolArg(g_behaviour_set_enabled, animator, true);
+  }
+  if (mesh_ok) {
+    g_third_person_visuals_applied = true;
+  }
+  return mesh_ok && animator_ok;
 }
 
 namespace {
@@ -4719,16 +5796,16 @@ static int SyncExtractionPointsHaul(int current, int goal) {
     return 0;
   }
   MonoArray* arr = FindObjectsOfTypeArray(g_extraction_point_class, "ExtractionPoint");
-  if (!arr || arr->max_length == 0) {
+  int len = GetArrayLengthSafe(arr);
+  if (len <= 0) {
     return 0;
   }
   int run_currency_before = 0;
   const bool has_run_currency_before = ComputeRunCurrencyBeforeForTarget(current, run_currency_before);
   int written = 0;
   int method_hits = 0;
-  size_t len = arr->max_length;
-  for (size_t i = 0; i < len; ++i) {
-    MonoObject* ep = static_cast<MonoObject*>(arr->vector[i]);
+  for (int i = 0; i < len; ++i) {
+    MonoObject* ep = GetArrayElementSafe(arr, i);
     if (!ep) continue;
     WriteFieldNumber(ep, g_extraction_point_haul_current_field, current);
     if (goal >= 0 && g_extraction_point_haul_goal_field) {
@@ -4782,8 +5859,22 @@ static int ReadListCount(MonoObject* list_obj) {
   MonoObject* exc = nullptr;
   MonoObject* count_obj = g_mono.mono_runtime_invoke(get_count, list_obj, nullptr, &exc);
   if (exc || !count_obj) return 0;
-  int count = *static_cast<int*>(g_mono.mono_object_unbox(count_obj));
+#ifdef _MSC_VER
+  __try {
+    void* raw = g_mono.mono_object_unbox(count_obj);
+    if (!raw) return 0;
+    int count = *static_cast<int*>(raw);
+    return count > 0 ? count : 0;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+#else
+  void* raw = g_mono.mono_object_unbox(count_obj);
+  if (!raw) return 0;
+  int count = *static_cast<int*>(raw);
   return count > 0 ? count : 0;
+#endif
 }
 
 static bool ReadBoxedNumberGuess(MonoObject* boxed, double& out_v, bool& out_is_float) {
@@ -4982,6 +6073,9 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
   if (!g_round_director_class) return false;
   MonoObject* rd = GetRoundDirectorInstance();
   if (!rd) return false;
+  const bool explicit_current = (current >= 0);
+  const bool explicit_goal = (goal >= 0);
+  const bool explicit_current_max = (current_max >= 0);
 
   auto read_int = [&](MonoClassField* f, int& dst) {
     return ReadFieldNumber(rd, f, dst);
@@ -5017,17 +6111,23 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
 
   if (cur >= 0 && g_round_total_haul_field) {
     int total = cur;
-    int prev_total = 0;
-    if (read_int(g_round_total_haul_field, prev_total) && prev_total > total) {
-      total = prev_total;
+    // If caller provides an explicit target, allow lowering values (e.g. reset to 0).
+    // Keep legacy "no decrease" behavior only for inferred values.
+    if (!explicit_current) {
+      int prev_total = 0;
+      if (read_int(g_round_total_haul_field, prev_total) && prev_total > total) {
+        total = prev_total;
+      }
     }
     write_int(g_round_total_haul_field, total);
   }
   if (haul_goal >= 0 && g_round_haul_goal_max_field) {
     int goal_max = haul_goal;
-    int prev_goal_max = 0;
-    if (read_int(g_round_haul_goal_max_field, prev_goal_max) && prev_goal_max > goal_max) {
-      goal_max = prev_goal_max;
+    if (!explicit_goal) {
+      int prev_goal_max = 0;
+      if (read_int(g_round_haul_goal_max_field, prev_goal_max) && prev_goal_max > goal_max) {
+        goal_max = prev_goal_max;
+      }
     }
     write_int(g_round_haul_goal_max_field, goal_max);
   }
@@ -5065,7 +6165,8 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
       AppendLog(lss.str());
     }
   }
-  if (cur >= 0 && haul_goal > 0 && cur >= haul_goal) {
+  const bool mark_completed = (cur >= 0 && haul_goal > 0 && cur >= haul_goal);
+  if (mark_completed) {
     int extraction_points = 0;
     if (!read_int(g_round_extraction_points_field, extraction_points) || extraction_points <= 0) {
       extraction_points = 2;
@@ -5075,6 +6176,14 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
     }
     if (g_round_all_extraction_points_completed_field) {
       write_int(g_round_all_extraction_points_completed_field, 1);
+    }
+  } else if (explicit_current || explicit_goal || explicit_current_max) {
+    // Explicit edits that do not satisfy completion should clear stale completion flags.
+    if (g_round_extraction_points_completed_field) {
+      write_int(g_round_extraction_points_completed_field, 0);
+    }
+    if (g_round_all_extraction_points_completed_field) {
+      write_int(g_round_all_extraction_points_completed_field, 0);
     }
   }
 
@@ -5672,8 +6781,8 @@ bool MonoSetGrabStrengthField(float strength) {
         g_mono.mono_runtime_invoke(g_find_objects_of_type_itemvolume, nullptr, args, &exc);
       if (!exc && arr_obj) {
         MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
-        if (arr && arr->max_length > 0) {
-          grabber = static_cast<MonoObject*>(arr->vector[0]);
+        if (GetArrayLengthSafe(arr) > 0) {
+          grabber = GetArrayElementSafe(arr, 0);
         }
       }
     }
@@ -5716,8 +6825,8 @@ bool MonoSetGrabRange(float range) {
         g_mono.mono_runtime_invoke(g_find_objects_of_type_itemvolume, nullptr, args, &exc);
       if (!exc && arr_obj) {
         MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
-        if (arr && arr->max_length > 0) {
-          grabber = static_cast<MonoObject*>(arr->vector[0]);
+        if (GetArrayLengthSafe(arr) > 0) {
+          grabber = GetArrayElementSafe(arr, 0);
         }
       }
     }
@@ -5731,6 +6840,205 @@ bool MonoSetGrabRange(float range) {
   g_mono.mono_field_set_value(grabber, g_phys_grabber_range_field, &range);
   std::ostringstream oss;
   oss << "MonoSetGrabRange: grabRange=" << range;
+  AppendLog(oss.str());
+  return true;
+}
+
+bool MonoSetThirdPerson(bool enabled, float distance, float height, float shoulder, float smooth) {
+  if (g_shutting_down) {
+    return false;
+  }
+  if (!CacheManagedRefs()) {
+    return false;
+  }
+  g_third_person_visual_target_enabled.store(enabled, std::memory_order_relaxed);
+  if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_from_present) {
+    ApplyThirdPersonLocalVisualsInternal(enabled);
+  } else if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_update_hook) {
+    static bool logged_main_thread_visuals_once = false;
+    if (!logged_main_thread_visuals_once) {
+      AppendLog("MonoSetThirdPerson: local mesh/animator toggle routed via PlayerAvatarVisuals.Update hook");
+      logged_main_thread_visuals_once = true;
+    }
+  } else if (!k_enable_third_person_local_visuals) {
+    static bool logged_visuals_disabled_once = false;
+    if (!logged_visuals_disabled_once) {
+      AppendLog("MonoSetThirdPerson: local mesh/animator toggle disabled (stability mode)");
+      logged_visuals_disabled_once = true;
+    }
+  }
+  if (!enabled && !g_third_person_applied && !g_third_person_visuals_applied) {
+    return true;
+  }
+  if (!g_camera_position_vtable || !g_camera_position_instance_field ||
+      !g_camera_position_player_offset_field) {
+    AppendLogOnce("MonoSetThirdPerson_refs_missing",
+      "MonoSetThirdPerson: CameraPosition refs unresolved");
+    return false;
+  }
+
+  MonoObject* camera_position = nullptr;
+#ifdef _MSC_VER
+  if (!FieldStaticGetObjectSafeSeh(
+        g_camera_position_vtable, g_camera_position_instance_field, camera_position)) {
+    AppendLogOnce("MonoSetThirdPerson_instance_fault",
+      "MonoSetThirdPerson: CameraPosition::instance read triggered SEH");
+    return false;
+  }
+#else
+  g_mono.mono_field_static_get_value(
+    g_camera_position_vtable, g_camera_position_instance_field, &camera_position);
+#endif
+
+  if (!camera_position || IsUnityNull(camera_position)) {
+    const uint64_t now_ms = GetTickCount64();
+    if (now_ms - g_third_person_last_missing_log_ms > 2000) {
+      AppendLog("MonoSetThirdPerson: CameraPosition::instance unavailable");
+      g_third_person_last_missing_log_ms = now_ms;
+    }
+    g_third_person_bound_camera_position = nullptr;
+    g_third_person_original_cached = false;
+    g_third_person_applied = false;
+    return false;
+  }
+
+  const bool instance_changed = (camera_position != g_third_person_bound_camera_position);
+  if (instance_changed) {
+    g_third_person_bound_camera_position = camera_position;
+    g_third_person_original_cached = false;
+    g_third_person_applied = false;
+  }
+
+  if (!g_third_person_original_cached) {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    bool read_vec_ok = true;
+#ifdef _MSC_VER
+    read_vec_ok = FieldGetVector3SafeSeh(
+      camera_position, g_camera_position_player_offset_field, x, y, z);
+#else
+    float raw[3] = {};
+    g_mono.mono_field_get_value(camera_position, g_camera_position_player_offset_field, raw);
+    x = raw[0];
+    y = raw[1];
+    z = raw[2];
+#endif
+    if (!read_vec_ok) {
+      AppendLogOnce("MonoSetThirdPerson_offset_read_fault",
+        "MonoSetThirdPerson: CameraPosition::playerOffset read failed");
+      return false;
+    }
+    g_third_person_original_offset[0] = x;
+    g_third_person_original_offset[1] = y;
+    g_third_person_original_offset[2] = z;
+    if (g_camera_position_position_smooth_field) {
+#ifdef _MSC_VER
+      float smooth_read = g_third_person_original_smooth;
+      if (FieldGetFloatSafeSeh(
+            camera_position, g_camera_position_position_smooth_field, smooth_read)) {
+        g_third_person_original_smooth = smooth_read;
+      } else {
+        AppendLogOnce("MonoSetThirdPerson_smooth_read_fault",
+          "MonoSetThirdPerson: CameraPosition::positionSmooth read failed");
+      }
+#else
+      g_mono.mono_field_get_value(
+        camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
+#endif
+    }
+    g_third_person_original_cached = true;
+  }
+
+  if (!enabled) {
+    if (g_third_person_applied && g_third_person_original_cached) {
+#ifdef _MSC_VER
+      if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
+                                  g_third_person_original_offset[0],
+                                  g_third_person_original_offset[1],
+                                  g_third_person_original_offset[2])) {
+        AppendLogOnce("MonoSetThirdPerson_restore_offset_fault",
+          "MonoSetThirdPerson: restore playerOffset write failed");
+      }
+      if (g_camera_position_position_smooth_field &&
+          !FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
+                                g_third_person_original_smooth)) {
+        AppendLogOnce("MonoSetThirdPerson_restore_smooth_fault",
+          "MonoSetThirdPerson: restore positionSmooth write failed");
+      }
+#else
+      g_mono.mono_field_set_value(
+        camera_position, g_camera_position_player_offset_field, g_third_person_original_offset);
+      if (g_camera_position_position_smooth_field) {
+        g_mono.mono_field_set_value(
+          camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
+      }
+#endif
+      g_third_person_applied = false;
+      AppendLog("MonoSetThirdPerson: restored first-person camera offset");
+    }
+    return true;
+  }
+
+  const float clamped_distance = std::clamp(distance, 0.5f, 8.0f);
+  const float clamped_height = std::clamp(height, -0.5f, 3.0f);
+  const float clamped_shoulder = std::clamp(shoulder, -2.0f, 2.0f);
+  const float safe_smooth = std::isfinite(smooth) ? smooth : 2.0f;
+  const float clamped_smooth = std::clamp(safe_smooth, 0.2f, 15.0f);
+  float target_offset[3] = {
+    g_third_person_original_offset[0] + clamped_shoulder,
+    g_third_person_original_offset[1] + clamped_height,
+    g_third_person_original_offset[2] - clamped_distance,
+  };
+  const bool changed = !g_third_person_applied || instance_changed ||
+    std::fabs(target_offset[0] - g_third_person_last_offset[0]) > 0.001f ||
+    std::fabs(target_offset[1] - g_third_person_last_offset[1]) > 0.001f ||
+    std::fabs(target_offset[2] - g_third_person_last_offset[2]) > 0.001f ||
+    std::fabs(clamped_smooth - g_third_person_last_smooth) > 0.001f;
+  if (!changed) {
+    return true;
+  }
+
+#ifdef _MSC_VER
+  if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
+                              target_offset[0], target_offset[1], target_offset[2])) {
+    AppendLogOnce("MonoSetThirdPerson_apply_offset_fault",
+      "MonoSetThirdPerson: apply playerOffset write failed");
+    return false;
+  }
+  if (g_camera_position_position_smooth_field) {
+    if (!FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
+                              clamped_smooth)) {
+      AppendLogOnce("MonoSetThirdPerson_apply_smooth_fault",
+        "MonoSetThirdPerson: apply positionSmooth write failed");
+      return false;
+    }
+  }
+#else
+  g_mono.mono_field_set_value(camera_position, g_camera_position_player_offset_field, target_offset);
+  if (g_camera_position_position_smooth_field) {
+    float smooth_value = clamped_smooth;
+    g_mono.mono_field_set_value(
+      camera_position, g_camera_position_position_smooth_field, &smooth_value);
+  }
+#endif
+  g_third_person_last_offset[0] = target_offset[0];
+  g_third_person_last_offset[1] = target_offset[1];
+  g_third_person_last_offset[2] = target_offset[2];
+  g_third_person_last_smooth = clamped_smooth;
+  g_third_person_applied = true;
+
+  std::ostringstream oss;
+  oss << "MonoSetThirdPerson: enabled dist=" << clamped_distance
+      << " height=" << clamped_height
+      << " shoulder=" << clamped_shoulder
+      << " smooth=" << clamped_smooth
+      << " base=(" << g_third_person_original_offset[0] << ","
+      << g_third_person_original_offset[1] << ","
+      << g_third_person_original_offset[2] << ")"
+      << " target=(" << target_offset[0] << ","
+      << target_offset[1] << ","
+      << target_offset[2] << ")";
   AppendLog(oss.str());
   return true;
 }
@@ -5824,10 +7132,12 @@ bool MonoSetCartValue(int value) {
   int haul_goal = -1;
   int haul_current = value;
   int haul_current_max = value;
+  bool allow_round_sync = false;
   RoundState rs{};
   if (MonoGetRoundState(rs) && rs.ok) {
-    if (rs.goal >= 0) {
+    if (rs.goal > 0) {
       haul_goal = rs.goal;
+      allow_round_sync = true;
     }
     if (rs.current_max > haul_current_max) {
       haul_current_max = rs.current_max;
@@ -5840,13 +7150,16 @@ bool MonoSetCartValue(int value) {
     haul_current = 0;
   }
   int haul_ep_goal = haul_goal >= 0 ? haul_goal : haul_current;
-  if (MonoSetRoundState(haul_current, haul_goal, haul_current_max)) {
-    haul_ok = true;
-  }
-  {
+  if (allow_round_sync) {
+    if (MonoSetRoundState(haul_current, haul_goal, haul_current_max)) {
+      haul_ok = true;
+    }
     if (SyncExtractionPointsHaul(haul_current, haul_ep_goal) > 0) {
       haul_ok = true;
     }
+  } else {
+    AppendLogOnce("MonoSetCartValue_skip_round_sync_invalid_goal",
+      "MonoSetCartValue: skip RoundDirector sync because haul goal is invalid (<=0)");
   }
   {
     std::ostringstream oss;
@@ -5891,11 +7204,12 @@ bool MonoSetCartValue(int value) {
       else if (arr_obj) {
         MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
         if (arr) {
+          const int arr_len = GetArrayLengthSafe(arr);
           std::ostringstream oss;
-          oss << "MonoSetCartValue: FindObjectsOfType length=" << arr->max_length;
+          oss << "MonoSetCartValue: FindObjectsOfType length=" << arr_len;
           AppendLogOnce("MonoSetCartValue_findobj", oss.str());
-          if (arr->max_length > 0) {
-            cart = static_cast<MonoObject*>(arr->vector[0]);
+          if (arr_len > 0) {
+            cart = GetArrayElementSafe(arr, 0);
           }
         }
       }
@@ -5930,11 +7244,12 @@ bool MonoSetCartValue(int value) {
       else if (arr_obj) {
         MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
         if (arr) {
+          const int arr_len = GetArrayLengthSafe(arr);
           std::ostringstream oss;
-          oss << "MonoSetCartValue: FindObjectsOfType(includeInactive) length=" << arr->max_length;
+          oss << "MonoSetCartValue: FindObjectsOfType(includeInactive) length=" << arr_len;
           AppendLogOnce("MonoSetCartValue_findobj_inactive", oss.str());
-          if (arr->max_length > 0) {
-            cart = static_cast<MonoObject*>(arr->vector[0]);
+          if (arr_len > 0) {
+            cart = GetArrayElementSafe(arr, 0);
           }
         }
       }
@@ -5964,11 +7279,12 @@ bool MonoSetCartValue(int value) {
       else if (arr_obj) {
         MonoArray* arr = reinterpret_cast<MonoArray*>(arr_obj);
         if (arr) {
+          const int arr_len = GetArrayLengthSafe(arr);
           std::ostringstream oss;
-          oss << "MonoSetCartValue: Resources.FindObjectsOfTypeAll length=" << arr->max_length;
+          oss << "MonoSetCartValue: Resources.FindObjectsOfTypeAll length=" << arr_len;
           AppendLogOnce("MonoSetCartValue_findobj_all", oss.str());
-          if (arr->max_length > 0) {
-            cart = static_cast<MonoObject*>(arr->vector[0]);
+          if (arr_len > 0) {
+            cart = GetArrayElementSafe(arr, 0);
           }
         }
       }
@@ -6054,7 +7370,7 @@ bool MonoSetCartValue(int value) {
         return nullptr;
       }
 
-      int len = static_cast<int>(arr->max_length);
+      int len = GetArrayLengthSafe(arr);
       {
         std::ostringstream oss;
         oss << "MonoSetCartValue: GameObject traversal length=" << len;
@@ -6073,9 +7389,9 @@ bool MonoSetCartValue(int value) {
         return nullptr;
       }
 
-      size_t limit = arr ? arr->max_length : 0;
-      for (size_t i = 0; i < limit; ++i) {
-        MonoObject* go = static_cast<MonoObject*>(arr->vector[i]);
+      int limit = GetArrayLengthSafe(arr);
+      for (int i = 0; i < limit; ++i) {
+        MonoObject* go = GetArrayElementSafe(arr, i);
         if (!go) continue;
         void* args[1] = { cart_type_obj };
         MonoObject* exc = nullptr;
@@ -6123,7 +7439,7 @@ bool MonoSetCartValue(int value) {
       }
       else {
         items = reinterpret_cast<MonoArray*>(list_obj);
-        list_size = items ? static_cast<int>(items->max_length) : 0;
+        list_size = GetArrayLengthSafe(items);
       }
       };
 
@@ -6158,19 +7474,20 @@ bool MonoSetCartValue(int value) {
       if (items) {
         std::ostringstream oss;
         oss << "MonoSetCartValue: ItemManager list size=" << list_size
-          << " max_length=" << items->max_length;
+          << " max_length=" << GetArrayLengthSafe(items);
         AppendLog(oss.str());
       }
       else {
         AppendLog("MonoSetCartValue: ItemManager items null");
       }
 
-      size_t limit =
-        items ? (items->max_length < static_cast<size_t>(list_size) ? items->max_length
-          : static_cast<size_t>(list_size))
-        : 0;
-      for (size_t i = 0; i < limit; ++i) {
-        MonoObject* candidate = static_cast<MonoObject*>(items->vector[i]);
+      int limit = 0;
+      if (items) {
+        const int items_len = GetArrayLengthSafe(items);
+        limit = items_len < list_size ? items_len : list_size;
+      }
+      for (int i = 0; i < limit; ++i) {
+        MonoObject* candidate = GetArrayElementSafe(items, i);
         if (!candidate) continue;
         if (g_mono.mono_object_get_class(candidate) == g_phys_grab_cart_class) {
           cart = candidate;
@@ -6229,12 +7546,12 @@ bool MonoSetCartValue(int value) {
         arr = try_invoke(g_find_objects_of_type_itemvolume, args, "FindObjectsOfType(ExtractionPoint)");
       }
 
-      int len = arr ? static_cast<int>(arr->max_length) : 0;
+      int len = GetArrayLengthSafe(arr);
       std::ostringstream oss;
       oss << "MonoSetCartValue: ExtractionPoint search length=" << len;
       AppendLogOnce("MonoSetCartValue_ep_len", oss.str());
       if (arr && len > 0) {
-        return static_cast<MonoObject*>(arr->vector[0]);
+        return GetArrayElementSafe(arr, 0);
       }
       return nullptr;
       };
@@ -6319,9 +7636,8 @@ int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObje
   MonoMethod* get_enum = cached_get_enum;
   if (!get_enum) return 0;
 
-  MonoObject* exc_enum = nullptr;
-  MonoObject* enumerator = g_mono.mono_runtime_invoke(get_enum, list_obj, nullptr, &exc_enum);
-  if (exc_enum || !enumerator) return 0;
+  MonoObject* enumerator = SafeInvoke(get_enum, list_obj, nullptr, "List.GetEnumerator");
+  if (!enumerator) return 0;
   MonoClass* enum_class = g_mono.mono_object_get_class(enumerator);
   if (!enum_class) return 0;
 
@@ -6339,18 +7655,23 @@ int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObje
 
   int count = 0;
   while (true) {
-    MonoObject* exc_move = nullptr;
-    MonoObject* move_obj =
-      g_mono.mono_runtime_invoke(move_next, enumerator, nullptr, &exc_move);
-    if (exc_move || !move_obj) break;
+    MonoObject* move_obj = SafeInvoke(move_next, enumerator, nullptr, "Enumerator.MoveNext");
+    if (!move_obj) break;
     bool has_next = false;
     if (g_mono.mono_object_unbox) {
-      has_next = *static_cast<bool*>(g_mono.mono_object_unbox(move_obj));
+#ifdef _MSC_VER
+      if (!UnboxBoolSafeSeh(move_obj, has_next)) {
+        break;
+      }
+#else
+      void* raw = g_mono.mono_object_unbox(move_obj);
+      if (!raw) break;
+      has_next = (*static_cast<uint8_t*>(raw) != 0);
+#endif
     }
     if (!has_next) break;
-    MonoObject* exc_cur = nullptr;
-    MonoObject* cur = g_mono.mono_runtime_invoke(get_current, enumerator, nullptr, &exc_cur);
-    if (exc_cur || !cur) continue;
+    MonoObject* cur = SafeInvoke(get_current, enumerator, nullptr, "Enumerator.get_Current");
+    if (!cur) continue;
     if (on_elem(cur)) {
       ++count;
     }
@@ -6464,10 +7785,11 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
       g_mono.mono_field_get_value(list_obj, size_field, &list_size);
     }
 
-    if (items && list_size > 0 && items->max_length > 0) {
-      const int lim = std::min(list_size, static_cast<int>(items->max_length));
+    const int items_len = GetArrayLengthSafe(items);
+    if (items && list_size > 0 && items_len > 0) {
+      const int lim = std::min(list_size, items_len);
       for (int i = 0; i < lim; ++i) {
-        if (add_player(static_cast<MonoObject*>(items->vector[i]))) {
+        if (add_player(GetArrayElementSafe(items, i))) {
           ++added_from_list;
         }
       }
@@ -6505,11 +7827,12 @@ bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
   // Strong fallback: scan all PlayerAvatar objects in scene.
   if (need_scene_scan && g_player_avatar_class) {
     MonoArray* arr = FindObjectsOfTypeArray(g_player_avatar_class, "PlayerAvatar");
-    if (arr && arr->max_length > 0) {
-      int lim = static_cast<int>(arr->max_length);
+    int arr_len = GetArrayLengthSafe(arr);
+    if (arr_len > 0) {
+      int lim = arr_len;
       if (lim > 128) lim = 128;
       for (int i = 0; i < lim; ++i) {
-        if (add_player(static_cast<MonoObject*>(arr->vector[i]))) {
+        if (add_player(GetArrayElementSafe(arr, i))) {
           ++added_from_scan;
         }
       }
@@ -6558,10 +7881,22 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     if (g_shutting_down) return false;
     static uint64_t last_items_empty_ms = 0;
     uint64_t now_ms = GetTickCount64();
-// Non-ASCII comment normalized.
-    if (g_items_disabled && now_ms - g_items_last_crash_ms.load(std::memory_order_relaxed) > 3000) {
+    const uint32_t safeinvoke_seh_start = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
+
+    if (g_items_disabled) {
+      const int crash_count = g_items_crash_count.load(std::memory_order_relaxed);
+      const uint64_t retry_after = g_items_retry_after_ms.load(std::memory_order_relaxed);
+      if (crash_count >= 3) {
+        return false;
+      }
+      if (now_ms < retry_after) {
+        return false;
+      }
       g_items_disabled = false;
+      AppendLogOnce("MonoListItems_retry_enabled",
+        "MonoListItems: retry window reached, re-enabling item scan");
     }
+
     if (!g_items_ready.load(std::memory_order_relaxed) && now_ms - last_items_empty_ms < 1500) {
       return false;  // Non-ASCII comment normalized.
     }
@@ -6570,8 +7905,31 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       AppendLog("MonoListItems: CacheManagedRefs failed");
       return false;
     }
+    SessionRuntimeGate gate{};
+    if (!MonoGetSessionRuntimeGate(gate) || !gate.ok ||
+        (gate.allow_mask & kSessionAllowScanItems) == 0) {
+      static uint64_t s_last_gate_log_ms = 0;
+      if (now_ms - s_last_gate_log_ms > 2000) {
+        std::ostringstream oss;
+        oss << "MonoListItems: skip by runtime gate, reason="
+            << (gate.reason.empty() ? "unknown" : gate.reason);
+        AppendLog(oss.str());
+        s_last_gate_log_ms = now_ms;
+      }
+      return false;
+    }
     if (!g_component_get_transform) {
       AppendLog("MonoListItems: Component::get_transform unresolved");
+      return false;
+    }
+    RoundState round_state{};
+    if (!MonoGetRoundState(round_state) || !round_state.ok) {
+      AppendLogOnce("MonoListItems_skip_noround", "MonoListItems: RoundDirector not ready; skip scan");
+      return false;
+    }
+    PlayerState local_player_state{};
+    if (!MonoGetLocalPlayerState(local_player_state) || !local_player_state.has_position) {
+      AppendLogOnce("MonoListItems_skip_nolocal", "MonoListItems: local player position unavailable; skip scan");
       return false;
     }
 
@@ -6585,10 +7943,9 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       MonoObject* type_obj = g_mono.mono_type_get_object(dom, g_light_fade_type);
       if (!type_obj) return;
       void* args[1] = { type_obj };
-      MonoObject* exc = nullptr;
-      MonoObject* comp =
-        g_mono.mono_runtime_invoke(g_game_object_get_component, go_obj, args, &exc);
-      if (exc || !comp) return;
+      MonoObject* comp = SafeInvoke(g_game_object_get_component, go_obj, args,
+                                    "GameObject.GetComponent(LightInteractableFadeRemove)");
+      if (!comp) return;
 
       if (g_light_fade_is_fading_field) {
         bool f = false;
@@ -6662,26 +8019,34 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
     auto populate_meta = [&](MonoObject* item_obj, PlayerState& st) {
       if (!item_obj) return;
-      MonoObject* exc_go = nullptr;
       MonoObject* go_obj = g_component_get_game_object
-        ? g_mono.mono_runtime_invoke(g_component_get_game_object, item_obj, nullptr, &exc_go)
+        ? SafeInvoke(g_component_get_game_object, item_obj, nullptr, "Component.get_gameObject")
         : nullptr;
-      if (!exc_go && go_obj && !IsUnityNull(go_obj)) {
+      if (go_obj && !IsUnityNull(go_obj)) {
         DisableFadeOnObject(go_obj);
         if (g_game_object_get_layer) {
-          MonoObject* exc_layer = nullptr;
-          MonoObject* layer_obj =
-            g_mono.mono_runtime_invoke(g_game_object_get_layer, go_obj, nullptr, &exc_layer);
-          if (!exc_layer && layer_obj && g_mono.mono_object_unbox) {
-            st.layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
-            st.has_layer = true;
+          MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, go_obj, nullptr,
+                                             "GameObject.get_layer");
+          if (layer_obj && g_mono.mono_object_unbox) {
+#ifdef _MSC_VER
+            int layer = 0;
+            if (UnboxInt32SafeSeh(layer_obj, layer)) {
+              st.layer = layer;
+              st.has_layer = true;
+            }
+#else
+            void* raw = g_mono.mono_object_unbox(layer_obj);
+            if (raw) {
+              st.layer = *static_cast<int*>(raw);
+              st.has_layer = true;
+            }
+#endif
           }
         }
         if (g_unity_object_get_name) {
-          MonoObject* exc_name = nullptr;
-          MonoObject* name_obj =
-            g_mono.mono_runtime_invoke(g_unity_object_get_name, go_obj, nullptr, &exc_name);
-          if (!exc_name && name_obj) {
+          MonoObject* name_obj = SafeInvoke(g_unity_object_get_name, go_obj, nullptr,
+                                            "UnityObject.get_name");
+          if (name_obj) {
             st.name = MonoStringToUtf8(name_obj);
             st.has_name = !st.name.empty();
           }
@@ -6755,12 +8120,9 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
 
       float center[3] = { 0.0f, 0.0f, 0.0f };
-      PlayerState local_state{};
-      if (MonoGetLocalPlayerState(local_state) && local_state.has_position) {
-        center[0] = local_state.x;
-        center[1] = local_state.y;
-        center[2] = local_state.z;
-      }
+      center[0] = local_player_state.x;
+      center[1] = local_player_state.y;
+      center[2] = local_player_state.z;
 
       float radius = 500.0f;
       int query = 2;  // QueryTriggerInteraction.Collide
@@ -6771,11 +8133,20 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         MonoObject* layer_name = g_mono.mono_string_new(dom, "Interactable");
         if (layer_name) {
           void* layer_args[1] = { layer_name };
-          MonoObject* exc_layer = nullptr;
-          MonoObject* layer_obj =
-            g_mono.mono_runtime_invoke(g_layer_mask_name_to_layer, nullptr, layer_args, &exc_layer);
-          if (!exc_layer && layer_obj && g_mono.mono_object_unbox) {
-            named_layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
+          MonoObject* layer_obj = SafeInvoke(g_layer_mask_name_to_layer, nullptr, layer_args,
+                                             "LayerMask.NameToLayer");
+          if (layer_obj && g_mono.mono_object_unbox) {
+#ifdef _MSC_VER
+            int layer = -1;
+            if (UnboxInt32SafeSeh(layer_obj, layer)) {
+              named_layer = layer;
+            }
+#else
+            void* raw = g_mono.mono_object_unbox(layer_obj);
+            if (raw) {
+              named_layer = *static_cast<int*>(raw);
+            }
+#endif
           }
         }
       }
@@ -6809,8 +8180,8 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
       auto parse_array = [&](MonoObject* obj, MonoArray*& out, int& count) {
         out = obj ? reinterpret_cast<MonoArray*>(obj) : nullptr;
-        count = out ? static_cast<int>(out->max_length) : 0;
-        return IsValidArray(out);
+        count = GetArrayLengthSafe(out);
+        return count > 0;
       };
 
       MonoArray* colliders = nullptr;
@@ -6848,7 +8219,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         AppendLog(oss.str());
         int preview = collider_count < 5 ? collider_count : 5;
         for (int i = 0; i < preview; ++i) {
-          MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
+          MonoObject* collider = GetArrayElementSafe(colliders, i);
           if (!collider || IsUnityNull(collider)) continue;
           int go_layer = -1;
           std::string go_name;
@@ -6856,7 +8227,17 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
           if (game_obj && !IsUnityNull(game_obj) && g_game_object_get_layer) {
             MonoObject* layer_obj = SafeInvoke(g_game_object_get_layer, game_obj, nullptr, "Collider.preview_get_layer");
             if (layer_obj && g_mono.mono_object_unbox) {
-              go_layer = *static_cast<int*>(g_mono.mono_object_unbox(layer_obj));
+#ifdef _MSC_VER
+              int layer = -1;
+              if (UnboxInt32SafeSeh(layer_obj, layer)) {
+                go_layer = layer;
+              }
+#else
+              void* raw = g_mono.mono_object_unbox(layer_obj);
+              if (raw) {
+                go_layer = *static_cast<int*>(raw);
+              }
+#endif
             }
           }
           if (game_obj && !IsUnityNull(game_obj) && g_unity_object_get_name) {
@@ -6878,7 +8259,7 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
       int valid = 0;
       for (int i = 0; i < limit; ++i) {
-        MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
+        MonoObject* collider = GetArrayElementSafe(colliders, i);
         if (!collider || IsUnityNull(collider)) continue;
 
         MonoObject* transform_obj = SafeInvoke(g_component_get_transform, collider, nullptr, "Collider.get_transform");
@@ -6911,6 +8292,20 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       return true;
     }
 
+    const uint32_t safeinvoke_seh_after_overlap =
+      g_safeinvoke_seh_count.load(std::memory_order_relaxed);
+    if (safeinvoke_seh_after_overlap != safeinvoke_seh_start) {
+      const uint64_t last_seh_ms =
+        g_safeinvoke_last_seh_ms.load(std::memory_order_relaxed);
+      if (last_seh_ms > 0 && now_ms >= last_seh_ms &&
+          (now_ms - last_seh_ms) <= 3000ull) {
+        AppendLogOnce("MonoListItems_overlap_seh_skip_fallback",
+          "MonoListItems: overlap path hit SEH; skip list fallback this frame for stability");
+        last_items_empty_ms = now_ms;
+        return false;
+      }
+    }
+
     MonoObject* manager = nullptr;
     if (g_item_manager_instance_field && g_item_manager_vtable) {
       g_mono.mono_field_static_get_value(
@@ -6940,13 +8335,10 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
           args1[0] = &arg_bool_false;
         }
 
-        MonoObject* exception = nullptr;
-        list_obj = g_mono.mono_runtime_invoke(
-          g_item_manager_get_all_items, manager, g_item_manager_get_all_items_argc ? args1 : nullptr,
-          &exception);
-        if (exception) {
-          AppendLog("MonoListItems: GetAllItemVolumesInScene threw exception");
-        }
+        list_obj = SafeInvoke(
+          g_item_manager_get_all_items, manager,
+          g_item_manager_get_all_items_argc ? args1 : nullptr,
+          "ItemManager.GetAllItemVolumesInScene");
 
         if (list_obj) {
           AppendLogOnce("MonoListItems_strategy2", "Got item list from GetAllItemVolumesInScene");
@@ -6961,14 +8353,10 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 // Non-ASCII comment normalized.
     auto fetch_fallback_list = [&]() -> MonoObject* {
       MonoObject* list_obj = nullptr;
-      MonoObject* exception = nullptr;
 
-      if (g_semi_func_shop_populate) {
-        MonoObject* result =
-          g_mono.mono_runtime_invoke(g_semi_func_shop_populate, nullptr, nullptr, &exception);
-        if (exception) {
-          exception = nullptr;
-        }
+      if (k_enable_aggressive_item_population && g_semi_func_shop_populate) {
+        MonoObject* result = SafeInvoke(
+          g_semi_func_shop_populate, nullptr, nullptr, "SemiFunc.ShopPopulateItemVolumes");
         if (result) {
           AppendLogOnce("MonoListItems_strategy3a", "Called SemiFunc::ShopPopulateItemVolumes");
         }
@@ -6978,12 +8366,9 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         g_mono.mono_field_get_value(manager, g_item_manager_item_volumes_field, &list_obj);
       }
 
-      if (!list_obj && g_semi_func_truck_populate) {
-        MonoObject* result =
-          g_mono.mono_runtime_invoke(g_semi_func_truck_populate, nullptr, nullptr, &exception);
-        if (exception) {
-          exception = nullptr;
-        }
+      if (!list_obj && k_enable_aggressive_item_population && g_semi_func_truck_populate) {
+        MonoObject* result = SafeInvoke(
+          g_semi_func_truck_populate, nullptr, nullptr, "SemiFunc.TruckPopulateItemVolumes");
         if (result) {
           AppendLogOnce("MonoListItems_strategy3b", "Called SemiFunc::TruckPopulateItemVolumes");
         }
@@ -7000,13 +8385,9 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
           MonoObject* type_obj = g_mono.mono_type_get_object(
             g_domain ? g_domain : g_mono.mono_get_root_domain(), iv_type);
           void* args[1] = { type_obj };
-          list_obj = g_mono.mono_runtime_invoke(
-            g_find_objects_of_type_itemvolume, nullptr, args, &exception);
-          if (exception) {
-            AppendLog("MonoListItems: FindObjectsOfType threw exception");
-            list_obj = nullptr;
-          }
-          else if (list_obj) {
+          list_obj = SafeInvoke(
+            g_find_objects_of_type_itemvolume, nullptr, args, "FindObjectsOfType<ItemVolume>");
+          if (list_obj) {
             AppendLogOnce("MonoListItems_strategy4",
               "Got item list from FindObjectsOfType<ItemVolume>()");
           }
@@ -7022,17 +8403,22 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         return;
       }
 
-      MonoClass* list_class = g_mono.mono_object_get_class(list_obj);
-      MonoClassField* items_field = g_mono.mono_class_get_field_from_name(list_class, "_items");
-      MonoClassField* size_field = g_mono.mono_class_get_field_from_name(list_class, "_size");
+      MonoClass* list_class = g_mono.mono_object_get_class ? g_mono.mono_object_get_class(list_obj) : nullptr;
+      MonoClassField* items_field =
+        (list_class && g_mono.mono_class_get_field_from_name)
+          ? g_mono.mono_class_get_field_from_name(list_class, "_items")
+          : nullptr;
+      MonoClassField* size_field =
+        (list_class && g_mono.mono_class_get_field_from_name)
+          ? g_mono.mono_class_get_field_from_name(list_class, "_size")
+          : nullptr;
 
-      if (items_field && size_field) {
+      if (items_field && size_field && g_mono.mono_field_get_value) {
         g_mono.mono_field_get_value(list_obj, items_field, &items);
         g_mono.mono_field_get_value(list_obj, size_field, &list_size);
-      }
-      else {
+      } else {
         items = reinterpret_cast<MonoArray*>(list_obj);
-        list_size = items ? static_cast<int>(items->max_length) : 0;
+        list_size = GetArrayLengthSafe(items);
       }
 
       // Guard against invalid arrays
@@ -7042,8 +8428,9 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
         return;
       }
 
-      if (list_size > static_cast<int>(items->max_length)) {
-        list_size = static_cast<int>(items->max_length);
+      const int max_len = GetArrayLengthSafe(items);
+      if (list_size <= 0 || list_size > max_len) {
+        list_size = max_len;
       }
     };
 
@@ -7054,15 +8441,13 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
     // If still empty, try to force populate once (avoid hammering every frame)
     static bool forced_populate_once = false;
-    if (!list_obj && !forced_populate_once) {
+    if (k_enable_aggressive_item_population && !list_obj && !forced_populate_once) {
       forced_populate_once = true;
       if (g_semi_func_shop_populate) {
-        MonoObject* exception = nullptr;
-        g_mono.mono_runtime_invoke(g_semi_func_shop_populate, nullptr, nullptr, &exception);
+        SafeInvoke(g_semi_func_shop_populate, nullptr, nullptr, "SemiFunc.ShopPopulateItemVolumes(force)");
       }
       if (g_semi_func_truck_populate) {
-        MonoObject* exception = nullptr;
-        g_mono.mono_runtime_invoke(g_semi_func_truck_populate, nullptr, nullptr, &exception);
+        SafeInvoke(g_semi_func_truck_populate, nullptr, nullptr, "SemiFunc.TruckPopulateItemVolumes(force)");
       }
       list_obj = fetch_verified_list();
     }
@@ -7082,28 +8467,26 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 
 // Non-ASCII comment normalized.
       static bool forced_get_all_once = false;
-      if (list_size == 0 && manager && g_item_manager_get_all_items && !forced_get_all_once) {
-      MonoObject* exc_force = nullptr;
-      g_mono.mono_runtime_invoke(g_item_manager_get_all_items, manager, nullptr, &exc_force);
-      if (exc_force) {
-        AppendLog("MonoListItems: forced GetAllItemVolumesInScene threw exception");
-      }
-      else {
+      if (k_enable_aggressive_item_population && list_size == 0 && manager &&
+          g_item_manager_get_all_items && !forced_get_all_once) {
+      MonoObject* forced = SafeInvoke(
+        g_item_manager_get_all_items, manager, nullptr, "ItemManager.GetAllItemVolumesInScene(force)");
+      if (forced) {
         AppendLogOnce("MonoListItems_force_call", "Forced GetAllItemVolumesInScene due to empty list");
+      } else {
+        AppendLog("MonoListItems: forced GetAllItemVolumesInScene returned null");
       }
       forced_get_all_once = true;
 
       if (g_semi_func_shop_populate) {
-        MonoObject* exc_pop = nullptr;
-        g_mono.mono_runtime_invoke(g_semi_func_shop_populate, nullptr, nullptr, &exc_pop);
-        if (!exc_pop) {
+        if (SafeInvoke(g_semi_func_shop_populate, nullptr, nullptr,
+                       "SemiFunc.ShopPopulateItemVolumes(force-empty)")) {
           AppendLogOnce("MonoListItems_force_shop", "Forced SemiFunc::ShopPopulateItemVolumes");
         }
       }
       if (g_semi_func_truck_populate) {
-        MonoObject* exc_pop = nullptr;
-        g_mono.mono_runtime_invoke(g_semi_func_truck_populate, nullptr, nullptr, &exc_pop);
-        if (!exc_pop) {
+        if (SafeInvoke(g_semi_func_truck_populate, nullptr, nullptr,
+                       "SemiFunc.TruckPopulateItemVolumes(force-empty)")) {
           AppendLogOnce("MonoListItems_force_truck", "Forced SemiFunc::TruckPopulateItemVolumes");
         }
       }
@@ -7116,28 +8499,27 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       if (items && !logged_after_force) {
         std::ostringstream oss;
         oss << "MonoListItems: after force, size=" << list_size
-          << " max_length=" << items->max_length;
+          << " max_length=" << GetArrayLengthSafe(items);
         AppendLog(oss.str());
         logged_after_force = true;
       }
     }
 
 // Non-ASCII comment normalized.
-    if (list_size > 0 && (!items || (items && items->max_length == 0)) &&
+    if (list_size > 0 && (!items || GetArrayLengthSafe(items) == 0) &&
       g_find_objects_of_type_itemvolume && g_item_volume_class &&
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
       MonoType* iv_type = g_mono.mono_class_get_type(g_item_volume_class);
       if (iv_type) {
-        MonoObject* type_obj =
-          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), iv_type);
-        if (type_obj) {
-          void* f_args[1] = { type_obj };
-          MonoObject* exc = nullptr;
-          MonoObject* arr_obj = g_mono.mono_runtime_invoke(
-            g_find_objects_of_type_itemvolume, nullptr, f_args, &exc);
-          if (!exc && arr_obj) {
+          MonoObject* type_obj =
+            g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), iv_type);
+          if (type_obj) {
+            void* f_args[1] = { type_obj };
+          MonoObject* arr_obj = SafeInvoke(
+            g_find_objects_of_type_itemvolume, nullptr, f_args, "FindObjectsOfType<ItemVolume>(rescue)");
+          if (arr_obj) {
             items = reinterpret_cast<MonoArray*>(arr_obj);
-            list_size = items ? static_cast<int>(items->max_length) : 0;
+            list_size = GetArrayLengthSafe(items);
             static bool logged_rescue = false;
             if (!logged_rescue) {
               std::ostringstream oss;
@@ -7155,16 +8537,15 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       g_mono.mono_class_get_type && g_mono.mono_type_get_object) {
       MonoType* iv_type = g_mono.mono_class_get_type(g_item_volume_class);
       if (iv_type) {
-        MonoObject* type_obj =
-          g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), iv_type);
-        if (type_obj) {
-          void* f_args[1] = { type_obj };
-          MonoObject* exc = nullptr;
-          MonoObject* arr_obj = g_mono.mono_runtime_invoke(
-            g_find_objects_of_type_itemvolume, nullptr, f_args, &exc);
-          if (!exc && arr_obj) {
+          MonoObject* type_obj =
+            g_mono.mono_type_get_object(g_domain ? g_domain : g_mono.mono_get_root_domain(), iv_type);
+          if (type_obj) {
+            void* f_args[1] = { type_obj };
+          MonoObject* arr_obj = SafeInvoke(
+            g_find_objects_of_type_itemvolume, nullptr, f_args, "FindObjectsOfType<ItemVolume>(fallback)");
+          if (arr_obj) {
             items = reinterpret_cast<MonoArray*>(arr_obj);
-            list_size = items ? static_cast<int>(items->max_length) : 0;
+            list_size = GetArrayLengthSafe(items);
             static bool logged_fallback = false;
             if (!logged_fallback) {
               std::ostringstream oss;
@@ -7206,17 +8587,14 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
           MonoClass* dict_class = g_mono.mono_object_get_class(dict_obj);
           MonoMethod* get_values = g_mono.mono_class_get_method_from_name(dict_class, "get_Values", 0);
           if (get_values) {
-            MonoObject* exc_vals = nullptr;
-            MonoObject* values = g_mono.mono_runtime_invoke(get_values, dict_obj, nullptr, &exc_vals);
-            if (!exc_vals && values) {
+            MonoObject* values = SafeInvoke(get_values, dict_obj, nullptr, "Dictionary.get_Values");
+            if (values) {
               MonoClass* values_class = g_mono.mono_object_get_class(values);
               MonoMethod* get_enum =
                 g_mono.mono_class_get_method_from_name(values_class, "GetEnumerator", 0);
               if (get_enum) {
-                MonoObject* exc_enum = nullptr;
-                MonoObject* enumerator =
-                  g_mono.mono_runtime_invoke(get_enum, values, nullptr, &exc_enum);
-                if (!exc_enum && enumerator) {
+                MonoObject* enumerator = SafeInvoke(get_enum, values, nullptr, "Values.GetEnumerator");
+                if (enumerator) {
                   MonoClass* enum_class = g_mono.mono_object_get_class(enumerator);
                   MonoMethod* move_next =
                     g_mono.mono_class_get_method_from_name(enum_class, "MoveNext", 0);
@@ -7225,16 +8603,21 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
                   MonoClassField* kv_value_field = nullptr;
                   if (move_next && get_current) {
                     while (true) {
-                      MonoObject* exc_move = nullptr;
-                      MonoObject* move_obj =
-                        g_mono.mono_runtime_invoke(move_next, enumerator, nullptr, &exc_move);
-                      if (exc_move || !move_obj) break;
-                      bool has_next = *static_cast<bool*>(g_mono.mono_object_unbox(move_obj));
+                      MonoObject* move_obj = SafeInvoke(move_next, enumerator, nullptr, "Enumerator.MoveNext");
+                      if (!move_obj) break;
+                      bool has_next = false;
+#ifdef _MSC_VER
+                      if (!UnboxBoolSafeSeh(move_obj, has_next)) {
+                        break;
+                      }
+#else
+                      void* raw = g_mono.mono_object_unbox(move_obj);
+                      if (!raw) break;
+                      has_next = (*static_cast<uint8_t*>(raw) != 0);
+#endif
                       if (!has_next) break;
-                      MonoObject* exc_cur = nullptr;
-                      MonoObject* kv = g_mono.mono_runtime_invoke(get_current, enumerator, nullptr,
-                        &exc_cur);
-                      if (exc_cur || !kv) continue;
+                      MonoObject* kv = SafeInvoke(get_current, enumerator, nullptr, "Enumerator.get_Current");
+                      if (!kv) continue;
                       if (!kv_value_field) {
                         MonoClass* kv_class = g_mono.mono_object_get_class(kv);
                         kv_value_field = g_mono.mono_class_get_field_from_name(kv_class, "value");
@@ -7263,11 +8646,12 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
 
 // Non-ASCII comment normalized.
-    if (!items || list_size <= 0 || (items && items->max_length <= 0)) {
+    const int items_len = GetArrayLengthSafe(items);
+    if (!items || list_size <= 0 || items_len <= 0) {
       if (!logged_no_items) {
         std::ostringstream oss;
         oss << "MonoListItems: list_size=" << list_size
-          << " max_length=" << (items ? items->max_length : 0) << " (empty; skipping scan)";
+          << " max_length=" << items_len << " (empty; skipping scan)";
         AppendLog(oss.str());
         logged_no_items = true;
       }
@@ -7279,14 +8663,14 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     if (!logged_list_count) {
       std::ostringstream oss;
       oss << "MonoListItems: Successfully got item list, size=" << list_size
-        << " max_length=" << (items ? items->max_length : 0);
+        << " max_length=" << items_len;
       AppendLog(oss.str());
       logged_list_count = true;
     }
     g_items_ready.store(true, std::memory_order_relaxed);
 
     int limit = list_size;
-    int max_len = (items && items->max_length > 0) ? static_cast<int>(items->max_length) : list_size;
+    int max_len = items_len > 0 ? items_len : list_size;
 // Non-ASCII comment normalized.
     if (max_len > 0 && limit > max_len) limit = max_len;
     if (limit > 1024) {
@@ -7294,14 +8678,19 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
     }
 
     int valid_count = 0;
+    const uint32_t safeinvoke_seh_before_list_loop =
+      g_safeinvoke_seh_count.load(std::memory_order_relaxed);
     for (int i = 0; i < limit; ++i) {
-      MonoObject* item = static_cast<MonoObject*>(items->vector[i]);
+      if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) !=
+          safeinvoke_seh_before_list_loop) {
+        break;
+      }
+      MonoObject* item = GetArrayElementSafe(items, i);
       if (!item || IsUnityNull(item)) continue;
 
-      MonoObject* exception2 = nullptr;
-      MonoObject* transform_obj =
-        g_mono.mono_runtime_invoke(g_component_get_transform, item, nullptr, &exception2);
-      if (exception2 || !transform_obj || IsUnityNull(transform_obj)) {
+      MonoObject* transform_obj = SafeInvoke(g_component_get_transform, item, nullptr,
+                                             "Item.get_transform");
+      if (!transform_obj || IsUnityNull(transform_obj)) {
         continue;
       }
 
@@ -7313,8 +8702,16 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       }
     }
 
+    if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) !=
+        safeinvoke_seh_before_list_loop) {
+      AppendLogOnce("MonoListItems_seh_abort_rest",
+        "MonoListItems: detected SafeInvoke SEH during list walk; aborting remaining scans");
+      return !out_items.empty();
+    }
+
     // Extra sweep: use authoritative scans for PhysGrabObject and ValuableObject.
     auto sweep_type_positions = [&](MonoClass* target_cls, const char* tag) -> int {
+      if (!k_enable_item_global_sweeps) return 0;
       if (!target_cls || !g_mono.mono_class_get_type || !g_mono.mono_type_get_object) return 0;
       MonoType* t = g_mono.mono_class_get_type(target_cls);
       if (!t) return 0;
@@ -7327,41 +8724,40 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
       if (g_find_objects_of_type_itemvolume_include_inactive) {
         bool include_inactive = true;
         void* args2[2] = { type_obj, &include_inactive };
-        MonoObject* exc = nullptr;
-        MonoObject* arr_obj = g_mono.mono_runtime_invoke(
-          g_find_objects_of_type_itemvolume_include_inactive, nullptr, args2, &exc);
-        if (!exc && arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
+        MonoObject* arr_obj = SafeInvoke(
+          g_find_objects_of_type_itemvolume_include_inactive, nullptr, args2,
+          "FindObjectsOfType(Type,true)[sweep]");
+        if (arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
       }
       // try Object.FindObjectsOfType(Type)
       if (!arr && g_find_objects_of_type_itemvolume) {
         void* args1[1] = { type_obj };
-        MonoObject* exc = nullptr;
-        MonoObject* arr_obj =
-          g_mono.mono_runtime_invoke(g_find_objects_of_type_itemvolume, nullptr, args1, &exc);
-        if (!exc && arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
+        MonoObject* arr_obj = SafeInvoke(
+          g_find_objects_of_type_itemvolume, nullptr, args1,
+          "FindObjectsOfType(Type)[sweep]");
+        if (arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
       }
       // try Resources.FindObjectsOfTypeAll(Type)
       if (!arr && g_resources_find_objects_of_type_all) {
         void* args1b[1] = { type_obj };
-        MonoObject* exc = nullptr;
-        MonoObject* arr_obj = g_mono.mono_runtime_invoke(
-          g_resources_find_objects_of_type_all, nullptr, args1b, &exc);
-        if (!exc && arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
+        MonoObject* arr_obj = SafeInvoke(
+          g_resources_find_objects_of_type_all, nullptr, args1b,
+          "Resources.FindObjectsOfTypeAll[sweep]");
+        if (arr_obj) arr = reinterpret_cast<MonoArray*>(arr_obj);
       }
 
       int added = 0;
       if (IsValidArray(arr)) {
-        int cnt = static_cast<int>(arr->max_length);
+        int cnt = GetArrayLengthSafe(arr);
         std::ostringstream oss;
         oss << "MonoListItems: sweep " << tag << " count=" << cnt;
         AppendLogOnce(std::string("MonoListItems_sweep_") + tag, oss.str());
         int lim = cnt > 1024 ? 1024 : cnt;
         for (int i = 0; i < lim; ++i) {
-          MonoObject* obj = static_cast<MonoObject*>(arr->vector[i]);
+          MonoObject* obj = GetArrayElementSafe(arr, i);
           if (!obj || IsUnityNull(obj)) continue;
-          MonoObject* exc_t = nullptr;
-          MonoObject* tr = g_mono.mono_runtime_invoke(g_component_get_transform, obj, nullptr, &exc_t);
-          if (exc_t || !tr || IsUnityNull(tr)) continue;
+          MonoObject* tr = SafeInvoke(g_component_get_transform, obj, nullptr, "Sweep.get_transform");
+          if (!tr || IsUnityNull(tr)) continue;
           PlayerState st{};
           populate_meta(obj, st);
           if (TryGetPositionFromTransform(tr, st, false) && st.has_position) {
@@ -7390,6 +8786,12 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
   }
   catch (...) {
     AppendLog("MonoListItems: exception caught");
+    const uint64_t now_ms = GetTickCount64();
+    g_items_disabled = true;
+    g_items_last_crash_ms.store(now_ms, std::memory_order_relaxed);
+    const int crash_count = g_items_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_items_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
     return false;
   }
 }
@@ -7398,10 +8800,12 @@ bool MonoListItems(std::vector<PlayerState>& out_items) {
 // Avoid local objects with destructors inside the __try block.
 #ifdef _MSC_VER
 __declspec(noinline) static bool __stdcall MonoListItemsSehThunk(std::vector<PlayerState>* out_items) {
+  g_items_last_seh_fault.store(false, std::memory_order_relaxed);
   __try {
     return MonoListItems(*out_items);
   }
   __except (LogCrash("MonoListItemsSafe", GetExceptionCode(), GetExceptionInformation())) {
+    g_items_last_seh_fault.store(true, std::memory_order_relaxed);
     return false;
   }
 }
@@ -7410,20 +8814,54 @@ __declspec(noinline) static bool __stdcall MonoListItemsSehThunk(std::vector<Pla
 bool MonoListItemsSafe(std::vector<PlayerState>& out_items) {
 #ifdef _MSC_VER
   bool ok = MonoListItemsSehThunk(&out_items);
-  if (!ok) {
+  if (ok) {
+    g_items_crash_count.store(0, std::memory_order_relaxed);
+    g_items_retry_after_ms.store(0, std::memory_order_relaxed);
+    return true;
+  }
+  if (!ok && g_items_last_seh_fault.load(std::memory_order_relaxed)) {
     g_items_disabled = true;
-    g_items_last_crash_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    AppendLogOnce("MonoListItems_disabled", "MonoListItemsSafe crashed; auto item refresh disabled");
+    const uint64_t now_ms = GetTickCount64();
+    g_items_last_crash_ms.store(now_ms, std::memory_order_relaxed);
+    const int crash_count = g_items_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_items_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
+    if (crash_count >= 3) {
+      AppendLogOnce("MonoListItems_disabled_hard",
+        "MonoListItemsSafe crashed repeatedly; item refresh disabled until manual reset");
+    } else {
+      std::ostringstream oss;
+      oss << "MonoListItemsSafe crashed; auto item refresh disabled for "
+          << (backoff_ms / 1000) << "s";
+      AppendLog(oss.str());
+    }
   }
   return ok;
 #else
   try {
-    return MonoListItems(out_items);
+    bool ok = MonoListItems(out_items);
+    if (ok) {
+      g_items_crash_count.store(0, std::memory_order_relaxed);
+      g_items_retry_after_ms.store(0, std::memory_order_relaxed);
+    }
+    return ok;
   }
   catch (...) {
     g_items_disabled = true;
-    g_items_last_crash_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    AppendLogOnce("MonoListItems_disabled", "MonoListItemsSafe crashed; auto item refresh disabled");
+    const uint64_t now_ms = GetTickCount64();
+    g_items_last_crash_ms.store(now_ms, std::memory_order_relaxed);
+    const int crash_count = g_items_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_items_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
+    if (crash_count >= 3) {
+      AppendLogOnce("MonoListItems_disabled_hard",
+        "MonoListItemsSafe crashed repeatedly; item refresh disabled until manual reset");
+    } else {
+      std::ostringstream oss;
+      oss << "MonoListItemsSafe crashed; auto item refresh disabled for "
+          << (backoff_ms / 1000) << "s";
+      AppendLog(oss.str());
+    }
     return false;
   }
 #endif
@@ -7434,6 +8872,9 @@ bool MonoItemsDisabled() { return g_items_disabled; }
 void MonoResetItemsDisabled() {
   g_items_disabled = false;
   g_items_ready.store(false, std::memory_order_relaxed);
+  g_items_crash_count.store(0, std::memory_order_relaxed);
+  g_items_last_seh_fault.store(false, std::memory_order_relaxed);
+  g_items_retry_after_ms.store(0, std::memory_order_relaxed);
 }
 
 bool MonoManualRefreshItems(std::vector<PlayerState>& out_items) {
@@ -7445,6 +8886,8 @@ void MonoResetEnemiesDisabled() {
   g_enemy_esp_disabled = false;
   g_enemy_cache_disabled = false;
   g_enemies_ready.store(false, std::memory_order_relaxed);
+  g_enemies_crash_count.store(0, std::memory_order_relaxed);
+  g_enemies_retry_after_ms.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
     ClearEnemyCacheHandlesUnlocked();
@@ -7454,9 +8897,38 @@ void MonoResetEnemiesDisabled() {
 bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
   try {
     if (g_shutting_down) return false;
+    const uint64_t now_ms = GetTickCount64();
+    if (g_enemy_esp_disabled) {
+      const int crash_count = g_enemies_crash_count.load(std::memory_order_relaxed);
+      const uint64_t retry_after = g_enemies_retry_after_ms.load(std::memory_order_relaxed);
+      if (crash_count >= 3) {
+        return false;
+      }
+      if (now_ms < retry_after) {
+        return false;
+      }
+      g_enemy_esp_disabled = false;
+      g_enemy_cache_disabled = false;
+      AppendLogOnce("MonoListEnemies_retry_enabled",
+        "MonoListEnemies: retry window reached, re-enabling enemy scan");
+    }
+
     out_enemies.clear();
     if (!CacheManagedRefs()) {
       AppendLog("MonoListEnemies: CacheManagedRefs failed");
+      return false;
+    }
+    SessionRuntimeGate gate{};
+    if (!MonoGetSessionRuntimeGate(gate) || !gate.ok ||
+        (gate.allow_mask & kSessionAllowScanEnemies) == 0) {
+      static uint64_t s_last_gate_log_ms = 0;
+      if (now_ms - s_last_gate_log_ms > 2000) {
+        std::ostringstream oss;
+        oss << "MonoListEnemies: skip by runtime gate, reason="
+            << (gate.reason.empty() ? "unknown" : gate.reason);
+        AppendLog(oss.str());
+        s_last_gate_log_ms = now_ms;
+      }
       return false;
     }
     RoundState rs{};
@@ -7473,7 +8945,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       return false;
     }
 
-    uint64_t now = GetTickCount64();
+    uint64_t now = now_ms;
     EnemyCachePruneDead();
 
     std::vector<uint32_t> cache_snapshot;
@@ -7533,26 +9005,80 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
   catch (...) {
     AppendLog("MonoListEnemies: exception caught");
     g_enemy_esp_disabled = true;
+    g_enemy_cache_disabled = true;
+    const uint64_t now_ms = GetTickCount64();
+    const int crash_count = g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_enemies_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
     return false;
   }
 }
 
-bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies) {
 #ifdef _MSC_VER
+__declspec(noinline) static bool __stdcall MonoListEnemiesSehThunk(
+  std::vector<PlayerState>* out_ptr, bool* out_seh_fault) {
+  if (out_seh_fault) *out_seh_fault = false;
   __try {
-    return MonoListEnemies(out_enemies);
+    return MonoListEnemies(*out_ptr);
   }
   __except (LogCrash("MonoListEnemiesSafe", GetExceptionCode(), GetExceptionInformation())) {
-    g_enemy_esp_disabled = true;
-    g_enemy_cache_disabled = true;
+    if (out_seh_fault) *out_seh_fault = true;
     return false;
   }
+}
+#endif
+
+bool MonoListEnemiesSafe(std::vector<PlayerState>& out_enemies) {
+#ifdef _MSC_VER
+  bool seh_fault = false;
+  bool ok = MonoListEnemiesSehThunk(&out_enemies, &seh_fault);
+  if (ok) {
+    g_enemies_crash_count.store(0, std::memory_order_relaxed);
+    g_enemies_retry_after_ms.store(0, std::memory_order_relaxed);
+    return true;
+  }
+  if (!ok && seh_fault) {
+    g_enemy_esp_disabled = true;
+    g_enemy_cache_disabled = true;
+    const uint64_t now_ms = GetTickCount64();
+    const int crash_count = g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_enemies_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
+    if (crash_count >= 3) {
+      AppendLogOnce("MonoListEnemies_disabled_hard",
+        "MonoListEnemiesSafe crashed repeatedly; enemy refresh disabled until manual reset");
+    } else {
+      std::ostringstream oss;
+      oss << "MonoListEnemiesSafe crashed; auto enemy refresh disabled for "
+          << (backoff_ms / 1000) << "s";
+      AppendLog(oss.str());
+    }
+  }
+  return ok;
 #else
   try {
-    return MonoListEnemies(out_enemies);
+    bool ok = MonoListEnemies(out_enemies);
+    if (ok) {
+      g_enemies_crash_count.store(0, std::memory_order_relaxed);
+      g_enemies_retry_after_ms.store(0, std::memory_order_relaxed);
+    }
+    return ok;
   }
   catch (...) {
     g_enemy_esp_disabled = true;
+    const uint64_t now_ms = GetTickCount64();
+    const int crash_count = g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms = (crash_count >= 3) ? 30000ull : ((crash_count == 2) ? 10000ull : 3000ull);
+    g_enemies_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
+    if (crash_count >= 3) {
+      AppendLogOnce("MonoListEnemies_disabled_hard",
+        "MonoListEnemiesSafe crashed repeatedly; enemy refresh disabled until manual reset");
+    } else {
+      std::ostringstream oss;
+      oss << "MonoListEnemiesSafe crashed; auto enemy refresh disabled for "
+          << (backoff_ms / 1000) << "s";
+      AppendLog(oss.str());
+    }
     return false;
   }
 #endif
@@ -8309,14 +9835,16 @@ bool MonoReviveAllPlayers(bool include_local) {
       g_mono.mono_field_get_value(list_obj, items_field, &items);
       g_mono.mono_field_get_value(list_obj, size_field, &list_size);
     }
-    if (items && items->vector && items->max_length > 0 && list_size > 0) {
+    int items_len = GetArrayLengthSafe(items);
+    if (items && items_len > 0 && list_size > 0) {
       int lim = list_size;
-      if (lim > static_cast<int>(items->max_length)) lim = static_cast<int>(items->max_length);
+      if (lim > items_len) lim = items_len;
       for (int i = 0; i < lim; ++i) {
-        MonoObject* avatar = static_cast<MonoObject*>(items->vector[i]);
+        MonoObject* avatar = GetArrayElementSafe(items, i);
         if (revive_avatar(avatar)) ++revived;
       }
     }
+
     else {
 // Non-ASCII comment normalized.
       EnumerateListObjects(list_obj, [&](MonoObject* avatar) -> bool {
@@ -8445,19 +9973,21 @@ bool MonoGetCameraMatrices(Matrix4x4& view, Matrix4x4& projection) {
       return false;
     }
 
+#ifdef _MSC_VER
+    if (!CopyCameraMatricesSafeSeh(proj_obj, view_obj, projection, view)) {
+      AppendLog("MonoGetCameraMatrices: unbox/memcpy triggered SEH");
+      return false;
+    }
+#else
     void* proj_data = g_mono.mono_object_unbox ? g_mono.mono_object_unbox(proj_obj) : nullptr;
     void* view_data = g_mono.mono_object_unbox ? g_mono.mono_object_unbox(view_obj) : nullptr;
-    if (!proj_data) {
-      AppendLog("MonoGetCameraMatrices: failed to unbox projection matrix");
+    if (!proj_data || !view_data) {
+      AppendLog("MonoGetCameraMatrices: failed to unbox matrices");
       return false;
     }
-    if (!view_data) {
-      AppendLog("MonoGetCameraMatrices: failed to unbox view matrix");
-      return false;
-    }
-
     std::memcpy(projection.m, proj_data, sizeof(projection.m));
     std::memcpy(view.m, view_data, sizeof(view.m));
+#endif
 
     static bool logged_matrices_once = false;
     if (!logged_matrices_once) {
@@ -8519,7 +10049,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
 
   auto call_new_on_array = [&](MonoArray* arr) {
     if (!IsValidArray(arr)) return 0;
-    int limit = static_cast<int>(arr->max_length);
+    int limit = GetArrayLengthSafe(arr);
     if (max_items > 0 && limit > max_items) limit = max_items;
     if (limit > kObjCap) limit = kObjCap;
     int hit = 0;
@@ -8529,7 +10059,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
           "ValuableDiscover.New exceeded time budget, early-exit");
         break;
       }
-      MonoObject* obj = static_cast<MonoObject*>(arr->vector[i]);
+      MonoObject* obj = GetArrayElementSafe(arr, i);
       if (!obj) continue;
       void* new_args[2] = { obj, &state };
       MonoObject* ret = SafeInvoke(g_valuable_discover_new_method, discover_instance, new_args, "ValuableDiscover.New");
@@ -8561,7 +10091,6 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     int query = 2;
     int layer_mask = -1;
     MonoObject* arr_obj = nullptr;
-    MonoObject* exc = nullptr;
     void* args4[4] = { center, &radius, &layer_mask, &query };
     void* args3[3] = { center, &radius, &layer_mask };
     void* args2b[2] = { center, &radius };
@@ -8571,13 +10100,13 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
     case 2: arr_obj = SafeInvoke(g_physics_overlap_sphere, nullptr, args2b, "Physics.OverlapSphere2"); break;
     default: break;
     }
-    if (!exc && arr_obj && pgo_type_obj) {
+    if (arr_obj && pgo_type_obj) {
       MonoArray* colliders = reinterpret_cast<MonoArray*>(arr_obj);
       if (!IsValidArray(colliders)) {
         out_count = total_hit;
         return total_hit > 0;
       }
-      int limit = static_cast<int>(colliders->max_length);
+      int limit = GetArrayLengthSafe(colliders);
       if (limit > 4096) limit = 4096;
       for (int i = 0; i < limit; ++i) {
         if (GetTickCount64() - start_ms > kBudgetMs) {
@@ -8585,7 +10114,7 @@ bool MonoTriggerValuableDiscover(int state, int max_items, int& out_count) {
             "ValuableDiscover overlap-sphere exceeded time budget, early-exit");
           break;
         }
-        MonoObject* collider = static_cast<MonoObject*>(colliders->vector[i]);
+        MonoObject* collider = GetArrayElementSafe(colliders, i);
         if (!collider) continue;
         MonoObject* game_obj =
           g_component_get_game_object

@@ -81,6 +81,31 @@ bool MonoSetRunCurrency(int amount);
 bool MonoSetSessionMaster(bool enable);
 bool MonoIsSessionTransitioning();
 bool MonoIsRealMasterClient();
+
+enum SessionRuntimeAllow : uint32_t {
+  kSessionAllowReadPlayer = 1u << 0,
+  kSessionAllowScanItems = 1u << 1,
+  kSessionAllowScanEnemies = 1u << 2,
+  kSessionAllowMutatePlayer = 1u << 3,
+  kSessionAllowMutateEconomy = 1u << 4,
+  kSessionAllowMutateRound = 1u << 5,
+};
+
+struct SessionRuntimeGate {
+  bool ok{ false };
+  bool transitioning{ true };
+  bool in_room_known{ false };
+  bool in_room{ false };
+  bool has_local_player{ false };
+  bool has_local_position{ false };
+  bool level_generated{ false };
+  int game_state{ -1 };
+  uint32_t allow_mask{ 0 };
+  std::string reason;
+};
+
+bool MonoGetSessionRuntimeGate(SessionRuntimeGate& out_gate);
+
 bool MonoGetRunCurrency(int& out_amount);
 bool MonoApplyPendingCartValue();
 bool MonoOverrideSpeed(float multiplier, float duration_seconds);
@@ -95,6 +120,7 @@ bool MonoSetCartValue(int value);
 bool MonoSetCartValueSafe(int value);
 bool MonoSetGrabRange(float range);
 bool MonoSetGrabStrengthField(float strength);
+bool MonoSetThirdPerson(bool enabled, float distance, float height, float shoulder, float smooth);
 
 // Round/haul helpers (关卡收集阶段)
 struct RoundState {
@@ -111,12 +137,19 @@ struct RoundProgressState {
   int stage{ -1 };
   bool all_completed{ false };
 };
+struct RunLevelInfo {
+  bool ok{ false };
+  bool transitioning{ false };
+  std::string current_level;
+  std::string previous_level;
+};
 bool MonoGetRoundState(RoundState& out_state);
 bool MonoSetRoundState(int current, int goal = -1, int current_max = -1);
 bool MonoSetRoundStateSafe(int current, int goal = -1, int current_max = -1);
 bool MonoGetRoundProgress(RoundProgressState& out_state);
 bool MonoSetRoundProgress(int completed, int total, int stage = -1, int all_completed = -1);
 bool MonoSetRoundProgressSafe(int completed, int total, int stage = -1, int all_completed = -1);
+bool MonoGetRunLevelInfo(RunLevelInfo& out_info);
 void MonoSetRoundHaulOverride(bool enabled, int current, int goal = -1);
 
 // Enumerate all PlayerAvatar instances; fills out_states with any player that has a position.

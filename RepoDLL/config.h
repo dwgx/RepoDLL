@@ -26,6 +26,10 @@ constexpr const char* kPlayerAvatarTransformField = "playerTransform";
 constexpr const char* kPlayerAvatarHealthField = "playerHealth";
 constexpr const char* kPlayerAvatarSteamIdField = "steamID";
 constexpr const char* kPlayerAvatarPhysGrabberField = "physGrabber";
+constexpr const char* kPlayerAvatarVisualsField = "playerAvatarVisuals";
+constexpr const char* kPlayerAvatarVisualsClass = "PlayerAvatarVisuals";
+constexpr const char* kPlayerAvatarVisualsMeshParentField = "meshParent";
+constexpr const char* kPlayerAvatarVisualsAnimatorField = "animator";
 
 constexpr const char* kTransformGetPositionMethod = "get_position";
 constexpr const char* kTransformSetPositionMethod = "set_position";
@@ -75,6 +79,10 @@ constexpr const char* kUnityCameraMainMethod = "get_main";
 constexpr const char* kUnityCameraProjectionMatrixMethod = "get_projectionMatrix";
 constexpr const char* kUnityCameraWorldToCameraMatrixMethod = "get_worldToCameraMatrix";
 constexpr const char* kUnityCameraGetTransformMethod = "get_transform";
+constexpr const char* kCameraPositionClass = "CameraPosition";
+constexpr const char* kCameraPositionInstanceField = "instance";
+constexpr const char* kCameraPositionPlayerOffsetField = "playerOffset";
+constexpr const char* kCameraPositionSmoothField = "positionSmooth";
 
 constexpr const char* kTransformLocalToWorldMatrixMethod = "get_localToWorldMatrix";
 constexpr const char* kTransformWorldToLocalMatrixMethod = "get_worldToLocalMatrix";

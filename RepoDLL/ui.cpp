@@ -52,6 +52,12 @@ struct SavedSettings {
   bool load_on_start = true;
   bool reset_each_round = true;
   int menu_toggle_vk = VK_INSERT;
+  bool third_person_enabled = false;
+  int third_person_toggle_vk = VK_F6;
+  float third_person_distance = 2.8f;
+  float third_person_height = 1.15f;
+  float third_person_shoulder = 0.35f;
+  float third_person_smooth = 2.0f;
   float speed_mult = 1.0f;
   std::string log_path;
 };
@@ -92,6 +98,12 @@ void SaveSettings(const SavedSettings& s) {
   f << "load_on_start=" << s.load_on_start << "\n";
   f << "reset_each_round=" << s.reset_each_round << "\n";
   f << "menu_toggle_vk=" << s.menu_toggle_vk << "\n";
+  f << "third_person_enabled=" << s.third_person_enabled << "\n";
+  f << "third_person_toggle_vk=" << s.third_person_toggle_vk << "\n";
+  f << "third_person_distance=" << s.third_person_distance << "\n";
+  f << "third_person_height=" << s.third_person_height << "\n";
+  f << "third_person_shoulder=" << s.third_person_shoulder << "\n";
+  f << "third_person_smooth=" << s.third_person_smooth << "\n";
   f << "log_path=" << s.log_path << "\n";
 }
 
@@ -117,6 +129,12 @@ bool LoadSettings(SavedSettings& out) {
       else if (k == "load_on_start") out.load_on_start = to_bool(v);
       else if (k == "reset_each_round") out.reset_each_round = to_bool(v);
       else if (k == "menu_toggle_vk") out.menu_toggle_vk = std::stoi(v);
+      else if (k == "third_person_enabled") out.third_person_enabled = to_bool(v);
+      else if (k == "third_person_toggle_vk") out.third_person_toggle_vk = std::stoi(v);
+      else if (k == "third_person_distance") out.third_person_distance = std::stof(v);
+      else if (k == "third_person_height") out.third_person_height = std::stof(v);
+      else if (k == "third_person_shoulder") out.third_person_shoulder = std::stof(v);
+      else if (k == "third_person_smooth") out.third_person_smooth = std::stof(v);
       else if (k == "log_path") out.log_path = v;
     } catch (...) {
       continue;
@@ -195,6 +213,22 @@ std::string MenuHotkeyName(int vk) {
   }
   return std::string("VK_") + std::to_string(vk);
 }
+
+std::string DescribeGateReason(const std::string& reason) {
+  if (reason.empty()) return "未知";
+  if (reason == "managed_refs_unavailable") return "Mono引用未就绪";
+  if (reason == "PhotonNetwork.InRoom=false") return "未进入房间（联机会话未建立）";
+  if (reason == "PhotonNetwork.LevelLoadingProgress") return "关卡加载中";
+  if (reason == "RunManager.restarting") return "RunManager 正在重开";
+  if (reason == "RunManager.waitToChangeScene") return "等待切换地图";
+  if (reason == "RunManager.lobbyJoin") return "正在加入大厅/会话";
+  if (reason == "GameDirector.currentState=Load/EndWait") return "GameDirector 处于 Load/EndWait";
+  if (reason == "LevelGenerator.Generated=false") return "地图尚未生成完成";
+  if (reason == "LocalPlayerUnavailable") return "本地玩家对象未找到";
+  if (reason == "LocalPlayerPositionUnavailable") return "本地玩家坐标未就绪";
+  if (reason == "stable" || reason == "stable(InRoomUnknown)") return "稳定";
+  return reason;
+}
 }  // namespace
 
 const std::vector<PlayerState>& UiGetCachedItems() { return g_cached_items; }
@@ -250,6 +284,10 @@ void RenderOverlay(bool* menu_open) {
   static int extra_jump_count = 0;     // 初始 0，用户开启时如未设值会自动提升
   static float jump_cooldown = 0.0f;   // 仅在用户修改后生效
   static int grab_strength = 1000;
+  static float third_person_distance = 2.8f;
+  static float third_person_height = 1.15f;
+  static float third_person_shoulder = 0.35f;
+  static float third_person_smooth = 2.0f;
   static bool infinite_jump_enabled = false;  // 默认关闭，需手动开启
   static bool god_mode_enabled = false;
   static float jump_force = 20.0f;
@@ -266,7 +304,12 @@ void RenderOverlay(bool* menu_open) {
   static bool has_round_state = false;
   static RoundProgressState cached_round_progress{};
   static bool has_round_progress = false;
+  static RunLevelInfo cached_level_info{};
+  static bool has_level_info = false;
   static uint64_t last_round_update = 0;
+  static uint64_t last_level_info_update = 0;
+  static bool scan_pause_pending = false;
+  static int scan_pause_stable_samples = 0;
   static std::vector<std::string> debug_logs;
   static std::vector<std::string> collector_scan_results;
   static char collector_scan_kw[64] = "haul";
@@ -277,6 +320,9 @@ void RenderOverlay(bool* menu_open) {
   static bool settings_loaded = false;
   static bool reset_each_round = true;
   static bool session_master_transitioning = false;
+  static SessionRuntimeGate runtime_gate{};
+  static bool runtime_gate_ok = false;
+  static uint64_t last_runtime_gate_update = 0;
   static bool is_real_master = false;
   static uint64_t last_master_state_update = 0;
   static int last_stage_seen = -999;
@@ -292,6 +338,12 @@ void RenderOverlay(bool* menu_open) {
     saved.log_path = MonoGetLogPath();
     LoadSettings(saved);
     SetMenuToggleVirtualKey(saved.menu_toggle_vk);
+    SetThirdPersonToggleVirtualKey(saved.third_person_toggle_vk);
+    third_person_distance = saved.third_person_distance;
+    third_person_height = saved.third_person_height;
+    third_person_shoulder = saved.third_person_shoulder;
+    third_person_smooth = saved.third_person_smooth;
+    SetThirdPersonEnabled(saved.load_on_start ? saved.third_person_enabled : false);
     if (!saved.log_path.empty()) {
       strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
       MonoSetLogPath(saved.log_path);
@@ -310,12 +362,67 @@ void RenderOverlay(bool* menu_open) {
     settings_loaded = true;
   }
   if (mono_ready) {
-    session_master_transitioning = MonoIsSessionTransitioning();
+    if (!runtime_gate_ok || now - last_runtime_gate_update > 120) {
+      runtime_gate_ok = MonoGetSessionRuntimeGate(runtime_gate);
+      last_runtime_gate_update = now;
+    }
+    session_master_transitioning =
+      !(runtime_gate_ok && runtime_gate.ok && !runtime_gate.transitioning);
     if (g_session_master_patch_active) {
       MonoSetSessionMaster(false);
     }
-  } else {
+  }
+  else {
     session_master_transitioning = true;
+    runtime_gate_ok = false;
+    runtime_gate = SessionRuntimeGate{};
+  }
+  const bool allow_read_player =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowReadPlayer) != 0;
+  const bool allow_scan_items =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowScanItems) != 0;
+  const bool allow_scan_enemies =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowScanEnemies) != 0;
+  const bool allow_mutate_player =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowMutatePlayer) != 0;
+  const bool allow_mutate_economy =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowMutateEconomy) != 0;
+  const bool allow_mutate_round =
+    runtime_gate_ok && (runtime_gate.allow_mask & kSessionAllowMutateRound) != 0;
+  if (scan_pause_pending) {
+    if (allow_scan_items || allow_scan_enemies) {
+      ++scan_pause_stable_samples;
+      if (scan_pause_stable_samples >= 2) {
+        scan_pause_pending = false;
+        scan_pause_stable_samples = 0;
+      }
+    }
+    else {
+      scan_pause_stable_samples = 0;
+    }
+  }
+  std::string gate_reason_text;
+  if (!mono_ready) {
+    gate_reason_text = "Mono未就绪";
+  } else if (!runtime_gate_ok) {
+    gate_reason_text = "会话门控读取失败";
+  } else if (!runtime_gate.ok) {
+    gate_reason_text = runtime_gate.reason.empty()
+      ? "会话门控未就绪"
+      : DescribeGateReason(runtime_gate.reason);
+  } else {
+    gate_reason_text = runtime_gate.reason.empty()
+      ? (runtime_gate.transitioning ? "会话切换中" : "稳定")
+      : DescribeGateReason(runtime_gate.reason);
+  }
+
+  if (session_master_transitioning) {
+    last_ok = false;
+    has_currency = false;
+    inputs_synced = false;
+    g_cached_items.clear();
+    g_cached_enemies.clear();
+    g_cached_mats_valid = false;
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -323,7 +430,7 @@ void RenderOverlay(bool* menu_open) {
     return;
   }
   if (mono_ready && auto_refresh && safe_to_refresh && now - last_update > 500) {
-    if (!session_master_transitioning) {
+    if (!session_master_transitioning && allow_read_player) {
       SetCrashStage("RenderOverlay:MonoGetLocalPlayer");
       last_ok = MonoGetLocalPlayer(last_info);
       if (last_ok) {
@@ -344,15 +451,15 @@ void RenderOverlay(bool* menu_open) {
     last_update = now;
   }
 
-  if (mono_ready && !session_master_transitioning && now - last_master_state_update > 500) {
+  if (mono_ready && allow_read_player && now - last_master_state_update > 500) {
     is_real_master = MonoIsRealMasterClient();
     last_master_state_update = now;
-  } else if (!mono_ready || session_master_transitioning) {
+  } else if (!mono_ready || !allow_read_player) {
     is_real_master = false;
   }
 
   // Round/haul state refresh (关卡收集阶段)
-  if (mono_ready && !session_master_transitioning && safe_to_refresh && now - last_round_update > 500) {
+  if (mono_ready && allow_read_player && safe_to_refresh && now - last_round_update > 500) {
     RoundState rs{};
     RoundProgressState rps{};
     if (MonoGetRoundState(rs) && rs.ok) {
@@ -387,14 +494,39 @@ void RenderOverlay(bool* menu_open) {
       has_round_progress = false;
     }
     last_round_update = now;
+  } else if (!mono_ready || !allow_read_player) {
+    has_round_state = false;
+    has_round_progress = false;
+  }
+
+  if (mono_ready && safe_to_refresh && now - last_level_info_update > 500) {
+    RunLevelInfo level_info{};
+    if (MonoGetRunLevelInfo(level_info) && level_info.ok) {
+      has_level_info = true;
+      cached_level_info = level_info;
+    }
+    else {
+      has_level_info = false;
+      cached_level_info = RunLevelInfo{};
+    }
+    last_level_info_update = now;
   }
 
   auto refresh_items = [&]() {
     if (!mono_ready) return;
     if (session_master_transitioning) return;
+    if (!allow_scan_items) return;
+    if (scan_pause_pending) return;
     if (g_items_disabled) return;
-    // 仅在有可靠本地玩家坐标时刷新，避免主菜单/加载场景扫物品导致崩溃
-    if (!last_ok || !last_state.has_position) return;
+    SetCrashStage("RenderOverlay:MonoGetLocalPlayer(refresh_items)");
+    last_ok = MonoGetLocalPlayer(last_info);
+    if (!last_ok) return;
+    SetCrashStage("RenderOverlay:MonoGetLocalPlayerState(refresh_items)");
+    if (!MonoGetLocalPlayerState(last_state) || !last_state.has_position) {
+      last_ok = false;
+      return;
+    }
+    last_update = now;
     SetCrashStage("RenderOverlay:MonoListItems");
     MonoListItemsSafe(g_cached_items);
     last_items_update = now;
@@ -402,11 +534,25 @@ void RenderOverlay(bool* menu_open) {
   auto refresh_enemies = [&]() {
     if (!mono_ready) return;
     if (session_master_transitioning) return;
+    if (!allow_scan_enemies) return;
+    if (scan_pause_pending) return;
     if (g_enemy_esp_disabled) return;
-    if (!last_ok || !last_state.has_position) return;
+    SetCrashStage("RenderOverlay:MonoGetLocalPlayer(refresh_enemies)");
+    last_ok = MonoGetLocalPlayer(last_info);
+    if (!last_ok) return;
+    SetCrashStage("RenderOverlay:MonoGetLocalPlayerState(refresh_enemies)");
+    if (!MonoGetLocalPlayerState(last_state) || !last_state.has_position) {
+      last_ok = false;
+      return;
+    }
+    last_update = now;
     SetCrashStage("RenderOverlay:MonoListEnemies");
     MonoListEnemiesSafe(g_cached_enemies);
     last_enemies_update = now;
+  };
+  auto pause_scans_for_mutation = [&]() {
+    scan_pause_pending = true;
+    scan_pause_stable_samples = 0;
   };
   auto normalize_squad_selection = [&]() {
     if (squad_states.empty()) {
@@ -437,7 +583,7 @@ void RenderOverlay(bool* menu_open) {
   };
   auto refresh_squad = [&]() {
     if (!mono_ready) return;
-    if (session_master_transitioning) return;
+    if (!allow_read_player) return;
     MonoListPlayers(squad_states, include_local_squad);
     normalize_squad_selection();
     last_squad_update = now;
@@ -448,7 +594,7 @@ void RenderOverlay(bool* menu_open) {
   };
   auto refresh_matrices = [&]() {
     if (!mono_ready) return;
-    if (session_master_transitioning) return;
+    if (!allow_read_player) return;
     if (!last_ok || !last_state.has_position) return;
     SetCrashStage("RenderOverlay:MonoGetCameraMatrices");
     Matrix4x4 v{}, p{};
@@ -459,8 +605,8 @@ void RenderOverlay(bool* menu_open) {
       g_last_matrix_update = now;
     }
   };
-  // 高频刷新：降低到约 60ms，保证快速转镜时缓存不滞后
-  if (mono_ready && auto_refresh_items && now - last_items_update > 60) {
+  // 高频刷新：约 120ms，降低加载期抖动与崩溃风险
+  if (mono_ready && auto_refresh_items && now - last_items_update > 120) {
     refresh_items();
   }
   if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 180) {
@@ -469,21 +615,35 @@ void RenderOverlay(bool* menu_open) {
   if (mono_ready && safe_to_refresh && now - last_squad_update > 500) {
     refresh_squad();
   }
-  if (mono_ready && !session_master_transitioning && now - g_last_matrix_update > 33) {
+  if (mono_ready && allow_read_player && now - g_last_matrix_update > 33) {
     refresh_matrices();
   }
 
-  if (mono_ready && !session_master_transitioning) {
+  if (mono_ready && allow_mutate_round) {
     if (round_lock_enabled) {
-      int target_goal = round_goal_edit > 0 ? round_goal_edit
-        : ((has_round_state && cached_round_state.goal > 0) ? cached_round_state.goal : round_current_edit);
-      int target_cur = round_current_edit > 0 ? round_current_edit : target_goal;
+      // Respect explicit zero values from UI; only fallback when user sets negative.
+      int target_goal = round_goal_edit;
+      if (target_goal < 0 && has_round_state && cached_round_state.goal > 0) {
+        target_goal = cached_round_state.goal;
+      }
+      int target_cur = round_current_edit;
+      if (target_cur < 0) {
+        target_cur = (has_round_state && cached_round_state.current > 0)
+          ? cached_round_state.current
+          : ((target_goal > 0) ? target_goal : 0);
+      }
+      // Lock mode should be conservative by default: do not exceed goal unless user edits explicitly.
+      if (target_goal > 0 && target_cur > target_goal) {
+        target_cur = target_goal;
+      }
       MonoSetRoundHaulOverride(true, target_cur, target_goal);
     }
     else {
       MonoSetRoundHaulOverride(false, 0, -1);
     }
-  } else if (mono_ready) {
+  } else if (mono_ready && round_lock_enabled) {
+    // Changing scene or restarting can leave stale lock values that auto-complete next round.
+    round_lock_enabled = false;
     MonoSetRoundHaulOverride(false, 0, -1);
   }
 
@@ -507,7 +667,7 @@ void RenderOverlay(bool* menu_open) {
   };
 
   // Native in-game highlight (ValuableDiscover) with SEH guard
-  if (mono_ready && !session_master_transitioning &&
+  if (mono_ready && allow_scan_items &&
     g_esp_enabled && g_native_highlight_active &&
     MonoValueFieldsResolved() && MonoNativeHighlightAvailable()) {
     native_highlight(now);
@@ -550,7 +710,6 @@ void RenderOverlay(bool* menu_open) {
       ImGui::Text("来源: %s | 指针: %p | isLocal: %s",
         last_info.via_player_list ? "GameDirector.PlayerList" : "SemiFunc.PlayerAvatarLocal",
         last_info.object, last_info.is_local ? "true" : "false");
-
       ImGui::Spacing();
       if (ImGui::BeginTabBar("repo_tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
         // 玩家页
@@ -558,6 +717,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::BeginGroup();
           ImGui::Checkbox("自动刷新", &auto_refresh);
           ImGui::SameLine();
+          ImGui::BeginDisabled(!allow_read_player);
           if (ImGui::Button("刷新")) {
             last_ok = MonoGetLocalPlayer(last_info);
             if (last_ok) {
@@ -566,7 +726,14 @@ void RenderOverlay(bool* menu_open) {
             inputs_synced = false;
             last_update = now;
           }
+          ImGui::EndDisabled();
           ImGui::EndGroup();
+          if (!allow_read_player) {
+            ImGui::TextDisabled("玩家读取受限: %s", gate_reason_text.c_str());
+          }
+          if (!allow_mutate_player) {
+            ImGui::TextDisabled("玩家修改受限: %s", gate_reason_text.c_str());
+          }
 
           SectionLabel("实时状态");
           ImGui::BeginGroup();
@@ -579,6 +746,7 @@ void RenderOverlay(bool* menu_open) {
           ImGui::EndGroup();
 
           SectionLabel("编辑 / 应用");
+          ImGui::BeginDisabled(!allow_mutate_player);
           if (ImGui::BeginTable("edit_table", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 2.0f);
@@ -644,85 +812,19 @@ void RenderOverlay(bool* menu_open) {
 
             ImGui::EndTable();
           }
+          ImGui::EndDisabled();
 
           SectionLabel("功能修改");
+          ImGui::BeginDisabled(!allow_mutate_player);
           if (ImGui::BeginTable("mods_table", 2, ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 2.0f);
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text("金钱/总价值联动");
-            ImGui::TableSetColumnIndex(1);
-            bool money_commit = false;
-            if (ImGui::InputInt("##money", &currency_edit, 0, 0,
-              ImGuiInputTextFlags_EnterReturnsTrue) ||
-              ImGui::IsItemDeactivatedAfterEdit()) {
-              money_commit = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("应用")) {
-              money_commit = true;
-            }
-              if (money_commit) {
-                MonoSetRunCurrency(currency_edit);
-                MonoSetCartValueSafe(currency_edit);
-              }
-              if (has_currency) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("当前: %d (总金库)", current_currency);
-              }
-
-              ImGui::TableNextRow();
-              ImGui::TableSetColumnIndex(0);
-              ImGui::Text("关卡收集 (局内)");
-            ImGui::TableSetColumnIndex(1);
-            ImGui::BeginGroup();
-            if (has_round_state) {
-              ImGui::TextDisabled("当前 %d / 目标 %d",
-                cached_round_state.current,
-                cached_round_state.goal);
-              if (cached_round_state.current_max > 0) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("Max %d", cached_round_state.current_max);
-              }
-              if (cached_round_state.stage >= 0) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("阶段 %d", cached_round_state.stage);
-              }
-              bool round_apply = false;
-              if (ImGui::InputInt("当前值##haul_cur", &round_current_edit, 0, 0,
-                ImGuiInputTextFlags_EnterReturnsTrue) ||
-                ImGui::IsItemDeactivatedAfterEdit()) {
-                round_apply = true;
-              }
-              if (ImGui::InputInt("目标值##haul_goal", &round_goal_edit, 0, 0,
-                ImGuiInputTextFlags_EnterReturnsTrue) ||
-                ImGui::IsItemDeactivatedAfterEdit()) {
-                round_apply = false;  // only apply when user clicks
-              }
-              ImGui::SameLine();
-            if (ImGui::Button("当前=目标##copy_goal")) {
-              round_current_edit = round_goal_edit;
-              round_apply = true;
-            }
-            if (round_apply) {
-              MonoSetRoundStateSafe(round_current_edit, round_goal_edit, round_current_edit);
-            }
-            ImGui::Checkbox("超级补丁大法", &round_lock_enabled);
-            ImGui::SameLine();
-            ImGui::TextDisabled("ZW[ZIWEI]");
-
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
             ImGui::Text("防摔倒/击倒");
             ImGui::TableSetColumnIndex(1);
             ImGui::Checkbox("防摔倒", &no_fall_enabled);
-            }
-            else {
-              ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "未找到 RoundDirector (请在局内)");
-            }
-            ImGui::EndGroup();
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -807,12 +909,19 @@ void RenderOverlay(bool* menu_open) {
 
             ImGui::EndTable();
           }
+          ImGui::EndDisabled();
           ImGui::EndTabItem();
         }
 
-        // 经济 / 关卡页
-        if (ImGui::BeginTabItem("经济/关卡")) {
-          SectionLabel("总金库");
+        // 金钱管理页
+        if (ImGui::BeginTabItem("金钱管理大师")) {
+          SectionLabel("金钱/总价值联动");
+          if (!allow_mutate_economy) {
+            ImGui::TextDisabled("经济修改受限: %s", gate_reason_text.c_str());
+          }
+          if (!allow_mutate_round) {
+            ImGui::TextDisabled("关卡收集修改受限: %s", gate_reason_text.c_str());
+          }
           if (has_currency) {
             ImGui::TextDisabled("当前总金库: %d", current_currency);
           }
@@ -820,16 +929,47 @@ void RenderOverlay(bool* menu_open) {
             ImGui::TextDisabled("当前总金库: 无数据");
           }
           ImGui::SameLine();
+          ImGui::BeginDisabled(!allow_read_player);
           if (ImGui::Button("读取##econ_refresh_currency")) {
             has_currency = MonoGetRunCurrency(current_currency);
           }
+          ImGui::EndDisabled();
+          ImGui::BeginDisabled(!allow_mutate_economy);
           ImGui::InputInt("目标金额##econ_currency", &currency_edit, 0, 0);
-          if (ImGui::Button("应用总金库##econ_apply_currency")) {
+          if (ImGui::Button("应用修改器数值##econ_apply_currency")) {
+            pause_scans_for_mutation();
             MonoSetRunCurrency(currency_edit);
             has_currency = MonoGetRunCurrency(current_currency);
           }
+          ImGui::SameLine();
+          if (ImGui::Button("同步收集器(危险)##econ_apply_currency_cart")) {
+            pause_scans_for_mutation();
+            MonoSetCartValueSafe(currency_edit);
+          }
+          ImGui::EndDisabled();
+          ImGui::TextDisabled("默认只改金钱；右侧按钮才会改收集器，可能导致直接通关。");
 
-          SectionLabel("收集器价格");
+          SectionLabel("关卡状态");
+          const char* current_level_name = cached_level_info.current_level.empty()
+            ? "未知"
+            : cached_level_info.current_level.c_str();
+          const char* previous_level_name = cached_level_info.previous_level.empty()
+            ? "未知"
+            : cached_level_info.previous_level.c_str();
+          if (has_level_info) {
+            ImGui::TextDisabled("当前地图: %s", current_level_name);
+            ImGui::TextDisabled("上一地图: %s", previous_level_name);
+            ImGui::TextDisabled("状态: %s",
+              cached_level_info.transitioning ? "切换中/加载中" : "稳定");
+          }
+          else if (session_master_transitioning) {
+            ImGui::TextDisabled("状态: 切换中/加载中 (等待关卡初始化)");
+          }
+          else {
+            ImGui::TextDisabled("状态: 无法读取关卡信息");
+          }
+
+          SectionLabel("关卡收集（局内）");
           int display_stage = cached_round_state.stage;
           if (display_stage < 0 && has_round_progress && cached_round_progress.completed >= 0) {
             display_stage = cached_round_progress.completed;
@@ -842,8 +982,14 @@ void RenderOverlay(bool* menu_open) {
               display_stage);
           }
           else {
-            ImGui::TextDisabled("RoundDirector 无数据（请在局内）");
+            if (session_master_transitioning) {
+              ImGui::TextDisabled("RoundDirector 暂无数据：关卡切换中/加载中");
+            }
+            else {
+              ImGui::TextDisabled("RoundDirector 暂无数据：当前场景未初始化");
+            }
           }
+          ImGui::BeginDisabled(!allow_mutate_round);
           ImGui::InputInt("收集器当前##econ_haul_cur", &round_current_edit, 0, 0);
           ImGui::InputInt("收集器目标##econ_haul_goal", &round_goal_edit, 0, 0);
           if (ImGui::Button("当前=目标##econ_copy_goal")) {
@@ -851,10 +997,12 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::SameLine();
           if (ImGui::Button("应用收集器数值##econ_apply_haul")) {
+            pause_scans_for_mutation();
             MonoSetRoundStateSafe(round_current_edit, round_goal_edit, round_current_edit);
           }
           ImGui::Checkbox("锁定收集器(超级补丁大法)##econ_round_lock", &round_lock_enabled);
-          ImGui::TextDisabled("说明: 开启后会拦截 RoundDirector.Update 的重算，按你设定值显示。");
+          ImGui::EndDisabled();
+          ImGui::TextDisabled("说明: 开启后会拦截 RoundDirector.Update 的重算；切图/重启会自动关闭。");
 
           SectionLabel("关卡切换 / 进度");
           int display_progress_stage = cached_round_progress.stage;
@@ -869,13 +1017,20 @@ void RenderOverlay(bool* menu_open) {
               display_progress_stage);
           }
           else {
-            ImGui::TextDisabled("进度字段无数据（请在局内）");
+            if (session_master_transitioning) {
+              ImGui::TextDisabled("进度字段暂无数据：关卡切换中/加载中");
+            }
+            else {
+              ImGui::TextDisabled("进度字段暂无数据：当前场景未初始化");
+            }
           }
+          ImGui::BeginDisabled(!allow_mutate_round);
           ImGui::InputInt("已完成##econ_progress_done", &round_progress_completed_edit, 0, 0);
           ImGui::InputInt("总节点##econ_progress_total", &round_progress_total_edit, 0, 0);
           ImGui::InputInt("阶段##econ_progress_stage", &round_stage_edit, 0, 0);
           ImGui::Checkbox("全部完成##econ_progress_all", &round_progress_all_completed_edit);
           if (ImGui::Button("应用进度##econ_apply_progress")) {
+            pause_scans_for_mutation();
             MonoSetRoundProgressSafe(
               round_progress_completed_edit,
               round_progress_total_edit,
@@ -884,6 +1039,7 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::SameLine();
           if (ImGui::Button("下一节点##econ_next_progress")) {
+            pause_scans_for_mutation();
             ++round_progress_completed_edit;
             MonoSetRoundProgressSafe(
               round_progress_completed_edit,
@@ -891,6 +1047,8 @@ void RenderOverlay(bool* menu_open) {
               round_stage_edit,
               -1);
           }
+          ImGui::EndDisabled();
+          ImGui::BeginDisabled(!allow_read_player);
           if (ImGui::Button("读取全部状态##econ_refresh_all")) {
             has_currency = MonoGetRunCurrency(current_currency);
             RoundState rs{};
@@ -904,6 +1062,7 @@ void RenderOverlay(bool* menu_open) {
               cached_round_progress = rps;
             }
           }
+          ImGui::EndDisabled();
           ImGui::EndTabItem();
         }
 
@@ -918,16 +1077,22 @@ void RenderOverlay(bool* menu_open) {
             g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
           }
           ImGui::SameLine();
+          ImGui::BeginDisabled(!allow_scan_items);
           ImGui::Checkbox("自动刷新", &auto_refresh_items);
           ImGui::SameLine();
           if (ImGui::Button("刷新物品")) refresh_items();
+          ImGui::EndDisabled();
           ImGui::EndGroup();
+          if (!allow_scan_items) {
+            ImGui::TextDisabled("物品扫描受限: %s", gate_reason_text.c_str());
+          }
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_items.size()));
           if (MonoItemsDisabled()) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.9f, 0.45f, 0.35f, 1.0f), "物品扫描已自动关闭(崩溃保护)");
           }
+          ImGui::BeginDisabled(!allow_scan_items);
           if (ImGui::Button("安全刷新一次")) {
             MonoManualRefreshItems(g_cached_items);
             last_items_update = now;
@@ -936,6 +1101,7 @@ void RenderOverlay(bool* menu_open) {
           if (ImGui::Button("重置物品禁用")) {
             MonoResetItemsDisabled();
           }
+          ImGui::EndDisabled();
           ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
           ImGui::SliderInt("敌人ESP上限", &g_enemy_esp_cap, 0, 512);
 
@@ -1023,13 +1189,18 @@ void RenderOverlay(bool* menu_open) {
 
         // 队友/复活
         if (ImGui::BeginTabItem("队友")) {
+          ImGui::BeginDisabled(!allow_read_player);
           if (ImGui::Checkbox("包含自己", &include_local_squad)) {
             refresh_squad();
           }
           ImGui::SameLine();
           if (ImGui::Button("刷新队友")) refresh_squad();
+          ImGui::EndDisabled();
+          if (!allow_read_player) {
+            ImGui::TextDisabled("队友读取受限: %s", gate_reason_text.c_str());
+          }
           ImGui::SameLine();
-          ImGui::BeginDisabled(!is_real_master);
+          ImGui::BeginDisabled(!(is_real_master && allow_mutate_player));
           if (ImGui::Button("复活队友")) {
             MonoReviveAllPlayers(false);
             refresh_squad();
@@ -1043,7 +1214,9 @@ void RenderOverlay(bool* menu_open) {
           ImGui::SameLine();
           ImGui::TextDisabled("队友数: %d", static_cast<int>(squad_states.size()));
           ImGui::SameLine();
-          ImGui::TextDisabled("你是房主: %s", is_real_master ? "是" : "否");
+          ImGui::TextDisabled("你是房主: %s | 可写队友: %s",
+            is_real_master ? "是" : "否",
+            (is_real_master && allow_mutate_player) ? "是" : "否");
 
           normalize_squad_selection();
           const PlayerState* selected_state = nullptr;
@@ -1063,7 +1236,7 @@ void RenderOverlay(bool* menu_open) {
             if (selected_state->has_object) {
               void* selected_obj = selected_state->object;
               bool squad_need_refresh = false;
-              const bool can_manage_squad = is_real_master;
+              const bool can_manage_squad = is_real_master && allow_mutate_player;
               ImGui::SetNextItemWidth(120.0f);
               ImGui::InputInt("目标生命##squad_hp", &squad_target_health, 1, 20);
               ImGui::SameLine();
@@ -1207,10 +1380,12 @@ void RenderOverlay(bool* menu_open) {
             MonoResetItemsDisabled();
           }
           ImGui::SameLine();
+          ImGui::BeginDisabled(!allow_scan_items);
           if (ImGui::Button("手动刷新物品")) {
             MonoManualRefreshItems(g_cached_items);
             last_items_update = now;
           }
+          ImGui::EndDisabled();
           ImGui::SameLine();
           ImGui::TextDisabled("敌人禁用: %s", g_enemy_esp_disabled ? "是" : "否");
           ImGui::SameLine();
@@ -1287,10 +1462,15 @@ void RenderOverlay(bool* menu_open) {
             g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
           }
           ImGui::SameLine();
+          ImGui::BeginDisabled(!allow_scan_enemies);
           ImGui::Checkbox("自动刷新", &auto_refresh_enemies);
           ImGui::SameLine();
           if (ImGui::Button("刷新敌人")) refresh_enemies();
+          ImGui::EndDisabled();
           ImGui::EndGroup();
+          if (!allow_scan_enemies) {
+            ImGui::TextDisabled("敌人扫描受限: %s", gate_reason_text.c_str());
+          }
           ImGui::SameLine();
           ImGui::TextDisabled("共 %d", static_cast<int>(g_cached_enemies.size()));
           if (g_enemy_esp_disabled) {
@@ -1394,6 +1574,35 @@ void RenderOverlay(bool* menu_open) {
             }
           }
 
+          SectionLabel("第三人称");
+          bool third_person_enabled = GetThirdPersonEnabled();
+          if (ImGui::Checkbox("启用第三人称视角", &third_person_enabled)) {
+            SetThirdPersonEnabled(third_person_enabled);
+          }
+          ImGui::TextDisabled("开启=第三人称，关闭=第一人称");
+          ImGui::SliderFloat("第三人称后移距离", &third_person_distance, 0.5f, 8.0f, "%.2f");
+          ImGui::SliderFloat("第三人称高度", &third_person_height, -0.5f, 3.0f, "%.2f");
+          ImGui::SliderFloat("第三人称肩位偏移", &third_person_shoulder, -2.0f, 2.0f, "%.2f");
+          ImGui::SliderFloat("第三人称平滑", &third_person_smooth, 0.2f, 15.0f, "%.2f");
+          const int third_person_vk = GetThirdPersonToggleVirtualKey();
+          const std::string third_person_vk_name = MenuHotkeyName(third_person_vk);
+          ImGui::Text("第三人称切换键: %s", third_person_vk_name.c_str());
+          ImGui::SameLine();
+          if (third_person_vk == VK_F6) {
+            ImGui::TextDisabled("(默认 F6)");
+          }
+          if (IsThirdPersonToggleKeyCaptureActive()) {
+            ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.28f, 1.0f), "监听中... 按任意键 (Esc 取消)");
+          } else {
+            if (ImGui::Button("监听第三人称按键")) {
+              BeginThirdPersonToggleKeyCapture();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("恢复默认 F6")) {
+              SetThirdPersonToggleVirtualKey(VK_F6);
+            }
+          }
+
           SectionLabel("持久化操作");
             if (ImGui::Button("保存设置")) {
               saved.auto_refresh = auto_refresh;
@@ -1406,6 +1615,12 @@ void RenderOverlay(bool* menu_open) {
               saved.speed_mult = speed_mult;
               saved.reset_each_round = reset_each_round;
               saved.menu_toggle_vk = GetMenuToggleVirtualKey();
+              saved.third_person_enabled = GetThirdPersonEnabled();
+              saved.third_person_toggle_vk = GetThirdPersonToggleVirtualKey();
+              saved.third_person_distance = third_person_distance;
+              saved.third_person_height = third_person_height;
+              saved.third_person_shoulder = third_person_shoulder;
+              saved.third_person_smooth = third_person_smooth;
               saved.log_path = log_path_buf;
               SaveSettings(saved);
             }
@@ -1422,6 +1637,12 @@ void RenderOverlay(bool* menu_open) {
                 speed_mult = saved.speed_mult;
                 reset_each_round = saved.reset_each_round;
                 SetMenuToggleVirtualKey(saved.menu_toggle_vk);
+                SetThirdPersonToggleVirtualKey(saved.third_person_toggle_vk);
+                SetThirdPersonEnabled(saved.third_person_enabled);
+                third_person_distance = saved.third_person_distance;
+                third_person_height = saved.third_person_height;
+                third_person_shoulder = saved.third_person_shoulder;
+                third_person_smooth = saved.third_person_smooth;
                 g_esp_enabled = g_item_esp_enabled || g_enemy_esp_enabled || g_native_highlight_active;
                 if (!saved.log_path.empty()) {
                   strncpy_s(log_path_buf, saved.log_path.c_str(), sizeof(log_path_buf) - 1);
@@ -1435,6 +1656,12 @@ void RenderOverlay(bool* menu_open) {
               g_item_esp_enabled, g_enemy_esp_enabled, g_native_highlight_active, no_fall_enabled,
               speed_mult, extra_jump_count, infinite_jump_enabled, god_mode_enabled);
             SetMenuToggleVirtualKey(VK_INSERT);
+            SetThirdPersonToggleVirtualKey(VK_F6);
+            SetThirdPersonEnabled(false);
+            third_person_distance = 2.8f;
+            third_person_height = 1.15f;
+            third_person_shoulder = 0.35f;
+            third_person_smooth = 2.0f;
             g_esp_enabled = false;
           }
 
@@ -1450,16 +1677,27 @@ void RenderOverlay(bool* menu_open) {
 
   static uint64_t maint_probe_last = 0;
   static bool maint_has_local_player = false;
-  if (mono_ready && !session_master_transitioning && now - maint_probe_last > 250) {
+  if (mono_ready && allow_read_player && now - maint_probe_last > 250) {
     LocalPlayerInfo probe_info{};
     maint_has_local_player = MonoGetLocalPlayer(probe_info);
     maint_probe_last = now;
-  } else if (!mono_ready || session_master_transitioning) {
+  } else if (!mono_ready || !allow_read_player) {
     maint_has_local_player = false;
   }
 
+  if (mono_ready && allow_read_player) {
+    SetCrashStage("RenderOverlay:MonoSetThirdPerson");
+    MonoSetThirdPerson(
+      GetThirdPersonEnabled(),
+      third_person_distance,
+      third_person_height,
+      third_person_shoulder,
+      third_person_smooth);
+    SetCrashStage("RenderOverlay:postMonoSetThirdPerson");
+  }
+
   // Auto-maintenance toggles
-  if (mono_ready && maint_has_local_player && !session_master_transitioning) {
+  if (mono_ready && maint_has_local_player && allow_mutate_player) {
     if (no_fall_enabled) {
       MonoSetInvincible(2.0f);
       MonoOverrideJumpCooldown(0.0f);

@@ -1,38 +1,35 @@
-﻿# RepoDLL 说明（联机 / 同步 / 稳定性）
+﻿# RepoDLL 使用说明
 
-## 1. 这个游戏的联机通信方式
-- 联机框架是 `Photon PUN`（`Photon.Pun` + `Photon.Realtime`）。
-- Session 本质是 Photon Room。
-- 核心同步通过：
-  - `PhotonView.RPC(...)`
-  - `IPunObservable.OnPhotonSerializeView(...)`
-- 权限判断由 `SemiFunc` 系列方法统一控制（`IsMasterClient*`, `MasterOnlyRPC`, `OwnerOnlyRPC` 等）。
+## 1. 项目说明
+- 本项目为 RepoDLL 注入模块与 UI 工具集。
+- 主要功能包括玩家状态修改、物品/敌人 ESP、队友信息查看与局内调试。
 
-## 2. 为什么“本地强制变房主”无法真正全局同步
-- 本地 patch 只能修改本进程判定，不能改变房间内其他客户端/服务端的权威状态。
-- Photon 的真实房主（`MasterClient`）不是靠本地 bool 改出来的，需要网络层真实切主成功。
-- 当强制把 `OwnerOnlyRPC/MasterOnlyRPC` 一类检查改成恒 true 时，会破坏原本的所有权约束，常见后果：
-  - 抓取状态错乱
-  - 物体交互异常
-  - 看起来“本地成功”，但队友端不同步
+## 2. 作者声明 / 免责声明
+- 本仓库由我维护与整理，但原始历史源码来源复杂，原始作者信息并不完整。
+- 原始源码版权不归我所有，与我个人无关；如涉及侵权请联系处理，我会配合删除相关内容。
+- 本项目仅作学习与研究用途，使用行为及后果由使用者自行承担。
 
-## 3. 本次修复与策略调整
-- `Session master` 功能已默认停用（稳定性优先）。
-- 不再使用高风险的 RPC 权限强制路径来“伪装房主”。
-- 抓力修改改为本地字段路径优先，避免触发联机所有权冲突。
-- 场景切换/回主菜单期间，减少高频写入与相机矩阵拉取，降低崩溃概率。
-- 退出卸载时会主动恢复残留 patch，避免脏状态带出。
+## 3. 快速使用
+1. 使用 `x64` 配置编译 DLL（建议 `Release`）。
+2. 进入游戏后将 DLL 注入到游戏进程。
+3. 默认菜单开关键为 `INS`。
+4. 菜单内可通过“监听按键修改”更换菜单按键。
 
-## 4. 已知限制
-- 非真实房主情况下，涉及权威端写入的功能（尤其网络物理/抓取/部分货币链路）仍可能被房主状态覆盖。
-- 这属于联机模型限制，不是单个函数名 patch 就能彻底解决。
+## 4. 功能使用
+- 玩家页：位置、生命、体力、移动相关修改。
+- 经济/关卡：货币与关卡收集数值相关功能。
+- ESP：物品与敌人显示，默认上限为物品 `65`、敌人 `8`。
+- 队友页：支持队友列表、坐标与状态查看。
+- 队友操作限制：传送/拉取/改队友状态仅在你是真实房主时可用，非房主只可查看。
+- 稳定性策略：`Session master` 强制功能已停用，不再提供伪房主入口。
 
-## 5. 日志排查建议
+## 5. 日志与排查
 - 日志目录：`C:\Users\dwgx1\AppData\LocalLow\semiwork\Repo\repodll`
-- 重点看：
-  - `SessionTransitionGuard: ...`
-  - `MonoGetLocalPlayer ...`
-  - `MonoGetCameraMatrices ...`
-  - `MonoSetGrabStrength ...`
+- 常看文件：`REPO_LOG.txt`、`REPO_CRASH.txt`
+- 建议关注关键字：`MonoGetLocalPlayer`、`MonoGetCameraMatrices`、`MonoSetGrabStrength`、`SessionTransitionGuard`
 
-如果后续要恢复“会话主人”实验功能，建议单独开测试分支，不要在日常联机版本启用。
+## 附录 A：联机通信方式说明
+- 本游戏联机基于 `Photon PUN`（`Photon.Pun` + `Photon.Realtime`）。
+- Session 本质是 Photon Room，权威角色是 `MasterClient`。
+- 核心同步接口为 `PhotonView.RPC(...)` 与 `IPunObservable.OnPhotonSerializeView(...)`。
+- 结论：本地篡改判定无法等价于真实切主，因此无法保证全房间全功能同步。
