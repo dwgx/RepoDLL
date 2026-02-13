@@ -160,6 +160,8 @@ namespace {
   // Forward declarations for enemy cache helpers / hooks
   static bool EnsureMinHookReady();
   static bool IsUnityNull(MonoObject* obj);
+  static int EnumerateListObjects(
+    MonoObject* list_obj, const std::function<bool(MonoObject*)>& on_elem);
   static void EnemyCacheAdd(MonoObject* obj);
   static void EnemyCachePruneDead();
   static void __stdcall EnemyAwakeHook(MonoObject* self);
@@ -8241,7 +8243,8 @@ bool MonoSetCartValueSafe(int value) {
 }
 
 // Non-ASCII comment normalized.
-int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObject*)>& on_elem) {
+namespace {
+static int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObject*)>& on_elem) {
   if (!list_obj || !on_elem) return 0;
   MonoClass* cls = g_mono.mono_object_get_class(list_obj);
   if (!cls) return 0;
@@ -8297,6 +8300,7 @@ int EnumerateListObjects(MonoObject* list_obj, const std::function<bool(MonoObje
   }
   return count;
 }
+}  // namespace
 
 bool MonoListPlayers(std::vector<PlayerState>& out_states, bool include_local) {
   out_states.clear();

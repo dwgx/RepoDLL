@@ -2,4 +2,5 @@
 * text=auto
 
 # Hide third party code from language stats
-RepoDLL/third_party/** linguist-vendored=true
+RepoDLL/third_party/** linguist-vendored
+RepoDLL/third_party/minhook/** linguist-detectable=false
