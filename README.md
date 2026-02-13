@@ -23,7 +23,7 @@
 - 稳定性策略：`Session master` 强制功能已停用，不再提供伪房主入口。
 
 ## 5. 日志与排查
-- 日志目录：`C:\Users\dwgx1\AppData\LocalLow\semiwork\Repo\repodll`
+- 日志目录：`C:\Users\username\AppData\LocalLow\semiwork\Repo\repodll`
 - 常看文件：`REPO_LOG.txt`、`REPO_CRASH.txt`
 - 建议关注关键字：`MonoGetLocalPlayer`、`MonoGetCameraMatrices`、`MonoSetGrabStrength`、`SessionTransitionGuard`
 
