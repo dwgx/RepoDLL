@@ -197,7 +197,10 @@ namespace {
 
   MonoApi g_mono;
   MonoDomain* g_domain = nullptr;
-  DWORD g_attached_thread_id = 0;
+  // Mono thread attachment must be tracked per-native-thread.
+  // A single global thread id causes two active threads to repeatedly
+  // re-attach and spam logs ("Attached thread to Mono domain").
+  thread_local MonoDomain* g_tls_attached_domain = nullptr;
 
   MonoImage* g_image = nullptr;
   MonoClass* g_game_director_class = nullptr;
@@ -249,6 +252,9 @@ namespace {
   MonoClassField* g_camera_position_instance_field = nullptr;
   MonoClassField* g_camera_position_player_offset_field = nullptr;
   MonoClassField* g_camera_position_position_smooth_field = nullptr;
+  MonoClass* g_camera_aim_class = nullptr;
+  MonoVTable* g_camera_aim_vtable = nullptr;
+  MonoClassField* g_camera_aim_instance_field = nullptr;
   MonoClass* g_component_class = nullptr;
   MonoMethod* g_component_get_transform = nullptr;
   MonoMethod* g_component_get_game_object = nullptr;
@@ -267,6 +273,7 @@ namespace {
   MonoClass* g_transform_class = nullptr;
   MonoMethod* g_transform_get_local_to_world = nullptr;
   MonoMethod* g_transform_get_world_to_local = nullptr;
+  MonoMethod* g_transform_get_local_euler_angles = nullptr;
   MonoClass* g_behaviour_class = nullptr;
   MonoMethod* g_behaviour_get_enabled = nullptr;
   MonoMethod* g_behaviour_set_enabled = nullptr;
@@ -479,6 +486,7 @@ namespace {
   float g_third_person_last_offset[3] = { 0.0f, 0.0f, 0.0f };
   float g_third_person_last_smooth = 2.0f;
   uint64_t g_third_person_last_missing_log_ms = 0;
+  uint64_t g_third_person_last_apply_log_ms = 0;
   MonoObject* g_third_person_bound_mesh_parent = nullptr;
   MonoObject* g_third_person_bound_animator = nullptr;
   bool g_third_person_original_mesh_parent_active = false;
@@ -499,16 +507,23 @@ namespace {
   constexpr bool k_enable_session_master_patch = false;
   // Disabled: RPC-based grab upgrades can affect multiplayer ownership/state unexpectedly.
   constexpr bool k_enable_grab_rpc_upgrades = false;
+  // Keep haul edits and progress edits decoupled:
+  // MonoSetRoundState should not auto-mark stage completion.
+  bool k_round_state_updates_progress = false;
   // Third-person local model visibility support.
   // We keep local-visual toggles enabled, but apply them on a Unity main-thread hook
   // (PlayerAvatarVisuals::Update). Direct Present-thread writes remain disabled.
   constexpr bool k_enable_third_person_local_visuals = true;
   constexpr bool k_enable_third_person_visuals_from_present = false;
   constexpr bool k_enable_third_person_visuals_update_hook = true;
+  // Rotate third-person offset by CameraAim local yaw so camera follows mouse sway.
+  constexpr bool k_enable_third_person_follow_mouse_yaw = true;
   // Disabled by default: aggressive populate calls can race with shop/scene object rebuild and crash.
   constexpr bool k_enable_aggressive_item_population = false;
   // Disabled by default: extra global sweeps are expensive and less stable on scene transitions.
   constexpr bool k_enable_item_global_sweeps = false;
+  // Stability-first: includeInactive enemy scan is crash-prone on some scene states.
+  constexpr bool k_enable_enemy_find_include_inactive = false;
   struct CodePatchBackup {
     std::array<uint8_t, 16> bytes{};
     size_t size{ 0 };
@@ -931,14 +946,15 @@ namespace {
       }
     }
 
-    DWORD thread_id = GetCurrentThreadId();
-    if (g_attached_thread_id != thread_id) {
+    if (g_tls_attached_domain != g_domain) {
       if (!g_mono.mono_thread_attach(g_domain)) {
         AppendLog("mono_thread_attach failed");
         return false;
       }
-      g_attached_thread_id = thread_id;
-      AppendLog("Attached thread to Mono domain");
+      g_tls_attached_domain = g_domain;
+      const DWORD thread_id = GetCurrentThreadId();
+      AppendLogOnce("MonoThreadAttached:" + std::to_string(thread_id),
+                    "Attached thread to Mono domain");
     }
     return true;
   }
@@ -1293,6 +1309,15 @@ namespace {
         AppendLog("Resolved PlayerAvatarVisuals::animator field");
       }
     }
+    if (g_player_avatar_visuals_class && !g_player_avatar_visuals_animation_logic_method) {
+      g_player_avatar_visuals_animation_logic_method =
+        g_mono.mono_class_get_method_from_name(g_player_avatar_visuals_class, "AnimationLogic", 0);
+      if (g_player_avatar_visuals_animation_logic_method) {
+        AppendLog("Resolved PlayerAvatarVisuals::AnimationLogic");
+      } else {
+        AppendLog("Failed to resolve PlayerAvatarVisuals::AnimationLogic");
+      }
+    }
     if (g_player_avatar_visuals_class && !g_player_avatar_visuals_update_hooked) {
       InstallPlayerAvatarVisualsUpdateHook();
     }
@@ -1627,6 +1652,25 @@ namespace {
         AppendLog("Resolved CameraPosition::positionSmooth field");
       }
     }
+    if (!g_camera_aim_class && g_image) {
+      g_camera_aim_class = g_mono.mono_class_from_name(g_image, "", "CameraAim");
+      if (!g_camera_aim_class) {
+        g_camera_aim_class = FindClassAnyAssembly("", "CameraAim");
+      }
+      if (g_camera_aim_class) {
+        AppendLog("Resolved CameraAim class");
+      }
+    }
+    if (g_camera_aim_class && !g_camera_aim_vtable) {
+      g_camera_aim_vtable = g_mono.mono_class_vtable(g_domain, g_camera_aim_class);
+    }
+    if (g_camera_aim_class && !g_camera_aim_instance_field) {
+      g_camera_aim_instance_field =
+        g_mono.mono_class_get_field_from_name(g_camera_aim_class, "Instance");
+      if (g_camera_aim_instance_field) {
+        AppendLog("Resolved CameraAim::Instance field");
+      }
+    }
 
     if (!g_component_class) {
       if (g_unity_image) {
@@ -1816,6 +1860,15 @@ namespace {
       }
       else {
         AppendLog("Failed to resolve Transform::get_worldToLocalMatrix method");
+      }
+    }
+    if (g_transform_class && !g_transform_get_local_euler_angles) {
+      g_transform_get_local_euler_angles =
+        g_mono.mono_class_get_method_from_name(g_transform_class, "get_localEulerAngles", 0);
+      if (g_transform_get_local_euler_angles) {
+        AppendLog("Successfully resolved Transform::get_localEulerAngles method");
+      } else {
+        AppendLog("Failed to resolve Transform::get_localEulerAngles method");
       }
     }
     if (!g_behaviour_class) {
@@ -3377,46 +3430,63 @@ namespace {
   }
 
   void __stdcall PlayerAvatarVisualsUpdateHook(MonoObject* self) {
-    bool is_local_visual = false;
-    bool desired_enabled = false;
-    if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_update_hook &&
-        !g_shutting_down && self && g_player_avatar_vtable &&
-        g_player_avatar_instance_field && g_player_avatar_visuals_field) {
-      MonoObject* local_player = nullptr;
-#ifdef _MSC_VER
-      if (FieldStaticGetObjectSafeSeh(
-            g_player_avatar_vtable, g_player_avatar_instance_field, local_player)) {
-#else
-      g_mono.mono_field_static_get_value(
-        g_player_avatar_vtable, g_player_avatar_instance_field, &local_player);
-      if (local_player) {
-#else
-      if (local_player) {
-#endif
-        if (!IsUnityNull(local_player)) {
-          MonoObject* local_visuals = nullptr;
-#ifdef _MSC_VER
-          if (FieldGetObjectSafeSeh(local_player, g_player_avatar_visuals_field, local_visuals)) {
-#else
-          g_mono.mono_field_get_value(local_player, g_player_avatar_visuals_field, &local_visuals);
-          if (local_visuals) {
-#endif
-            if (local_visuals && !IsUnityNull(local_visuals) && local_visuals == self) {
-              is_local_visual = true;
-              desired_enabled =
-                g_third_person_visual_target_enabled.load(std::memory_order_relaxed);
-              ::ApplyThirdPersonLocalVisualsInternal(desired_enabled);
-            }
-          }
-        }
-      }
-    }
-
     if (g_player_avatar_visuals_update_orig) {
       g_player_avatar_visuals_update_orig(self);
     }
-    if (is_local_visual) {
-      ::ApplyThirdPersonLocalVisualsInternal(desired_enabled);
+    if (!k_enable_third_person_visuals_update_hook || !k_enable_third_person_local_visuals ||
+        g_shutting_down || !self || !g_player_avatar_vtable || !g_player_avatar_instance_field ||
+        !g_player_avatar_visuals_field) {
+      return;
+    }
+
+    MonoObject* local_player = nullptr;
+#ifdef _MSC_VER
+    if (!FieldStaticGetObjectSafeSeh(
+          g_player_avatar_vtable, g_player_avatar_instance_field, local_player)) {
+      return;
+    }
+#else
+    g_mono.mono_field_static_get_value(
+      g_player_avatar_vtable, g_player_avatar_instance_field, &local_player);
+#endif
+    if (!local_player || IsUnityNull(local_player)) {
+      return;
+    }
+
+    MonoObject* local_visuals = nullptr;
+#ifdef _MSC_VER
+    if (!FieldGetObjectSafeSeh(local_player, g_player_avatar_visuals_field, local_visuals)) {
+      return;
+    }
+#else
+    g_mono.mono_field_get_value(local_player, g_player_avatar_visuals_field, &local_visuals);
+#endif
+    if (!local_visuals || IsUnityNull(local_visuals) || local_visuals != self) {
+      return;
+    }
+
+    const bool desired_enabled = g_third_person_visual_target_enabled.load(std::memory_order_relaxed);
+    const float desired_distance =
+      g_third_person_target_distance.load(std::memory_order_relaxed);
+    const float desired_height =
+      g_third_person_target_height.load(std::memory_order_relaxed);
+    const float desired_shoulder =
+      g_third_person_target_shoulder.load(std::memory_order_relaxed);
+    const float desired_smooth =
+      g_third_person_target_smooth.load(std::memory_order_relaxed);
+
+    ::ApplyThirdPersonLocalVisualsInternal(desired_enabled);
+    ::ApplyThirdPersonCameraOffsetInternal(
+      desired_enabled, desired_distance, desired_height, desired_shoulder, desired_smooth);
+
+    if (desired_enabled && g_player_avatar_visuals_animation_logic_method) {
+      static bool logged_local_anim_logic_once = false;
+      if (!logged_local_anim_logic_once) {
+        AppendLog("ThirdPerson: local AnimationLogic reroute enabled");
+        logged_local_anim_logic_once = true;
+      }
+      SafeInvoke(g_player_avatar_visuals_animation_logic_method, self, nullptr,
+                 "PlayerAvatarVisuals.AnimationLogic");
     }
   }
 
@@ -3576,9 +3646,35 @@ namespace {
     return true;
   }
 
+  static void OnEnemyFindObjectsSeh(const char* tag) {
+    g_enemy_esp_disabled = true;
+    g_enemy_cache_disabled = true;
+    g_enemies_ready.store(false, std::memory_order_relaxed);
+    {
+      // Do not free GC handles inside a fault-recovery path; just drop local references.
+      std::lock_guard<std::mutex> lock(g_enemy_cache_mutex);
+      g_enemy_cache.clear();
+    }
+
+    const uint64_t now_ms = GetTickCount64();
+    const int crash_count = g_enemies_crash_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t backoff_ms =
+      (crash_count >= 3) ? 60000ull : ((crash_count == 2) ? 30000ull : 10000ull);
+    g_enemies_retry_after_ms.store(now_ms + backoff_ms, std::memory_order_relaxed);
+
+    std::ostringstream oss;
+    oss << "Enemy scan paused after SafeInvoke SEH"
+        << " tag=" << (tag ? tag : "<null>")
+        << " cooldown=" << (backoff_ms / 1000) << "s"
+        << " crash_count=" << crash_count;
+    AppendLog(oss.str());
+  }
+
   bool ScanEnemiesDirect(std::vector<PlayerState>& out_enemies, int max_count) {
     if (!g_enemy_rigidbody_class) return false;
-    if (!g_object_find_objects_of_type_include_inactive && !g_object_find_objects_of_type) {
+    const bool can_find = g_object_find_objects_of_type ||
+      (k_enable_enemy_find_include_inactive && g_object_find_objects_of_type_include_inactive);
+    if (!can_find) {
       return false;
     }
 
@@ -3590,16 +3686,26 @@ namespace {
     if (!enemy_type_obj) return false;
 
     MonoObject* arr_obj = nullptr;
-    if (g_object_find_objects_of_type_include_inactive) {
+    if (k_enable_enemy_find_include_inactive && g_object_find_objects_of_type_include_inactive) {
+      const uint32_t seh_before = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
       bool include_inactive = true;
       void* args2[2] = { enemy_type_obj, &include_inactive };
       arr_obj = SafeInvoke(g_object_find_objects_of_type_include_inactive, nullptr, args2,
                            "Object.FindObjectsOfType(EnemyRigidbody, true)");
+      if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) != seh_before) {
+        OnEnemyFindObjectsSeh("Object.FindObjectsOfType(EnemyRigidbody, true)");
+        return false;
+      }
     }
     if (!arr_obj && g_object_find_objects_of_type) {
+      const uint32_t seh_before = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
       void* args1[1] = { enemy_type_obj };
       arr_obj = SafeInvoke(g_object_find_objects_of_type, nullptr, args1,
                            "Object.FindObjectsOfType(EnemyRigidbody)");
+      if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) != seh_before) {
+        OnEnemyFindObjectsSeh("Object.FindObjectsOfType(EnemyRigidbody)");
+        return false;
+      }
     }
 
     MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
@@ -3652,7 +3758,9 @@ namespace {
       AppendLogOnce("EnemyCache_class_missing", "RefreshEnemyCache: EnemyRigidbody class unresolved");
       return false;
     }
-    if (!g_object_find_objects_of_type_include_inactive && !g_object_find_objects_of_type) {
+    const bool can_find = g_object_find_objects_of_type ||
+      (k_enable_enemy_find_include_inactive && g_object_find_objects_of_type_include_inactive);
+    if (!can_find) {
       AppendLogOnce("EnemyCache_find_missing", "RefreshEnemyCache: FindObjectsOfType methods unresolved");
       return false;
     }
@@ -3667,16 +3775,26 @@ namespace {
     }
 
     MonoObject* arr_obj = nullptr;
-    if (g_object_find_objects_of_type_include_inactive) {
+    if (k_enable_enemy_find_include_inactive && g_object_find_objects_of_type_include_inactive) {
+      const uint32_t seh_before = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
       bool include_inactive = true;
       void* args2[2] = { enemy_type_obj, &include_inactive };
       arr_obj = SafeInvoke(g_object_find_objects_of_type_include_inactive, nullptr, args2,
         "Object.FindObjectsOfType(EnemyRigidbody, true)");
+      if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) != seh_before) {
+        OnEnemyFindObjectsSeh("Object.FindObjectsOfType(EnemyRigidbody, true)");
+        return false;
+      }
     }
     if (!arr_obj && g_object_find_objects_of_type) {
+      const uint32_t seh_before = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
       void* args1[1] = { enemy_type_obj };
       arr_obj = SafeInvoke(g_object_find_objects_of_type, nullptr, args1,
         "Object.FindObjectsOfType(EnemyRigidbody)");
+      if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) != seh_before) {
+        OnEnemyFindObjectsSeh("Object.FindObjectsOfType(EnemyRigidbody)");
+        return false;
+      }
     }
 
     MonoArray* arr = arr_obj ? reinterpret_cast<MonoArray*>(arr_obj) : nullptr;
@@ -4120,9 +4238,14 @@ bool MonoBeginShutdown() {
   g_pending_cart_active = false;
   g_cart_apply_in_progress = false;
   g_third_person_visual_target_enabled.store(false, std::memory_order_relaxed);
+  g_third_person_target_distance.store(2.8f, std::memory_order_relaxed);
+  g_third_person_target_height.store(1.15f, std::memory_order_relaxed);
+  g_third_person_target_shoulder.store(0.35f, std::memory_order_relaxed);
+  g_third_person_target_smooth.store(2.0f, std::memory_order_relaxed);
   g_third_person_bound_camera_position = nullptr;
   g_third_person_original_cached = false;
   g_third_person_applied = false;
+  g_third_person_last_apply_log_ms = 0;
   ResetThirdPersonVisualState();
   if (g_session_master_patch_active) {
     RestoreSessionMasterPatches();
@@ -5643,6 +5766,35 @@ static bool TryInvokeBoolGetter(MonoMethod* method, MonoObject* target, bool& ou
 #endif
 }
 
+static bool TryInvokeVector3Getter(MonoMethod* method,
+                                   MonoObject* target,
+                                   float& out_x,
+                                   float& out_y,
+                                   float& out_z) {
+  out_x = 0.0f;
+  out_y = 0.0f;
+  out_z = 0.0f;
+  if (!method || !target || !g_mono.mono_object_unbox) {
+    return false;
+  }
+  MonoObject* boxed = SafeInvoke(method, target, nullptr, "Vector3Getter");
+  if (!boxed) {
+    return false;
+  }
+#ifdef _MSC_VER
+  return UnboxVector3SafeSeh(boxed, out_x, out_y, out_z);
+#else
+  void* raw = g_mono.mono_object_unbox(boxed);
+  if (!raw) return false;
+  float tmp[3] = {};
+  std::memcpy(tmp, raw, sizeof(tmp));
+  out_x = tmp[0];
+  out_y = tmp[1];
+  out_z = tmp[2];
+  return true;
+#endif
+}
+
 namespace {
 static void ResetThirdPersonVisualState() {
   g_third_person_bound_mesh_parent = nullptr;
@@ -5773,6 +5925,230 @@ static bool ApplyThirdPersonLocalVisualsInternal(bool enabled) {
     g_third_person_visuals_applied = true;
   }
   return mesh_ok && animator_ok;
+}
+
+static bool ApplyThirdPersonCameraOffsetInternal(bool enabled,
+                                                 float distance,
+                                                 float height,
+                                                 float shoulder,
+                                                 float smooth) {
+  if (!g_camera_position_vtable || !g_camera_position_instance_field ||
+      !g_camera_position_player_offset_field) {
+    AppendLogOnce("MonoSetThirdPerson_refs_missing",
+                  "MonoSetThirdPerson: CameraPosition refs unresolved");
+    return false;
+  }
+
+  MonoObject* camera_position = nullptr;
+#ifdef _MSC_VER
+  if (!FieldStaticGetObjectSafeSeh(
+        g_camera_position_vtable, g_camera_position_instance_field, camera_position)) {
+    AppendLogOnce("MonoSetThirdPerson_instance_fault",
+                  "MonoSetThirdPerson: CameraPosition::instance read triggered SEH");
+    return false;
+  }
+#else
+  g_mono.mono_field_static_get_value(
+    g_camera_position_vtable, g_camera_position_instance_field, &camera_position);
+#endif
+
+  if (!camera_position || IsUnityNull(camera_position)) {
+    const uint64_t now_ms = GetTickCount64();
+    if (now_ms - g_third_person_last_missing_log_ms > 2000) {
+      AppendLog("MonoSetThirdPerson: CameraPosition::instance unavailable");
+      g_third_person_last_missing_log_ms = now_ms;
+    }
+    g_third_person_bound_camera_position = nullptr;
+    g_third_person_original_cached = false;
+    g_third_person_applied = false;
+    return false;
+  }
+
+  const bool instance_changed = (camera_position != g_third_person_bound_camera_position);
+  if (instance_changed) {
+    g_third_person_bound_camera_position = camera_position;
+    g_third_person_original_cached = false;
+    g_third_person_applied = false;
+  }
+
+  if (!g_third_person_original_cached) {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    bool read_vec_ok = true;
+#ifdef _MSC_VER
+    read_vec_ok = FieldGetVector3SafeSeh(
+      camera_position, g_camera_position_player_offset_field, x, y, z);
+#else
+    float raw[3] = {};
+    g_mono.mono_field_get_value(camera_position, g_camera_position_player_offset_field, raw);
+    x = raw[0];
+    y = raw[1];
+    z = raw[2];
+#endif
+    if (!read_vec_ok) {
+      AppendLogOnce("MonoSetThirdPerson_offset_read_fault",
+                    "MonoSetThirdPerson: CameraPosition::playerOffset read failed");
+      return false;
+    }
+    g_third_person_original_offset[0] = x;
+    g_third_person_original_offset[1] = y;
+    g_third_person_original_offset[2] = z;
+    if (g_camera_position_position_smooth_field) {
+#ifdef _MSC_VER
+      float smooth_read = g_third_person_original_smooth;
+      if (FieldGetFloatSafeSeh(
+            camera_position, g_camera_position_position_smooth_field, smooth_read)) {
+        g_third_person_original_smooth = smooth_read;
+      } else {
+        AppendLogOnce("MonoSetThirdPerson_smooth_read_fault",
+                      "MonoSetThirdPerson: CameraPosition::positionSmooth read failed");
+      }
+#else
+      g_mono.mono_field_get_value(
+        camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
+#endif
+    }
+    g_third_person_original_cached = true;
+  }
+
+  if (!enabled) {
+    if (g_third_person_applied && g_third_person_original_cached) {
+#ifdef _MSC_VER
+      if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
+                                  g_third_person_original_offset[0],
+                                  g_third_person_original_offset[1],
+                                  g_third_person_original_offset[2])) {
+        AppendLogOnce("MonoSetThirdPerson_restore_offset_fault",
+                      "MonoSetThirdPerson: restore playerOffset write failed");
+      }
+      if (g_camera_position_position_smooth_field &&
+          !FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
+                                g_third_person_original_smooth)) {
+        AppendLogOnce("MonoSetThirdPerson_restore_smooth_fault",
+                      "MonoSetThirdPerson: restore positionSmooth write failed");
+      }
+#else
+      g_mono.mono_field_set_value(
+        camera_position, g_camera_position_player_offset_field, g_third_person_original_offset);
+      if (g_camera_position_position_smooth_field) {
+        g_mono.mono_field_set_value(
+          camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
+      }
+#endif
+      g_third_person_applied = false;
+      AppendLog("MonoSetThirdPerson: restored first-person camera offset");
+    }
+    return true;
+  }
+
+  const float clamped_distance = std::clamp(distance, 0.5f, 8.0f);
+  const float clamped_height = std::clamp(height, -0.5f, 3.0f);
+  const float clamped_shoulder = std::clamp(shoulder, -2.0f, 2.0f);
+  const float safe_smooth = std::isfinite(smooth) ? smooth : 2.0f;
+  const float clamped_smooth = std::clamp(safe_smooth, 0.2f, 15.0f);
+  float delta_x = clamped_shoulder;
+  float delta_y = clamped_height;
+  float delta_z = -clamped_distance;
+
+  if (k_enable_third_person_follow_mouse_yaw &&
+      g_camera_aim_vtable && g_camera_aim_instance_field &&
+      g_component_get_transform && g_transform_get_local_euler_angles) {
+    MonoObject* camera_aim = nullptr;
+#ifdef _MSC_VER
+    if (FieldStaticGetObjectSafeSeh(g_camera_aim_vtable, g_camera_aim_instance_field, camera_aim)) {
+#else
+    g_mono.mono_field_static_get_value(g_camera_aim_vtable, g_camera_aim_instance_field, &camera_aim);
+    if (camera_aim) {
+#endif
+      if (camera_aim && !IsUnityNull(camera_aim)) {
+        MonoObject* aim_transform =
+          SafeInvoke(g_component_get_transform, camera_aim, nullptr, "CameraAim.get_transform");
+        if (aim_transform && !IsUnityNull(aim_transform)) {
+          float euler_x = 0.0f;
+          float euler_y = 0.0f;
+          float euler_z = 0.0f;
+          if (TryInvokeVector3Getter(
+                g_transform_get_local_euler_angles, aim_transform, euler_x, euler_y, euler_z)) {
+            const float yaw_rad = euler_y * 0.01745329251994329577f;  // PI / 180
+            const float c = std::cos(yaw_rad);
+            const float s = std::sin(yaw_rad);
+            const float base_x = clamped_shoulder;
+            const float base_z = -clamped_distance;
+            delta_x = base_x * c + base_z * s;
+            delta_z = -base_x * s + base_z * c;
+            static bool logged_follow_yaw_once = false;
+            if (!logged_follow_yaw_once) {
+              AppendLog("MonoSetThirdPerson: offset now follows CameraAim local yaw");
+              logged_follow_yaw_once = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  float target_offset[3] = {
+    g_third_person_original_offset[0] + delta_x,
+    g_third_person_original_offset[1] + delta_y,
+    g_third_person_original_offset[2] + delta_z,
+  };
+  const bool changed = !g_third_person_applied || instance_changed ||
+    std::fabs(target_offset[0] - g_third_person_last_offset[0]) > 0.001f ||
+    std::fabs(target_offset[1] - g_third_person_last_offset[1]) > 0.001f ||
+    std::fabs(target_offset[2] - g_third_person_last_offset[2]) > 0.001f ||
+    std::fabs(clamped_smooth - g_third_person_last_smooth) > 0.001f;
+  if (!changed) {
+    return true;
+  }
+
+#ifdef _MSC_VER
+  if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
+                              target_offset[0], target_offset[1], target_offset[2])) {
+    AppendLogOnce("MonoSetThirdPerson_apply_offset_fault",
+                  "MonoSetThirdPerson: apply playerOffset write failed");
+    return false;
+  }
+  if (g_camera_position_position_smooth_field) {
+    if (!FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
+                              clamped_smooth)) {
+      AppendLogOnce("MonoSetThirdPerson_apply_smooth_fault",
+                    "MonoSetThirdPerson: apply positionSmooth write failed");
+      return false;
+    }
+  }
+#else
+  g_mono.mono_field_set_value(camera_position, g_camera_position_player_offset_field, target_offset);
+  if (g_camera_position_position_smooth_field) {
+    float smooth_value = clamped_smooth;
+    g_mono.mono_field_set_value(
+      camera_position, g_camera_position_position_smooth_field, &smooth_value);
+  }
+#endif
+  const bool first_apply_after_reset = !g_third_person_applied;
+  g_third_person_last_offset[0] = target_offset[0];
+  g_third_person_last_offset[1] = target_offset[1];
+  g_third_person_last_offset[2] = target_offset[2];
+  g_third_person_last_smooth = clamped_smooth;
+  g_third_person_applied = true;
+
+  const uint64_t now_ms = GetTickCount64();
+  if (first_apply_after_reset || now_ms - g_third_person_last_apply_log_ms > 2000) {
+    std::ostringstream oss;
+    oss << "MonoSetThirdPerson: enabled dist=" << clamped_distance
+        << " height=" << clamped_height
+        << " shoulder=" << clamped_shoulder
+        << " smooth=" << clamped_smooth
+        << " base=(" << g_third_person_original_offset[0] << ","
+        << g_third_person_original_offset[1] << ","
+        << g_third_person_original_offset[2] << ")"
+        << " target=(" << target_offset[0] << ","
+        << target_offset[1] << ","
+        << target_offset[2] << ")";
+    AppendLog(oss.str());
+    g_third_person_last_apply_log_ms = now_ms;
+  }
+  return true;
 }
 
 namespace {
@@ -6165,25 +6541,27 @@ bool MonoSetRoundState(int current, int goal, int current_max) {
       AppendLog(lss.str());
     }
   }
-  const bool mark_completed = (cur >= 0 && haul_goal > 0 && cur >= haul_goal);
-  if (mark_completed) {
-    int extraction_points = 0;
-    if (!read_int(g_round_extraction_points_field, extraction_points) || extraction_points <= 0) {
-      extraction_points = 2;
-    }
-    if (g_round_extraction_points_completed_field) {
-      write_int(g_round_extraction_points_completed_field, extraction_points);
-    }
-    if (g_round_all_extraction_points_completed_field) {
-      write_int(g_round_all_extraction_points_completed_field, 1);
-    }
-  } else if (explicit_current || explicit_goal || explicit_current_max) {
-    // Explicit edits that do not satisfy completion should clear stale completion flags.
-    if (g_round_extraction_points_completed_field) {
-      write_int(g_round_extraction_points_completed_field, 0);
-    }
-    if (g_round_all_extraction_points_completed_field) {
-      write_int(g_round_all_extraction_points_completed_field, 0);
+  if (k_round_state_updates_progress) {
+    const bool mark_completed = (cur >= 0 && haul_goal > 0 && cur >= haul_goal);
+    if (mark_completed) {
+      int extraction_points = 0;
+      if (!read_int(g_round_extraction_points_field, extraction_points) || extraction_points <= 0) {
+        extraction_points = 2;
+      }
+      if (g_round_extraction_points_completed_field) {
+        write_int(g_round_extraction_points_completed_field, extraction_points);
+      }
+      if (g_round_all_extraction_points_completed_field) {
+        write_int(g_round_all_extraction_points_completed_field, 1);
+      }
+    } else if (explicit_current || explicit_goal || explicit_current_max) {
+      // Explicit edits that do not satisfy completion should clear stale completion flags.
+      if (g_round_extraction_points_completed_field) {
+        write_int(g_round_extraction_points_completed_field, 0);
+      }
+      if (g_round_all_extraction_points_completed_field) {
+        write_int(g_round_all_extraction_points_completed_field, 0);
+      }
     }
   }
 
@@ -6851,15 +7229,30 @@ bool MonoSetThirdPerson(bool enabled, float distance, float height, float should
   if (!CacheManagedRefs()) {
     return false;
   }
+  const float clamped_distance = std::clamp(distance, 0.5f, 8.0f);
+  const float clamped_height = std::clamp(height, -0.5f, 3.0f);
+  const float clamped_shoulder = std::clamp(shoulder, -2.0f, 2.0f);
+  const float safe_smooth = std::isfinite(smooth) ? smooth : 2.0f;
+  const float clamped_smooth = std::clamp(safe_smooth, 0.2f, 15.0f);
+
   g_third_person_visual_target_enabled.store(enabled, std::memory_order_relaxed);
-  if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_from_present) {
-    ApplyThirdPersonLocalVisualsInternal(enabled);
-  } else if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_update_hook) {
+  g_third_person_target_distance.store(clamped_distance, std::memory_order_relaxed);
+  g_third_person_target_height.store(clamped_height, std::memory_order_relaxed);
+  g_third_person_target_shoulder.store(clamped_shoulder, std::memory_order_relaxed);
+  g_third_person_target_smooth.store(clamped_smooth, std::memory_order_relaxed);
+
+  if (k_enable_third_person_visuals_update_hook && g_player_avatar_visuals_update_hooked) {
     static bool logged_main_thread_visuals_once = false;
     if (!logged_main_thread_visuals_once) {
-      AppendLog("MonoSetThirdPerson: local mesh/animator toggle routed via PlayerAvatarVisuals.Update hook");
+      AppendLog(
+        "MonoSetThirdPerson: camera/visual apply routed via PlayerAvatarVisuals.Update hook");
       logged_main_thread_visuals_once = true;
     }
+    return true;
+  }
+
+  if (k_enable_third_person_local_visuals && k_enable_third_person_visuals_from_present) {
+    ApplyThirdPersonLocalVisualsInternal(enabled);
   } else if (!k_enable_third_person_local_visuals) {
     static bool logged_visuals_disabled_once = false;
     if (!logged_visuals_disabled_once) {
@@ -6867,180 +7260,12 @@ bool MonoSetThirdPerson(bool enabled, float distance, float height, float should
       logged_visuals_disabled_once = true;
     }
   }
+
   if (!enabled && !g_third_person_applied && !g_third_person_visuals_applied) {
     return true;
   }
-  if (!g_camera_position_vtable || !g_camera_position_instance_field ||
-      !g_camera_position_player_offset_field) {
-    AppendLogOnce("MonoSetThirdPerson_refs_missing",
-      "MonoSetThirdPerson: CameraPosition refs unresolved");
-    return false;
-  }
-
-  MonoObject* camera_position = nullptr;
-#ifdef _MSC_VER
-  if (!FieldStaticGetObjectSafeSeh(
-        g_camera_position_vtable, g_camera_position_instance_field, camera_position)) {
-    AppendLogOnce("MonoSetThirdPerson_instance_fault",
-      "MonoSetThirdPerson: CameraPosition::instance read triggered SEH");
-    return false;
-  }
-#else
-  g_mono.mono_field_static_get_value(
-    g_camera_position_vtable, g_camera_position_instance_field, &camera_position);
-#endif
-
-  if (!camera_position || IsUnityNull(camera_position)) {
-    const uint64_t now_ms = GetTickCount64();
-    if (now_ms - g_third_person_last_missing_log_ms > 2000) {
-      AppendLog("MonoSetThirdPerson: CameraPosition::instance unavailable");
-      g_third_person_last_missing_log_ms = now_ms;
-    }
-    g_third_person_bound_camera_position = nullptr;
-    g_third_person_original_cached = false;
-    g_third_person_applied = false;
-    return false;
-  }
-
-  const bool instance_changed = (camera_position != g_third_person_bound_camera_position);
-  if (instance_changed) {
-    g_third_person_bound_camera_position = camera_position;
-    g_third_person_original_cached = false;
-    g_third_person_applied = false;
-  }
-
-  if (!g_third_person_original_cached) {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    bool read_vec_ok = true;
-#ifdef _MSC_VER
-    read_vec_ok = FieldGetVector3SafeSeh(
-      camera_position, g_camera_position_player_offset_field, x, y, z);
-#else
-    float raw[3] = {};
-    g_mono.mono_field_get_value(camera_position, g_camera_position_player_offset_field, raw);
-    x = raw[0];
-    y = raw[1];
-    z = raw[2];
-#endif
-    if (!read_vec_ok) {
-      AppendLogOnce("MonoSetThirdPerson_offset_read_fault",
-        "MonoSetThirdPerson: CameraPosition::playerOffset read failed");
-      return false;
-    }
-    g_third_person_original_offset[0] = x;
-    g_third_person_original_offset[1] = y;
-    g_third_person_original_offset[2] = z;
-    if (g_camera_position_position_smooth_field) {
-#ifdef _MSC_VER
-      float smooth_read = g_third_person_original_smooth;
-      if (FieldGetFloatSafeSeh(
-            camera_position, g_camera_position_position_smooth_field, smooth_read)) {
-        g_third_person_original_smooth = smooth_read;
-      } else {
-        AppendLogOnce("MonoSetThirdPerson_smooth_read_fault",
-          "MonoSetThirdPerson: CameraPosition::positionSmooth read failed");
-      }
-#else
-      g_mono.mono_field_get_value(
-        camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
-#endif
-    }
-    g_third_person_original_cached = true;
-  }
-
-  if (!enabled) {
-    if (g_third_person_applied && g_third_person_original_cached) {
-#ifdef _MSC_VER
-      if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
-                                  g_third_person_original_offset[0],
-                                  g_third_person_original_offset[1],
-                                  g_third_person_original_offset[2])) {
-        AppendLogOnce("MonoSetThirdPerson_restore_offset_fault",
-          "MonoSetThirdPerson: restore playerOffset write failed");
-      }
-      if (g_camera_position_position_smooth_field &&
-          !FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
-                                g_third_person_original_smooth)) {
-        AppendLogOnce("MonoSetThirdPerson_restore_smooth_fault",
-          "MonoSetThirdPerson: restore positionSmooth write failed");
-      }
-#else
-      g_mono.mono_field_set_value(
-        camera_position, g_camera_position_player_offset_field, g_third_person_original_offset);
-      if (g_camera_position_position_smooth_field) {
-        g_mono.mono_field_set_value(
-          camera_position, g_camera_position_position_smooth_field, &g_third_person_original_smooth);
-      }
-#endif
-      g_third_person_applied = false;
-      AppendLog("MonoSetThirdPerson: restored first-person camera offset");
-    }
-    return true;
-  }
-
-  const float clamped_distance = std::clamp(distance, 0.5f, 8.0f);
-  const float clamped_height = std::clamp(height, -0.5f, 3.0f);
-  const float clamped_shoulder = std::clamp(shoulder, -2.0f, 2.0f);
-  const float safe_smooth = std::isfinite(smooth) ? smooth : 2.0f;
-  const float clamped_smooth = std::clamp(safe_smooth, 0.2f, 15.0f);
-  float target_offset[3] = {
-    g_third_person_original_offset[0] + clamped_shoulder,
-    g_third_person_original_offset[1] + clamped_height,
-    g_third_person_original_offset[2] - clamped_distance,
-  };
-  const bool changed = !g_third_person_applied || instance_changed ||
-    std::fabs(target_offset[0] - g_third_person_last_offset[0]) > 0.001f ||
-    std::fabs(target_offset[1] - g_third_person_last_offset[1]) > 0.001f ||
-    std::fabs(target_offset[2] - g_third_person_last_offset[2]) > 0.001f ||
-    std::fabs(clamped_smooth - g_third_person_last_smooth) > 0.001f;
-  if (!changed) {
-    return true;
-  }
-
-#ifdef _MSC_VER
-  if (!FieldSetVector3SafeSeh(camera_position, g_camera_position_player_offset_field,
-                              target_offset[0], target_offset[1], target_offset[2])) {
-    AppendLogOnce("MonoSetThirdPerson_apply_offset_fault",
-      "MonoSetThirdPerson: apply playerOffset write failed");
-    return false;
-  }
-  if (g_camera_position_position_smooth_field) {
-    if (!FieldSetFloatSafeSeh(camera_position, g_camera_position_position_smooth_field,
-                              clamped_smooth)) {
-      AppendLogOnce("MonoSetThirdPerson_apply_smooth_fault",
-        "MonoSetThirdPerson: apply positionSmooth write failed");
-      return false;
-    }
-  }
-#else
-  g_mono.mono_field_set_value(camera_position, g_camera_position_player_offset_field, target_offset);
-  if (g_camera_position_position_smooth_field) {
-    float smooth_value = clamped_smooth;
-    g_mono.mono_field_set_value(
-      camera_position, g_camera_position_position_smooth_field, &smooth_value);
-  }
-#endif
-  g_third_person_last_offset[0] = target_offset[0];
-  g_third_person_last_offset[1] = target_offset[1];
-  g_third_person_last_offset[2] = target_offset[2];
-  g_third_person_last_smooth = clamped_smooth;
-  g_third_person_applied = true;
-
-  std::ostringstream oss;
-  oss << "MonoSetThirdPerson: enabled dist=" << clamped_distance
-      << " height=" << clamped_height
-      << " shoulder=" << clamped_shoulder
-      << " smooth=" << clamped_smooth
-      << " base=(" << g_third_person_original_offset[0] << ","
-      << g_third_person_original_offset[1] << ","
-      << g_third_person_original_offset[2] << ")"
-      << " target=(" << target_offset[0] << ","
-      << target_offset[1] << ","
-      << target_offset[2] << ")";
-  AppendLog(oss.str());
-  return true;
+  return ApplyThirdPersonCameraOffsetInternal(
+    enabled, clamped_distance, clamped_height, clamped_shoulder, clamped_smooth);
 }
 
 bool MonoSetSpeedMultiplierDirect(float multiplier, float duration_seconds) {
@@ -8977,6 +9202,9 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     else {
       AppendLogOnce("MonoListEnemies_cache_disabled", "MonoListEnemies: enemy cache disabled or refresh failed");
     }
+    if (g_enemy_esp_disabled) {
+      return false;
+    }
 
     for (uint32_t h : cache_snapshot) {
       MonoObject* enemy_obj = g_mono.mono_gchandle_get_target ? g_mono.mono_gchandle_get_target(h) : nullptr;
@@ -8991,7 +9219,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     }
 
     static uint64_t s_last_direct_enemy_scan_ms = 0;
-    if (now - s_last_direct_enemy_scan_ms >= 250) {
+    if (now - s_last_direct_enemy_scan_ms >= 800) {
       s_last_direct_enemy_scan_ms = now;
       if (ScanEnemiesDirect(out_enemies, 512)) {
         AppendLogOnce("MonoListEnemies_direct_scan", "MonoListEnemies: populated via direct FindObjectsOfType scan");

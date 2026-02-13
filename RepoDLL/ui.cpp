@@ -50,7 +50,7 @@ struct SavedSettings {
   bool native_highlight = false;
   bool no_fall = false;
   bool load_on_start = true;
-  bool reset_each_round = true;
+  bool reset_each_round = false;
   int menu_toggle_vk = VK_INSERT;
   bool third_person_enabled = false;
   int third_person_toggle_vk = VK_F6;
@@ -318,14 +318,12 @@ void RenderOverlay(bool* menu_open) {
   static int log_lines = 200;
   static SavedSettings saved{};
   static bool settings_loaded = false;
-  static bool reset_each_round = true;
   static bool session_master_transitioning = false;
   static SessionRuntimeGate runtime_gate{};
   static bool runtime_gate_ok = false;
   static uint64_t last_runtime_gate_update = 0;
   static bool is_real_master = false;
   static uint64_t last_master_state_update = 0;
-  static int last_stage_seen = -999;
   static char log_path_buf[260] = {};
 
   const uint64_t now = GetTickCount64();
@@ -357,8 +355,9 @@ void RenderOverlay(bool* menu_open) {
       g_native_highlight_active = saved.native_highlight;
       no_fall_enabled = saved.no_fall;
       speed_mult = saved.speed_mult;
-      reset_each_round = saved.reset_each_round;
     }
+    // Deprecated: auto reset on stage/scene change causes user settings to be lost.
+    saved.reset_each_round = false;
     settings_loaded = true;
   }
   if (mono_ready) {
@@ -465,12 +464,6 @@ void RenderOverlay(bool* menu_open) {
     if (MonoGetRoundState(rs) && rs.ok) {
       has_round_state = true;
       cached_round_state = rs;
-      if (reset_each_round && last_stage_seen != -999 && rs.stage != last_stage_seen) {
-        ResetUiDefaults(auto_refresh, auto_refresh_items, auto_refresh_enemies,
-          g_item_esp_enabled, g_enemy_esp_enabled, g_native_highlight_active, no_fall_enabled,
-          speed_mult, extra_jump_count, infinite_jump_enabled, god_mode_enabled);
-      }
-      last_stage_seen = rs.stage;
       // 同步输入框（如果当前没有正在编辑）
       if (!user_editing) {
         if (rs.current >= 0) round_current_edit = rs.current;
@@ -1002,6 +995,7 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::Checkbox("锁定收集器(超级补丁大法)##econ_round_lock", &round_lock_enabled);
           ImGui::EndDisabled();
+          ImGui::TextDisabled("说明: 应用收集器数值仅改 haul 字段，不再改进度完成字段。");
           ImGui::TextDisabled("说明: 开启后会拦截 RoundDirector.Update 的重算；切图/重启会自动关闭。");
 
           SectionLabel("关卡切换 / 进度");
@@ -1538,7 +1532,7 @@ void RenderOverlay(bool* menu_open) {
           SectionLabel("默认开关");
           ImGui::Checkbox("启动时加载上次参数", &saved.load_on_start);
           ImGui::SameLine();
-          ImGui::Checkbox("每局重置为默认", &reset_each_round);
+          ImGui::TextDisabled("每局重置为默认: 已停用（防止切图丢设置）");
           ImGui::Checkbox("默认绘制覆盖层", &g_esp_enabled);
           ImGui::Checkbox("默认物品ESP", &g_item_esp_enabled);
           ImGui::SameLine();
@@ -1613,7 +1607,7 @@ void RenderOverlay(bool* menu_open) {
               saved.native_highlight = g_native_highlight_active;
               saved.no_fall = no_fall_enabled;
               saved.speed_mult = speed_mult;
-              saved.reset_each_round = reset_each_round;
+              saved.reset_each_round = false;
               saved.menu_toggle_vk = GetMenuToggleVirtualKey();
               saved.third_person_enabled = GetThirdPersonEnabled();
               saved.third_person_toggle_vk = GetThirdPersonToggleVirtualKey();
@@ -1635,7 +1629,7 @@ void RenderOverlay(bool* menu_open) {
                 g_native_highlight_active = saved.native_highlight;
                 no_fall_enabled = saved.no_fall;
                 speed_mult = saved.speed_mult;
-                reset_each_round = saved.reset_each_round;
+                saved.reset_each_round = false;
                 SetMenuToggleVirtualKey(saved.menu_toggle_vk);
                 SetThirdPersonToggleVirtualKey(saved.third_person_toggle_vk);
                 SetThirdPersonEnabled(saved.third_person_enabled);
