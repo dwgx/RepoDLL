@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Exclude vendored MinHook from GitHub language statistics
+RepoDLL/third_party/minhook/** linguist-vendored=true
