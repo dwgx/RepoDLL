@@ -269,7 +269,7 @@ void RenderOverlay(bool* menu_open) {
   static bool lock_stamina = false;
   static bool inputs_synced = false;
   static bool auto_refresh = false;  // 默认关闭，需用户开启
-  static bool auto_refresh_items = false;  // 保留设置兼容，不再驱动自动轮询
+  static bool auto_refresh_items = false;
   static bool auto_refresh_enemies = false;
   static std::vector<PlayerState> squad_states;
   static uint64_t last_squad_update = 0;
@@ -324,6 +324,9 @@ void RenderOverlay(bool* menu_open) {
   static uint64_t item_snapshot_hash2 = 0;
   static size_t item_snapshot_count = 0;
   static bool item_snapshot_ready = false;
+  static uint64_t last_items_auto_poll_ms = 0;
+  static uint64_t item_auto_refresh_interval_ms = 600;  // adaptive interval
+  static int item_auto_refresh_stable_hits = 0;
   static RoundState cached_round_state{};
   static bool has_round_state = false;
   static RoundProgressState cached_round_progress{};
@@ -372,6 +375,7 @@ void RenderOverlay(bool* menu_open) {
     }
     if (saved.load_on_start) {
       auto_refresh = saved.auto_refresh;
+      auto_refresh_items = saved.auto_refresh_items;
       auto_refresh_enemies = saved.auto_refresh_enemies;
       g_item_esp_enabled = saved.item_esp;
       g_enemy_esp_enabled = saved.enemy_esp;
@@ -455,6 +459,9 @@ void RenderOverlay(bool* menu_open) {
     item_snapshot_hash1 = 0;
     item_snapshot_hash2 = 0;
     item_snapshot_count = 0;
+    last_items_auto_poll_ms = now;
+    item_auto_refresh_interval_ms = 600;
+    item_auto_refresh_stable_hits = 0;
   }
   const uint64_t edit_cooldown_ms = 800;
   const bool safe_to_refresh = !user_editing && (now - last_user_edit > edit_cooldown_ms);
@@ -563,6 +570,7 @@ void RenderOverlay(bool* menu_open) {
     out_h2 = h2;
   };
   auto refresh_items = [&](bool manual_refresh = false) {
+    last_items_auto_poll_ms = now;
     if (!mono_ready) return;
     if (session_master_transitioning) return;
     if (!allow_scan_items) return;
@@ -583,6 +591,10 @@ void RenderOverlay(bool* menu_open) {
       ? MonoManualRefreshItems(new_items)
       : MonoListItemsSafe(new_items);
     if (!listed) {
+      if (!manual_refresh) {
+        item_auto_refresh_interval_ms = std::min<uint64_t>(2000ull, item_auto_refresh_interval_ms + 200ull);
+        item_auto_refresh_stable_hits = 0;
+      }
       return;
     }
     g_cached_items.swap(new_items);
@@ -601,6 +613,17 @@ void RenderOverlay(bool* menu_open) {
     item_snapshot_ready = true;
     if (items_changed) {
       weapon_cache_dirty = true;
+    }
+    if (!manual_refresh) {
+      if (items_changed) {
+        item_auto_refresh_interval_ms = 260;
+        item_auto_refresh_stable_hits = 0;
+      } else {
+        ++item_auto_refresh_stable_hits;
+        if (item_auto_refresh_stable_hits >= 2) {
+          item_auto_refresh_interval_ms = std::min<uint64_t>(2000ull, item_auto_refresh_interval_ms + 120ull);
+        }
+      }
     }
   };
   auto refresh_enemies = [&]() {
@@ -803,7 +826,11 @@ void RenderOverlay(bool* menu_open) {
       g_last_matrix_update = now;
     }
   };
-  // 物品列表不再自动巡检；仅手动刷新 + 会话切换重置
+  if (mono_ready && auto_refresh_items && safe_to_refresh &&
+      !session_master_transitioning && allow_scan_items && !scan_pause_pending &&
+      now - last_items_auto_poll_ms > item_auto_refresh_interval_ms) {
+    refresh_items(false);
+  }
   if (mono_ready && auto_refresh_enemies && now - last_enemies_update > 1000) {
     refresh_enemies();
   }
@@ -1303,6 +1330,8 @@ void RenderOverlay(bool* menu_open) {
           }
           ImGui::SameLine();
           ImGui::BeginDisabled(!allow_scan_items);
+          ImGui::Checkbox("自动刷新物品", &auto_refresh_items);
+          ImGui::SameLine();
           if (ImGui::Button("刷新物品")) refresh_items(true);
           ImGui::EndDisabled();
           ImGui::EndGroup();
@@ -1324,6 +1353,8 @@ void RenderOverlay(bool* menu_open) {
             MonoResetItemsDisabled();
           }
           ImGui::EndDisabled();
+          ImGui::SameLine();
+          ImGui::TextDisabled("自适应间隔: %llums", static_cast<unsigned long long>(item_auto_refresh_interval_ms));
           ImGui::SliderInt("物品ESP上限", &g_item_esp_cap, 0, 1024);
           ImGui::SliderInt("敌人ESP上限", &g_enemy_esp_cap, 0, 512);
 
@@ -1904,6 +1935,8 @@ void RenderOverlay(bool* menu_open) {
           ImGui::SameLine();
           ImGui::Checkbox("默认防摔倒", &no_fall_enabled);
           ImGui::Checkbox("默认自动刷新玩家状态", &auto_refresh);
+          ImGui::SameLine();
+          ImGui::Checkbox("默认自动刷新物品", &auto_refresh_items);
           ImGui::SameLine();
           ImGui::Checkbox("默认自动刷新敌人", &auto_refresh_enemies);
           ImGui::InputFloat("默认速度倍率", &speed_mult, 0.1f, 0.5f, "%.2f");

@@ -354,6 +354,39 @@ namespace {
   MonoClassField* g_enemy_enemy_rigidbody_field = nullptr;
   MonoClass* g_enemy_rigidbody_class = nullptr;
   MonoClassField* g_enemy_rigidbody_enemy_parent_field = nullptr;
+  constexpr std::array<const char*, 29> k_enemy_whitelist_names = {
+    "EnemyAnimal",
+    "EnemyBang",
+    "EnemyBeamer",
+    "EnemyBirthdayBoy",
+    "EnemyBombThrower",
+    "EnemyBowtie",
+    "EnemyCeilingEye",
+    "EnemyDuck",
+    "EnemyElsa",
+    "EnemyFloater",
+    "EnemyGnome",
+    "EnemyHeadController",
+    "EnemyHeadGrabber",
+    "EnemyHeartHugger",
+    "EnemyHidden",
+    "EnemyHunter",
+    "EnemyOogly",
+    "EnemyRobe",
+    "EnemyRunner",
+    "EnemyShadow",
+    "EnemySlowMouth",
+    "EnemySlowWalker",
+    "EnemySpinny",
+    "EnemyThinMan",
+    "EnemyTick",
+    "EnemyTricycle",
+    "EnemyTumbler",
+    "EnemyUpscream",
+    "EnemyValuableThrower"
+  };
+  std::array<MonoClass*, k_enemy_whitelist_names.size()> g_enemy_whitelist_classes{};
+  constexpr uint64_t k_enemy_whitelist_scan_interval_ms = 2500;
   std::vector<uint32_t> g_enemy_cache;  // GCHandles
   std::mutex g_enemy_cache_mutex;
   uint64_t g_enemy_cache_last_refresh = 0;
@@ -3251,6 +3284,27 @@ namespace {
         AppendLog("Resolved EnemyRigidbody::enemyParent field");
       }
     }
+    int resolved_enemy_whitelist = 0;
+    for (size_t i = 0; i < k_enemy_whitelist_names.size(); ++i) {
+      if (!g_enemy_whitelist_classes[i]) {
+        const char* enemy_class_name = k_enemy_whitelist_names[i];
+        MonoClass* cls = g_mono.mono_class_from_name(g_image, "", enemy_class_name);
+        if (!cls) {
+          cls = FindClassAnyAssembly("", enemy_class_name);
+        }
+        if (cls) {
+          g_enemy_whitelist_classes[i] = cls;
+          AppendLog(std::string("Resolved enemy whitelist class: ") + enemy_class_name);
+        }
+      }
+      if (g_enemy_whitelist_classes[i]) {
+        ++resolved_enemy_whitelist;
+      }
+    }
+    if (resolved_enemy_whitelist == 0) {
+      AppendLogOnce("EnemyWhitelist_empty",
+                    "Enemy whitelist classes unresolved; enemy scan may be incomplete");
+    }
 
     return true;
   }
@@ -3925,7 +3979,18 @@ namespace {
       dedup_key = component_obj;
     }
     if (!dedup_key || IsUnityNull(dedup_key)) return false;
-    if (seen_keys && seen_keys->find(dedup_key) != seen_keys->end()) return false;
+    MonoObject* go_key = nullptr;
+    if (g_component_get_game_object) {
+      go_key = SafeInvoke(g_component_get_game_object, component_obj, nullptr,
+                          "Enemy.Dedup.get_gameObject");
+      if (go_key && IsUnityNull(go_key)) {
+        go_key = nullptr;
+      }
+    }
+    if (seen_keys) {
+      if (seen_keys->find(dedup_key) != seen_keys->end()) return false;
+      if (go_key && seen_keys->find(go_key) != seen_keys->end()) return false;
+    }
 
     PlayerState st{};
     if (!FillEnemyStateFromComponent(component_obj, st)) return false;
@@ -3934,6 +3999,9 @@ namespace {
     out_enemies.push_back(std::move(st));
     if (seen_keys) {
       seen_keys->insert(dedup_key);
+      if (go_key) {
+        seen_keys->insert(go_key);
+      }
     }
     return true;
   }
@@ -3994,16 +4062,17 @@ namespace {
         }
       }
 
+      bool spawned = true;
+      bool spawned_known = false;
       if (g_enemy_parent_spawned_field) {
-        bool spawned = true;
-        if (TryReadBoolField(parent_obj, g_enemy_parent_spawned_field, spawned) && !spawned) {
-          return false;
-        }
+        spawned_known = TryReadBoolField(parent_obj, g_enemy_parent_spawned_field, spawned);
       }
-
       MonoObject* enemy_obj = nullptr;
       if (g_enemy_parent_enemy_field) {
         TryReadObjectField(parent_obj, g_enemy_parent_enemy_field, enemy_obj);
+      }
+      if (spawned_known && !spawned && (!enemy_obj || IsUnityNull(enemy_obj))) {
+        return false;
       }
 
       if (enemy_obj && !IsUnityNull(enemy_obj) && g_enemy_enemy_rigidbody_field) {
@@ -9510,6 +9579,49 @@ bool MonoManualRefreshItems(std::vector<PlayerState>& out_items) {
   return MonoListItemsSafe(out_items);
 }
 
+static bool ScanEnemiesByWhitelistClasses(std::vector<PlayerState>& out_enemies,
+                                          std::unordered_set<MonoObject*>& seen_keys,
+                                          int max_count,
+                                          int* out_added) {
+  if (out_added) *out_added = 0;
+  if (g_enemy_findobjects_disabled.load(std::memory_order_relaxed)) return false;
+  if (!g_component_get_transform) return false;
+
+  int added = 0;
+  for (size_t i = 0; i < k_enemy_whitelist_names.size(); ++i) {
+    if (max_count > 0 && static_cast<int>(out_enemies.size()) >= max_count) {
+      break;
+    }
+    MonoClass* enemy_cls = g_enemy_whitelist_classes[i];
+    if (!enemy_cls) continue;
+
+    const char* class_name = k_enemy_whitelist_names[i];
+    const uint32_t seh_before = g_safeinvoke_seh_count.load(std::memory_order_relaxed);
+    MonoArray* arr = FindObjectsOfTypeArray(enemy_cls, class_name);
+    if (g_safeinvoke_seh_count.load(std::memory_order_relaxed) != seh_before) {
+      OnEnemyFindObjectsSeh(class_name);
+      break;
+    }
+    int lim = GetArrayLengthSafe(arr);
+    if (lim <= 0) continue;
+    if (lim > 512) lim = 512;
+
+    for (int j = 0; j < lim; ++j) {
+      if (max_count > 0 && static_cast<int>(out_enemies.size()) >= max_count) {
+        break;
+      }
+      MonoObject* enemy_obj = GetArrayElementSafe(arr, j);
+      if (!enemy_obj || IsUnityNull(enemy_obj)) continue;
+      if (AddEnemyFromComponent(enemy_obj, out_enemies, &seen_keys)) {
+        ++added;
+      }
+    }
+  }
+
+  if (out_added) *out_added = added;
+  return added > 0;
+}
+
 void MonoResetEnemiesDisabled() {
   g_enemy_esp_disabled = false;
   g_enemy_cache_disabled = false;
@@ -9572,6 +9684,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     int added_from_director_rigidbody = 0;
     int added_from_cache = 0;
     int added_from_cache_refill = 0;
+    int added_from_whitelist_scan = 0;
     int added_from_direct_scan = 0;
 
     ScanEnemiesFromDirector(next_enemies, seen_enemy_keys, max_enemies,
@@ -9593,7 +9706,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
       }
     }
 
-    const bool findobjects_disabled = g_enemy_findobjects_disabled.load(std::memory_order_relaxed);
+    bool findobjects_disabled = g_enemy_findobjects_disabled.load(std::memory_order_relaxed);
     if (next_enemies.empty() && !findobjects_disabled && !g_enemy_cache_disabled) {
       if (RefreshEnemyCacheSafe()) {
         EnemyCachePruneDead();
@@ -9616,6 +9729,17 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
     }
     if (g_enemy_esp_disabled) {
       return false;
+    }
+
+    static uint64_t s_last_whitelist_enemy_scan_ms = 0;
+    const int whitelist_target_count = std::max(16, g_enemy_esp_cap * 4);
+    if (!findobjects_disabled &&
+        static_cast<int>(next_enemies.size()) < whitelist_target_count &&
+        now_ms - s_last_whitelist_enemy_scan_ms >= k_enemy_whitelist_scan_interval_ms) {
+      s_last_whitelist_enemy_scan_ms = now_ms;
+      ScanEnemiesByWhitelistClasses(next_enemies, seen_enemy_keys, max_enemies,
+                                    &added_from_whitelist_scan);
+      findobjects_disabled = g_enemy_findobjects_disabled.load(std::memory_order_relaxed);
     }
 
     static uint64_t s_last_direct_enemy_scan_ms = 0;
@@ -9642,6 +9766,7 @@ bool MonoListEnemies(std::vector<PlayerState>& out_enemies) {
           << " director_rb=" << added_from_director_rigidbody
           << " cache=" << added_from_cache
           << " cache_refill=" << added_from_cache_refill
+          << " whitelist=" << added_from_whitelist_scan
           << " direct=" << added_from_direct_scan
           << " find_disabled=" << (findobjects_disabled ? 1 : 0);
       AppendLog(oss.str());
