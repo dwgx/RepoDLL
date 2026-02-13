@@ -1,5 +1,5 @@
-# Auto detect text files and perform LF normalization
+# Normalize line endings
 * text=auto
 
-# Exclude vendored MinHook from GitHub language statistics
-RepoDLL/third_party/minhook/** linguist-vendored=true
+# Hide third party code from language stats
+RepoDLL/third_party/** linguist-vendored=true
