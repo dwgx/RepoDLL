@@ -1,4 +1,13 @@
-﻿# RepoDLL 使用说明
+## Compliance Notice / 合规声明
+
+- This repository is provided only for education, reverse engineering research, debugging, and interoperability study.
+- Do not use any code or ideas here for unauthorized access, cheating in online services, privacy invasion, data theft, malware delivery, or service disruption.
+- You must comply with applicable laws, platform Terms of Service, and software/game EULA before any use.
+- If any content infringes your rights, open an issue or contact the maintainer for removal.
+- Full statement: [DISCLAIMER.md](./DISCLAIMER.md)
+
+---
+# RepoDLL 使用说明
 
 ## 1. 项目说明
 - 本项目为 RepoDLL 注入模块与 UI 工具集。
@@ -32,3 +41,4 @@
 - Session 本质是 Photon Room，权威角色是 `MasterClient`。
 - 核心同步接口为 `PhotonView.RPC(...)` 与 `IPunObservable.OnPhotonSerializeView(...)`。
 - 结论：本地篡改判定无法等价于真实切主，因此无法保证全房间全功能同步。
+
