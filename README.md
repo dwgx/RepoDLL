@@ -1,44 +1,38 @@
+# RepoDLL
+
 ## Compliance Notice / 合规声明
 
-- This repository is provided only for education, reverse engineering research, debugging, and interoperability study.
-- Do not use any code or ideas here for unauthorized access, cheating in online services, privacy invasion, data theft, malware delivery, or service disruption.
-- You must comply with applicable laws, platform Terms of Service, and software/game EULA before any use.
-- If any content infringes your rights, open an issue or contact the maintainer for removal.
-- Full statement: [DISCLAIMER.md](./DISCLAIMER.md)
+- 本仓库仅用于学习、逆向研究、调试分析和兼容性研究。
+- 禁止用于未授权访问、破坏服务、隐私侵害、在线作弊、恶意传播等行为。
+- 使用者需自行遵守当地法律、平台条款与相关 EULA。
+- 完整声明见 [DISCLAIMER.md](./DISCLAIMER.md)
 
 ---
-# RepoDLL 使用说明
 
-## 1. 项目说明
-- 本项目为 RepoDLL 注入模块与 UI 工具集。
+RepoDLL 是一个历史 C#/C++ 相关项目仓库，包含 DLL 工程与辅助代码。
 
-## 2. 作者声明 / 免责声明
-- 本仓库由我维护与整理，但原始历史源码来源复杂，原始作者信息并不完整。
-- 原始源码版权不归我所有，与我个人无关；如涉及侵权请联系处理，我会配合删除相关内容。
-- 本项目仅作学习与研究用途，使用行为及后果由使用者自行承担。
+## 仓库内容
 
-## 3. 快速使用
-1. 使用 `x64` 配置编译 DLL（建议 `Release`）。
-2. 进入游戏后将 DLL 注入到游戏进程。
-3. 默认菜单开关键为 `INS`。
-4. 菜单内可通过“监听按键修改”更换菜单按键。
+- `RepoDLL/`：核心工程目录
+- `RepoDLL.slnx`：解决方案文件
+- `LICENSE`、`DISCLAIMER.md`：协议与声明
 
-## 4. 功能使用
-- 玩家页：位置、生命、体力、移动相关修改。
-- 经济/关卡：货币与关卡收集数值相关功能。
-- ESP：物品与敌人显示，默认上限为物品 `65`、敌人 `8`。
-- 队友页：支持队友列表、坐标与状态查看。
-- 队友操作限制：传送/拉取/改队友状态仅在你是真实房主时可用，非房主只可查看。
-- 稳定性策略：`Session master` 强制功能已停用，不再提供伪房主入口。
+## 使用方式（研究向）
 
-## 5. 日志与排查
-- 日志目录：`C:\Users\username\AppData\LocalLow\semiwork\Repo\repodll`
-- 常看文件：`REPO_LOG.txt`、`REPO_CRASH.txt`
-- 建议关注关键字：`MonoGetLocalPlayer`、`MonoGetCameraMatrices`、`MonoSetGrabStrength`、`SessionTransitionGuard`
+1. 用 Visual Studio 打开 `RepoDLL.slnx`
+2. 根据本机环境补齐依赖
+3. 在本地测试环境中编译和调试
 
-## 附录 A：联机通信方式说明
-- 本游戏联机基于 `Photon PUN`（`Photon.Pun` + `Photon.Realtime`）。
-- Session 本质是 Photon Room，权威角色是 `MasterClient`。
-- 核心同步接口为 `PhotonView.RPC(...)` 与 `IPunObservable.OnPhotonSerializeView(...)`。
-- 结论：本地篡改判定无法等价于真实切主，因此无法保证全房间全功能同步。
+## 项目定位
 
+这个仓库更偏“历史项目整理 + 技术研究记录”，不是零配置开箱即用产品。
+
+## 日志与排查建议
+
+- 保留运行日志方便定位问题
+- 先确认依赖版本和目标平台
+- 先做最小功能验证，再逐步扩展
+
+## 声明
+
+本仓库不提供违规用途支持。
