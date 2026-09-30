@@ -4,9 +4,9 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=1203f5614a2b" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=1203f5614a2b" />
-  <img src="docs/assets/banner.svg?t=1203f5614a2b" width="100%" alt="RepoDLL — REPO DX11/ImGui overlay DLL · 早期 Unity/Mono 游戏实验" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=a05ed73b21f8" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=a05ed73b21f8" />
+  <img src="docs/assets/banner.svg?t=a05ed73b21f8" width="100%" alt="RepoDLL — REPO DX11/ImGui overlay DLL · 早期 Unity/Mono 游戏实验" />
 </picture>
 
 <br/>
