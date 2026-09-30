@@ -1,5 +1,24 @@
 # RepoDLL
 
+<!-- dwgx-banner:BEGIN -->
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=d73dd28271e0" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=d73dd28271e0" />
+  <img src="docs/assets/banner.svg?t=d73dd28271e0" width="100%" alt="RepoDLL — REPO DX11/ImGui overlay DLL · 早期 Unity/Mono 游戏实验" />
+</picture>
+
+<br/>
+
+C++ · MIT · ★10
+
+[releases](https://github.com/dwgx/RepoDLL/releases)
+
+</div>
+<!-- dwgx-banner:END -->
+
+
 > DirectX 11 / ImGui overlay DLL for Unity/Mono games — hook, inspect, modify.
 > 基于 DirectX 11 / ImGui 的游戏覆盖层 DLL，针对 Unity/Mono 游戏的注入、检视与修改工具。
 
